@@ -1,0 +1,31 @@
+{
+  "name": "desktop-pet",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AI desktop pet (VRM) with remote control",
+  "main": "src/main/index.js",
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron -c blue,green \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:local": "concurrently -k -n server,vite,electron -c yellow,blue,green \"npm:dev:server\" \"npm:dev:renderer\" \"npm:dev:electron:local\"",
+    "dev:server": "cd ../server && npm run dev",
+    "dev:renderer": "node ../scripts/run-vite.cjs",
+    "dev:electron": "wait-on tcp:5173 && electron .",
+    "dev:electron:local": "wait-on tcp:5173 tcp:3030 && electron .",
+    "build:renderer": "node ../scripts/run-vite.cjs build",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/three": "^0.164.0",
+    "concurrently": "^8.2.2",
+    "electron": "^28.0.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.10",
+    "wait-on": "^7.2.0"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "^2.0.7",
+    "socket.io-client": "^4.7.5",
+    "three": "^0.164.0"
+  }
+}

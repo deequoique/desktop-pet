@@ -1,0 +1,13 @@
+{
+  "name": "desktop-pet-monorepo",
+  "private": true,
+  "description": "Top-level scripts for the desktop pet project",
+  "scripts": {
+    "dev": "printf 'Use one role per machine:\\n  npm run dev:server\\n  npm run dev:pet\\n  npm run dev:web\\n\\nSingle-machine smoke test only:\\n  npm run dev:all-local\\n'",
+    "dev:server": "npm run dev --prefix server",
+    "dev:pet": "npm run dev --prefix pet",
+    "dev:pet:local": "npm run dev:local --prefix pet",
+    "dev:web": "npm run dev --prefix web",
+    "dev:all-local": "./pet/node_modules/.bin/concurrently -k -n server,pet,web -c yellow,green,cyan \"npm run dev:server\" \"npm run dev:pet:local\" \"npm run dev:web\""
+  }
+}

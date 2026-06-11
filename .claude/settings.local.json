@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/deequoique/**)",
+      "Bash(xargs ls -lt)"
+    ]
+  }
+}

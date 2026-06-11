@@ -1,0 +1,23 @@
+# deps
+node_modules/
+dist/
+
+# logs
+npm-debug.log*
+*.log
+
+# env / secrets — 永远不要提交
+.env
+.env.local
+.env.*.local
+
+# editor
+.DS_Store
+.vscode/
+.idea/
+
+# user data (Electron)
+*.app/
+
+# 测试 / 临时
+tmp/
