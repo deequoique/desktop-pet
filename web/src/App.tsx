@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   connect,
   disconnect,
+  listMotions,
   listVoices,
   sendCommand,
   sendHangup,
@@ -9,6 +10,7 @@ import {
   setListeners,
   type Command,
   type ExpressionName,
+  type MotionMeta,
   type Peers,
   type WebRtcSignal,
 } from './api';
@@ -35,11 +37,6 @@ const EXPRESSIONS: { name: ExpressionName; label: string }[] = [
   { name: 'neutral', label: '平静' },
 ];
 
-const ANIMATIONS: { name: 'wag_tail' | 'shake'; label: string }[] = [
-  { name: 'wag_tail', label: '摇尾巴' },
-  { name: 'shake', label: '抖一抖' },
-];
-
 type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
 const CORNERS: { corner: Corner; label: string }[] = [
@@ -64,6 +61,7 @@ export default function App() {
   const [secret, setSecret] = useState(() => localStorage.getItem(LS_SECRET) || DEFAULT_SECRET);
   const [status, setStatus] = useState<Status>('idle');
   const [peers, setPeers] = useState<Peers>({ controller: false, pet: false });
+  const [motions, setMotions] = useState<MotionMeta[]>([]);
   const [voices, setVoices] = useState<string[]>([]);
   const [tts, setTts] = useState('');
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
@@ -71,8 +69,10 @@ export default function App() {
   const [remoteMuted, setRemoteMuted] = useState(true);
   const [pttPressed, setPttPressed] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
+  const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
   const toastTimer = useRef<number | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const rtcPcRef = useRef<RTCPeerConnection | null>(null);
   const localAudioRef = useRef<MediaStream | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
@@ -103,9 +103,33 @@ export default function App() {
     stopLocalAudio();
     setMicEnabled(false);
     setRemoteReady(false);
+    setRemoteTrackSummary('无');
+    remoteStreamRef.current = null;
     setCallState(opts?.nextState ?? 'idle');
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
   }, [setMicEnabled, stopLocalAudio]);
+
+  const syncRemoteMediaState = useCallback(async () => {
+    const stream = remoteStreamRef.current;
+    const videoTracks = stream?.getVideoTracks() ?? [];
+    const audioTracks = stream?.getAudioTracks() ?? [];
+    const summary = [
+      videoTracks.length ? `video:${videoTracks.length}` : null,
+      audioTracks.length ? `audio:${audioTracks.length}` : null,
+    ].filter(Boolean).join(' + ') || '无';
+    setRemoteTrackSummary(summary);
+    setRemoteReady(videoTracks.length > 0);
+
+    if (!stream || !remoteVideoRef.current) return;
+    if (remoteVideoRef.current.srcObject !== stream) {
+      remoteVideoRef.current.srcObject = stream;
+    }
+    try {
+      await remoteVideoRef.current.play();
+    } catch (e) {
+      console.warn('[webrtc] remote video play failed:', e);
+    }
+  }, []);
 
   const flushPendingCandidates = useCallback(async () => {
     const pc = rtcPcRef.current;
@@ -152,19 +176,38 @@ export default function App() {
       if (event.candidate) sendSignal({ candidate: event.candidate.toJSON() });
     };
     pc.ontrack = async (event) => {
-      const [stream] = event.streams;
-      if (!stream) return;
-      setRemoteReady(true);
-      if (remoteVideoRef.current?.srcObject !== stream) {
-        remoteVideoRef.current!.srcObject = stream;
+      const stream = remoteStreamRef.current ?? new MediaStream();
+      remoteStreamRef.current = stream;
+
+      if (!stream.getTracks().some((t) => t.id === event.track.id)) {
+        stream.addTrack(event.track);
       }
-      try {
-        await remoteVideoRef.current?.play();
-      } catch {}
+
+      console.log('[webrtc] remote track:', {
+        kind: event.track.kind,
+        id: event.track.id,
+        label: event.track.label,
+        muted: event.track.muted,
+        streams: event.streams.map((s) => ({ id: s.id, tracks: s.getTracks().map((t) => t.kind) })),
+      });
+
+      event.track.addEventListener('ended', () => {
+        console.log('[webrtc] remote track ended:', event.track.kind, event.track.id);
+        syncRemoteMediaState().catch(() => {});
+      });
+      event.track.addEventListener('mute', () => {
+        console.log('[webrtc] remote track muted:', event.track.kind, event.track.id);
+      });
+      event.track.addEventListener('unmute', () => {
+        console.log('[webrtc] remote track unmuted:', event.track.kind, event.track.id);
+      });
+
+      await syncRemoteMediaState();
       setCallState('in-call');
     };
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
+      console.log('[webrtc] controller connection state:', state);
       if (state === 'connected') {
         setCallState('in-call');
         return;
@@ -183,10 +226,12 @@ export default function App() {
     if (!signal) return;
     if (signal.description) {
       const desc = signal.description;
+      console.log('[webrtc] controller got description:', desc.type);
       if (desc.type === 'answer') {
         const pc = rtcPcRef.current;
         if (!pc) return;
         await pc.setRemoteDescription(desc);
+        console.log('[webrtc] controller set remote answer');
         await flushPendingCandidates();
         return;
       }
@@ -197,11 +242,13 @@ export default function App() {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         sendSignal({ description: pc.localDescription });
+        console.log('[webrtc] controller answered remote offer');
         return;
       }
     }
 
     if (signal.candidate) {
+      console.log('[webrtc] controller got ice candidate');
       const pc = rtcPcRef.current;
       if (!pc?.remoteDescription) {
         pendingCandidatesRef.current.push(signal.candidate);
@@ -240,10 +287,14 @@ export default function App() {
 
   useEffect(() => {
     if (status !== 'connected' || !peers.pet) {
+      setMotions([]);
       setVoices([]);
       if (!peers.pet) teardownCall({ nextState: 'idle' });
       return;
     }
+    listMotions().then((items) => {
+      setMotions(items);
+    });
     listVoices().then((files) => {
       setVoices(files);
       if (!files.length) showToast('桌宠端没有预录台词');
@@ -306,6 +357,7 @@ export default function App() {
       });
       await pc.setLocalDescription(offer);
       sendSignal({ description: pc.localDescription });
+      console.log('[webrtc] controller sent offer');
       setCallState('calling');
     } catch (e: any) {
       console.warn('[webrtc] startCall failed:', e);
@@ -389,6 +441,7 @@ export default function App() {
         </div>
         <div className="video-meta">
           <span>{remoteReady ? '已收到桌面视频流' : '尚未收到视频流'}</span>
+          <span>远端轨道：{remoteTrackSummary}</span>
           <span>{remoteMuted ? '对端声音默认静音' : '对端声音开启'}</span>
         </div>
         <div className="call-row">
@@ -434,16 +487,22 @@ export default function App() {
           ))}
         </div>
         <h3>动作</h3>
-        <div className="grid tight">
-          {ANIMATIONS.map((a) => (
-            <button
-              key={a.name}
-              className="btn"
-              disabled={!canSend}
-              onClick={() => send({ type: 'animation', name: a.name }, a.label)}
-            >{a.label}</button>
-          ))}
-        </div>
+        {motions.length === 0 ? (
+          <div className="empty">
+            {canSend ? '当前模型还没配置动作；把 manifest 和 .vrma 放进 pet/public/motions/ 后重启即可' : '连上后会显示'}
+          </div>
+        ) : (
+          <div className="grid tight">
+            {motions.map((m) => (
+              <button
+                key={m.id}
+                className="btn"
+                disabled={!canSend}
+                onClick={() => send({ type: 'animation', name: m.id }, m.label)}
+              >{m.label}</button>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="section">

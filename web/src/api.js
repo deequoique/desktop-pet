@@ -39,6 +39,11 @@ export function connect(serverUrl, secret) {
         listeners.onError?.(`被踢出：${r?.reason || ''}`);
         listeners.onStatus?.('rejected');
     });
+    s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));
+    s.on('webrtc:hangup', () => listeners.onHangup?.());
+    s.on('webrtc:error', (payload) => {
+        listeners.onRtcError?.(payload?.message || '通话出错');
+    });
     return s;
 }
 export function disconnect() {
@@ -72,4 +77,34 @@ export function listVoices(timeoutMs = 4000) {
             resolve(Array.isArray(files) ? files : []);
         });
     });
+}
+export function listMotions(timeoutMs = 4000) {
+    return new Promise((resolve) => {
+        if (!socket || !socket.connected)
+            return resolve([]);
+        let done = false;
+        const t = setTimeout(() => { if (!done) {
+            done = true;
+            resolve([]);
+        } }, timeoutMs);
+        socket.emit('pet:list-motions', (motions) => {
+            if (done)
+                return;
+            done = true;
+            clearTimeout(t);
+            resolve(Array.isArray(motions) ? motions : []);
+        });
+    });
+}
+export function sendSignal(signal) {
+    if (!socket || !socket.connected)
+        return false;
+    socket.emit('webrtc:signal', signal);
+    return true;
+}
+export function sendHangup() {
+    if (!socket || !socket.connected)
+        return false;
+    socket.emit('webrtc:hangup');
+    return true;
 }

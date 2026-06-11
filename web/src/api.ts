@@ -3,9 +3,15 @@ import { io, type Socket } from 'socket.io-client';
 export type ExpressionName =
   | 'joy' | 'sorrow' | 'angry' | 'surprised' | 'blink' | 'neutral';
 
+export type MotionMeta = {
+  id: string;
+  label: string;
+  loop: boolean;
+};
+
 export type Command =
   | { type: 'expression'; name: ExpressionName; strength?: number; holdMs?: number }
-  | { type: 'animation'; name: 'wag_tail' | 'shake' }
+  | { type: 'animation'; name: string }
   | { type: 'say_audio'; url: string }
   | { type: 'say_tts'; text: string }
   | { type: 'relocate'; corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' };
@@ -104,6 +110,20 @@ export function listVoices(timeoutMs = 4000): Promise<string[]> {
       done = true;
       clearTimeout(t);
       resolve(Array.isArray(files) ? files : []);
+    });
+  });
+}
+
+export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
+  return new Promise((resolve) => {
+    if (!socket || !socket.connected) return resolve([]);
+    let done = false;
+    const t = setTimeout(() => { if (!done) { done = true; resolve([]); } }, timeoutMs);
+    socket.emit('pet:list-motions', (motions: MotionMeta[]) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(Array.isArray(motions) ? motions : []);
     });
   });
 }

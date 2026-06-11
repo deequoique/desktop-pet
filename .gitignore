@@ -21,3 +21,5 @@ npm-debug.log*
 
 # 测试 / 临时
 tmp/
+.trash-web-src/
+*.tsbuildinfo

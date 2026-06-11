@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
+import { createVRMAnimationClip, VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation';
 import { io, type Socket } from 'socket.io-client';
 
 declare global {
@@ -43,6 +44,9 @@ const browserPetBridge: PetBridge = {
 const petBridge: PetBridge = window.pet ?? browserPetBridge;
 
 const VRM_URL = '/sample.vrm';
+const MOTION_MANIFEST_URL = '/motions/manifest.json';
+const MOTION_BASE_URL = '/motions/';
+const MOTION_FADE_SECONDS = 0.18;
 
 const app = document.getElementById('app')!;
 const fallback = document.getElementById('fallback')!;
@@ -51,6 +55,22 @@ const flash = document.getElementById('flash')!;
 const replyEl = document.getElementById('reply')!;
 const chatBox = document.getElementById('chat')!;
 const chatInput = document.getElementById('chat-input') as HTMLInputElement;
+
+type MotionFallbackPart = 'head' | 'body' | 'tail';
+
+type MotionManifestEntry = {
+  id: string;
+  label: string;
+  file: string;
+  loop: boolean;
+  fallback?: MotionFallbackPart;
+};
+
+type MotionMeta = {
+  id: string;
+  label: string;
+  loop: boolean;
+};
 
 // === Three.js scene ===
 const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: false, premultipliedAlpha: false });
@@ -94,6 +114,14 @@ let headY = 1.5;
 let modelMinY = 0;
 let modelCenter = new THREE.Vector3(0, 1.3, 0);
 let availableExpressions: Set<string> = new Set();
+const motionManifest = new Map<string, MotionManifestEntry>();
+// 缓存绑定到当前 vrm 的最终 AnimationClip（由 .vrma 经 createVRMAnimationClip 生成）。
+const motionClipCache = new Map<string, Promise<THREE.AnimationClip | null>>();
+let motionList: MotionMeta[] = [];
+let motionMixer: THREE.AnimationMixer | null = null;
+let currentMotionAction: THREE.AnimationAction | null = null;
+let currentMotionId = '';
+let currentMotionStopTimer = 0;
 
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -110,6 +138,15 @@ loader.load(
     if (v.lookAt) v.lookAt.target = lookTarget;
     vrm = v;
     modelBaseY = v.scene.position.y;
+    motionMixer = new THREE.AnimationMixer(v.scene);
+    motionMixer.addEventListener('finished', ((event: THREE.Event) => {
+      const action = (event as THREE.Event & { action?: THREE.AnimationAction }).action;
+      if (action && action === currentMotionAction) {
+        action.stop();
+        currentMotionAction = null;
+        currentMotionId = '';
+      }
+    }) as THREE.EventListener);
 
     try {
       const exps: any[] = (v.expressionManager as any)?.expressions ?? [];
@@ -150,13 +187,18 @@ loader.load(
 // === Expression system ===
 type ExpName = 'neutral' | 'joy' | 'sorrow' | 'angry' | 'surprised' | 'blink' | 'aa' | 'ih' | 'ou' | 'ee' | 'oh';
 
+// 一个逻辑表情映射到多个可能的 blendShape/expression 名，逐个 setValue，命中哪个算哪个
+// （不存在的名字被 expressionManager 静默忽略）。同时覆盖：
+//   - VRM 1.0 标准 preset（小写：happy/angry/sad/relaxed/surprised/neutral，口型 aa/ih/ou/ee/oh）
+//   - VRM 0.x 旧 preset / 大写自定义名（Joy/Angry/A/E/...）
+// 这样换不同版本/不同作者的模型时，情绪表情都能尽量命中。
 const EXP_ALIASES: Record<string, string[]> = {
-  joy:       ['joy', 'happy'],
-  sorrow:    ['sorrow', 'sad'],
-  angry:     ['angry'],
+  joy:       ['happy', 'joy', 'Joy', 'Happy', 'fun', 'Fun'],
+  sorrow:    ['sad', 'sorrow', 'Sorrow', 'Sad'],
+  angry:     ['angry', 'Angry'],
   surprised: ['surprised', 'Surprised'],
+  neutral:   ['neutral', 'Neutral', 'relaxed', 'Relaxed'],
   blink:     ['blink', 'Blink'],
-  neutral:   ['neutral', 'Neutral'],
   aa: ['aa', 'a', 'A'],
   ih: ['ih', 'i', 'I'],
   ou: ['ou', 'u', 'U'],
@@ -242,6 +284,174 @@ function triggerReaction(part: 'head' | 'body' | 'tail') {
   console.log('[reaction]', part, '→', exp);
 }
 
+function fadeOutAction(action: THREE.AnimationAction | null, immediate = false) {
+  if (!action) return;
+  if (immediate) {
+    action.stop();
+    return;
+  }
+  action.fadeOut(MOTION_FADE_SECONDS);
+  window.setTimeout(() => action.stop(), Math.ceil(MOTION_FADE_SECONDS * 1000) + 60);
+}
+
+function stopCurrentMotion(immediate = false) {
+  if (currentMotionStopTimer) {
+    window.clearTimeout(currentMotionStopTimer);
+    currentMotionStopTimer = 0;
+  }
+  const action = currentMotionAction;
+  currentMotionAction = null;
+  currentMotionId = '';
+  if (!action) return;
+  if (immediate) {
+    action.stop();
+    return;
+  }
+  action.fadeOut(MOTION_FADE_SECONDS);
+  currentMotionStopTimer = window.setTimeout(() => {
+    action.stop();
+    currentMotionStopTimer = 0;
+  }, Math.ceil(MOTION_FADE_SECONDS * 1000) + 60);
+}
+
+async function loadMotionManifest() {
+  motionManifest.clear();
+  motionClipCache.clear();
+  motionList = [];
+  try {
+    const r = await fetch(MOTION_MANIFEST_URL, { cache: 'no-store' });
+    if (r.status === 404) {
+      console.log('[motions] manifest missing');
+      return;
+    }
+    if (!r.ok) throw new Error(`manifest ${r.status}`);
+    const data = await r.json();
+    if (!Array.isArray(data)) throw new Error('manifest must be an array');
+
+    for (const raw of data) {
+      const id = String(raw?.id ?? '').trim();
+      const label = String(raw?.label ?? '').trim();
+      const file = String(raw?.file ?? '').trim();
+      const fallback = raw?.fallback;
+      if (!id || !label || !file) continue;
+      const entry: MotionManifestEntry = {
+        id,
+        label,
+        file,
+        loop: !!raw?.loop,
+      };
+      if (fallback === 'head' || fallback === 'body' || fallback === 'tail') {
+        entry.fallback = fallback;
+      }
+      motionManifest.set(id, entry);
+      motionList.push({ id, label, loop: entry.loop });
+    }
+    console.log('[motions] loaded:', motionList.map((m) => m.id));
+  } catch (e) {
+    console.warn('[motions] load failed:', e);
+  }
+}
+
+// 加载 .vrma 并经 createVRMAnimationClip 绑定到当前 vrm，得到可直接喂 mixer 的 AnimationClip。
+// VRMA 按 VRM 标准 humanoid 骨骼定义，库负责归一化，换模型无需任何重定向/缩放。
+// 要求 vrm 已加载（调用点 playMotion 已有守卫）。
+async function loadVrmaMotion(id: string): Promise<THREE.AnimationClip | null> {
+  const existing = motionClipCache.get(id);
+  if (existing) return existing;
+
+  const entry = motionManifest.get(id);
+  if (!entry || !vrm) return null;
+  const targetVrm = vrm;
+
+  const pending = new Promise<THREE.AnimationClip | null>((resolve) => {
+    const loader = new GLTFLoader();
+    loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
+    loader.load(
+      `${MOTION_BASE_URL}${entry.file}`,
+      (gltf) => {
+        const vrmAnim = gltf.userData?.vrmAnimations?.[0] ?? null;
+        if (!vrmAnim) {
+          console.warn('[motions] no vrmAnimation in file:', id, entry.file);
+          resolve(null);
+          return;
+        }
+        try {
+          const clip = createVRMAnimationClip(vrmAnim, targetVrm);
+          if (!clip || !clip.tracks?.length) {
+            console.warn('[motions] empty clip for', id, 'tracks=', clip?.tracks?.length);
+            resolve(null);
+            return;
+          }
+          resolve(clip);
+        } catch (e) {
+          console.warn('[motions] createVRMAnimationClip failed:', id, e);
+          resolve(null);
+        }
+      },
+      undefined,
+      (err) => {
+        console.warn('[motions] vrma load failed:', id, err);
+        resolve(null);
+      }
+    );
+  });
+
+  // 失败（null）时把缓存清掉，避免一次加载失败被永久缓存、补上文件后也不再重试。
+  pending.then((clip) => {
+    if (!clip && motionClipCache.get(id) === pending) motionClipCache.delete(id);
+  }).catch(() => {
+    if (motionClipCache.get(id) === pending) motionClipCache.delete(id);
+  });
+
+  motionClipCache.set(id, pending);
+  return pending;
+}
+
+async function playMotion(id: string): Promise<boolean> {
+  const entry = motionManifest.get(id);
+
+  if (!entry) {
+    console.warn('[motions] unknown motion:', id);
+    return false;
+  }
+
+  if (!vrm || !motionMixer) {
+    console.warn('[motions] motion system not ready:', id);
+    if (entry.fallback) triggerReaction(entry.fallback);
+    return false;
+  }
+
+  const clip = await loadVrmaMotion(id);
+  if (!clip) {
+    stopCurrentMotion();
+    if (entry.fallback) triggerReaction(entry.fallback);
+    return false;
+  }
+
+  if (currentMotionStopTimer) {
+    window.clearTimeout(currentMotionStopTimer);
+    currentMotionStopTimer = 0;
+  }
+
+  const nextAction = motionMixer.clipAction(clip, vrm.scene);
+  if (currentMotionAction && currentMotionAction !== nextAction) {
+    fadeOutAction(currentMotionAction);
+  }
+
+  nextAction.reset();
+  nextAction.enabled = true;
+  nextAction.clampWhenFinished = !entry.loop;
+  nextAction.setEffectiveTimeScale(1);
+  nextAction.setEffectiveWeight(1);
+  nextAction.setLoop(entry.loop ? THREE.LoopRepeat : THREE.LoopOnce, entry.loop ? Infinity : 1);
+  nextAction.fadeIn(MOTION_FADE_SECONDS);
+  nextAction.play();
+
+  currentMotionAction = nextAction;
+  currentMotionId = id;
+  return true;
+}
+
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0 || !lastClickable || !vrm) return;
   // 输入框正在用，不当作戳模型
@@ -297,6 +507,7 @@ let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
 (async () => {
   try { SERVER_URL = await petBridge.getServerUrl(); } catch {}
   try { ROOM_SECRET = await petBridge.getRoomSecret(); } catch {}
+  await loadMotionManifest();
   try {
     const files = await petBridge.listVoices();
     for (const f of files) {
@@ -309,7 +520,7 @@ let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
   } catch (e) {
     console.warn('[voices] load failed:', e);
   }
-  // voices 加载完之后再连远程，list-voices ack 才有内容
+  // motions / voices 加载完之后再连远程，ack 才有内容
   connectRemote();
 })();
 
@@ -448,10 +659,10 @@ petBridge.onHotkey((name) => {
 });
 
 // === 远程控制（M4a）===
-// A 端（controller）通过 Socket.IO 发指令，B 端（pet）路由到现有动作函数。
+// A 端（controller）通过 Socket.IO 发指令，B 端（pet）路由到现有动作函数 / FBX 动作。
 type RemoteCommand =
   | { type: 'expression'; name: ExpName; strength?: number; holdMs?: number }
-  | { type: 'animation'; name: 'wag_tail' | 'shake' }
+  | { type: 'animation'; name: string }
   | { type: 'say_audio'; url: string }
   | { type: 'say_tts'; text: string }
   | { type: 'relocate'; corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' };
@@ -498,13 +709,14 @@ function handleRemoteCommand(cmd: RemoteCommand) {
       break;
     }
     case 'animation': {
-      // M4a 没有 VRMA 动作系统，用最贴近的反应近似
-      if (cmd.name === 'wag_tail') {
-        triggerReaction('tail');
-      } else if (cmd.name === 'shake') {
-        triggerReaction('body');
-      }
-      noteRemote(`anim ${cmd.name}`);
+      void playMotion(cmd.name)
+        .then((played) => {
+          noteRemote(played ? `anim ${cmd.name}` : `anim ${cmd.name} fallback`);
+        })
+        .catch((e) => {
+          console.warn('[motions] remote play failed:', cmd.name, e);
+          noteRemote(`anim ${cmd.name} err`);
+        });
       break;
     }
     case 'say_audio': {
@@ -558,6 +770,10 @@ async function ensurePetMedia(): Promise<MediaStream> {
   const aliveScreen = rtcScreenStream?.getVideoTracks().some((track) => track.readyState === 'live');
   const aliveMic = rtcMicStream?.getAudioTracks().some((track) => track.readyState === 'live');
   if (rtcScreenStream && rtcMicStream && aliveScreen && aliveMic) {
+    console.log('[webrtc] reusing existing media', {
+      screenTracks: rtcScreenStream.getTracks().map((t) => `${t.kind}:${t.readyState}`),
+      micTracks: rtcMicStream.getTracks().map((t) => `${t.kind}:${t.readyState}`),
+    });
     return new MediaStream([
       ...rtcScreenStream.getVideoTracks(),
       ...rtcMicStream.getAudioTracks(),
@@ -583,6 +799,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
 
     try {
       rtcScreenStream = await navigator.mediaDevices.getUserMedia(screenConstraints);
+      console.log('[webrtc] captured screen via desktop source', sourceId);
     } catch (error) {
       console.warn('[webrtc] desktop source capture failed, falling back to getDisplayMedia:', error);
     }
@@ -598,6 +815,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
         },
         audio: false,
       });
+      console.log('[webrtc] captured screen via getDisplayMedia');
     } catch (error: any) {
       throw new Error(`屏幕采集失败：${error?.message || error}`);
     }
@@ -611,6 +829,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
     },
     video: false,
   });
+  console.log('[webrtc] captured microphone');
 
   const screenTrack = rtcScreenStream.getVideoTracks()[0];
   if (screenTrack) {
@@ -646,9 +865,18 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   rtcPc = pc;
 
   for (const track of media.getTracks()) pc.addTrack(track, media);
+  console.log('[webrtc] pet added local tracks', media.getTracks().map((t) => ({
+    kind: t.kind,
+    id: t.id,
+    label: t.label,
+    state: t.readyState,
+  })));
 
   pc.onicecandidate = (event) => {
-    if (event.candidate) remoteSocket?.emit('webrtc:signal', { candidate: event.candidate.toJSON() });
+    if (event.candidate) {
+      console.log('[webrtc] pet sent ice candidate');
+      remoteSocket?.emit('webrtc:signal', { candidate: event.candidate.toJSON() });
+    }
   };
   pc.ontrack = async (event) => {
     if (!rtcRemoteAudioStream) rtcRemoteAudioStream = new MediaStream();
@@ -663,10 +891,16 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     } catch (e) {
       console.warn('[webrtc] remote audio play failed:', e);
     }
+    console.log('[webrtc] pet received remote track', {
+      kind: event.track.kind,
+      id: event.track.id,
+      streams: event.streams.map((s) => ({ id: s.id, tracks: s.getTracks().map((t) => t.kind) })),
+    });
     noteRemote('call audio');
   };
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState;
+    console.log('[webrtc] pet connection state:', state);
     if (state === 'connected') noteRemote('call on');
     if (state === 'failed' || state === 'closed' || state === 'disconnected') {
       cleanupRtc(false);
@@ -681,13 +915,16 @@ async function handleRtcSignal(signal: WebRtcSignal) {
   if (!signal) return;
   if (signal.description) {
     const desc = signal.description;
+    console.log('[webrtc] pet got description:', desc.type);
     if (desc.type === 'offer') {
       try {
         const pc = await ensurePetPeerConnection();
         await pc.setRemoteDescription(desc);
+        console.log('[webrtc] pet set remote offer');
         await flushRtcCandidates();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        console.log('[webrtc] pet created answer');
         remoteSocket?.emit('webrtc:signal', { description: pc.localDescription });
       } catch (e: any) {
         reportRtcError(`接通失败：${e?.message || e}`);
@@ -698,6 +935,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
     if (desc.type === 'answer' && rtcPc) {
       try {
         await rtcPc.setRemoteDescription(desc);
+        console.log('[webrtc] pet set remote answer');
         await flushRtcCandidates();
       } catch (e) {
         console.warn('[webrtc] setRemoteDescription(answer) failed:', e);
@@ -706,6 +944,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
   }
 
   if (signal.candidate) {
+    console.log('[webrtc] pet got ice candidate');
     if (!rtcPc?.remoteDescription) {
       rtcPendingCandidates.push(signal.candidate);
       return;
@@ -778,6 +1017,9 @@ function connectRemote() {
   remoteSocket.on('pet:list-voices', (ack: (files: string[]) => void) => {
     if (typeof ack === 'function') ack(voicesFlat.slice());
   });
+  remoteSocket.on('pet:list-motions', (ack: (motions: MotionMeta[]) => void) => {
+    if (typeof ack === 'function') ack(motionList.slice());
+  });
   remoteSocket.on('room:peers', (peers: { controller: boolean; pet: boolean }) => {
     console.log('[remote] peers', peers);
   });
@@ -804,37 +1046,47 @@ function tick() {
 
   if (vrm) vrm.scene.position.y = modelBaseY + Math.sin(t * 1.2) * 0.015;
 
-  // 先让 VRM 自己更新（含 SpringBone、lookAt 眼睛）
+  // 先更新主动作，再让 VRM 自己更新（含 SpringBone、lookAt 眼睛）
+  if (motionMixer) motionMixer.update(dt);
   if (vrm) vrm.update(dt);
 
   // 再叠加头骨偏移（在 VRM 处理后做，否则被覆盖；同时只追加 yaw/pitch 不动 roll）
+  // 动作播放期间不抢头骨：否则会逐帧覆盖 FBX 动作里的点头/转头。此时让偏移平滑归零，
+  // 并把头骨交还给动作（不再写 rotation），动作结束后自动恢复跟随光标。
   if (vrm) {
     const headBone = vrm.humanoid?.getNormalizedBoneNode('head');
     if (headBone) {
-      // 用世界坐标算 lookTarget 相对头部的方向
-      const headWorld = headBone.getWorldPosition(new THREE.Vector3());
-      const dx = lookTarget.position.x - headWorld.x;
-      const dy = lookTarget.position.y - headWorld.y;
-      const dz = lookTarget.position.z - headWorld.z;
-      // v.scene 转了 PI（世界前向 +Z），但 headBone 是 normalized 骨骼，rotation 在它自己的坐标系里
-      // normalized 静止前向 = -Z；rotation.y=+θ 把 -Z 转向 -X。
-      // 世界方向 (dx,dy,dz) 映射到 normalized 系是 (-dx, dy, -dz)，需要 θ 让 -Z 转到 (-dx,*,-dz)：
-      //   sinθ = dx, cosθ = dz  →  θ = atan2(dx, dz)
-      const targetYaw = Math.atan2(dx, dz) * 0.35;
-      const targetPitch = Math.atan2(dy, Math.hypot(dx, dz)) * 0.35;
-      const clampedYaw = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetYaw));
-      const clampedPitch = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetPitch));
-      // 防御 NaN：一旦 headOffset 被污染就永远卡在 NaN（slerp 无法自愈），头会消失
-      if (!Number.isFinite(clampedYaw) || !Number.isFinite(clampedPitch)) {
-        headOffsetYaw = 0;
-        headOffsetPitch = 0;
+      const motionActive = !!currentMotionId;
+      if (motionActive) {
+        // 偏移归零；不写 headBone.rotation，保留 mixer 写入的动作姿态。
+        headOffsetYaw += (0 - headOffsetYaw) * HEAD_OFFSET_SLERP;
+        headOffsetPitch += (0 - headOffsetPitch) * HEAD_OFFSET_SLERP;
       } else {
-        headOffsetYaw += (clampedYaw - headOffsetYaw) * HEAD_OFFSET_SLERP;
-        headOffsetPitch += (clampedPitch - headOffsetPitch) * HEAD_OFFSET_SLERP;
+        // 用世界坐标算 lookTarget 相对头部的方向
+        const headWorld = headBone.getWorldPosition(new THREE.Vector3());
+        const dx = lookTarget.position.x - headWorld.x;
+        const dy = lookTarget.position.y - headWorld.y;
+        const dz = lookTarget.position.z - headWorld.z;
+        // v.scene 转了 PI（世界前向 +Z），但 headBone 是 normalized 骨骼，rotation 在它自己的坐标系里
+        // normalized 静止前向 = -Z；rotation.y=+θ 把 -Z 转向 -X。
+        // 世界方向 (dx,dy,dz) 映射到 normalized 系是 (-dx, dy, -dz)，需要 θ 让 -Z 转到 (-dx,*,-dz)：
+        //   sinθ = dx, cosθ = dz  →  θ = atan2(dx, dz)
+        const targetYaw = Math.atan2(dx, dz) * 0.35;
+        const targetPitch = Math.atan2(dy, Math.hypot(dx, dz)) * 0.35;
+        const clampedYaw = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetYaw));
+        const clampedPitch = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetPitch));
+        // 防御 NaN：一旦 headOffset 被污染就永远卡在 NaN（slerp 无法自愈），头会消失
+        if (!Number.isFinite(clampedYaw) || !Number.isFinite(clampedPitch)) {
+          headOffsetYaw = 0;
+          headOffsetPitch = 0;
+        } else {
+          headOffsetYaw += (clampedYaw - headOffsetYaw) * HEAD_OFFSET_SLERP;
+          headOffsetPitch += (clampedPitch - headOffsetPitch) * HEAD_OFFSET_SLERP;
+        }
+        // 直接赋值（headOffsetYaw/Pitch 已经做了限位+slerp），不要 +=，否则每帧累加会转飞
+        headBone.rotation.y = headOffsetYaw;
+        headBone.rotation.x = headOffsetPitch;
       }
-      // 直接赋值（headOffsetYaw/Pitch 已经做了限位+slerp），不要 +=，否则每帧累加会转飞
-      headBone.rotation.y = headOffsetYaw;
-      headBone.rotation.x = headOffsetPitch;
     }
   }
 
@@ -891,7 +1143,7 @@ function tick() {
       `vrm:${vrm ? 'ok' : '...'} inside:${cursorInside ? 'Y' : 'N'} click:${lastClickable ? 'Y' : 'N'}\n` +
       `look:${lookMode} chat:${chatOpen ? 'Y' : 'N'} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
       `hit:${lastHitPart}\n` +
-      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}\n` +
+      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} active:${currentMotionId || '-'}\n` +
       `last:${lastReactionMsg || '-'} (${since}s)  remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`;
   }
 

@@ -1,0 +1,9 @@
+[
+  {
+    "id": "dance",
+    "label": "跳舞",
+    "file": "HipHopDancing.vrma",
+    "loop": true,
+    "fallback": "body"
+  }
+]

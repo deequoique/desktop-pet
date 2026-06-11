@@ -210,6 +210,25 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('pet:list-motions', (ack) => {
+    if (roleOf(socket) !== 'controller') {
+      if (typeof ack === 'function') ack([]);
+      return;
+    }
+    const petId = room.pet;
+    if (!petId) {
+      if (typeof ack === 'function') ack([]);
+      return;
+    }
+    io.to(petId).timeout(3000).emit('pet:list-motions', (err, replies) => {
+      if (err || !replies?.length) {
+        if (typeof ack === 'function') ack([]);
+        return;
+      }
+      if (typeof ack === 'function') ack(replies[0] || []);
+    });
+  });
+
   socket.on('webrtc:signal', (payload) => {
     const role = roleOf(socket);
     const targetRole = otherRole(role);
