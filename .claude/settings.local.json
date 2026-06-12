@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Read(//Users/deequoique/**)",
-      "Bash(xargs ls -lt)"
+      "Bash(xargs ls -lt)",
+      "WebSearch",
+      "Bash(gh api *)",
+      "Bash(git *)"
     ]
   }
 }
