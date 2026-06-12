@@ -1,0 +1,3 @@
+[submodule "Mate-Engine"]
+	path = Mate-Engine
+	url = https://github.com/deequoique/Mate-Engine.git
