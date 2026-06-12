@@ -4,8 +4,17 @@ const fs = require('fs');
 
 const DEV_URL = 'http://localhost:5173';
 const isDev = !app.isPackaged;
+// scale=1 的基准尺寸；实际窗口 = 基准 * scale。
 const PET_W = 360;
 const PET_H = 480;
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 2.0;
+
+const clampScale = (s) => {
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, n));
+};
 
 const stateFile = () => path.join(app.getPath('userData'), 'pet-state.json');
 
@@ -16,12 +25,23 @@ function loadState() {
 function saveState(state) {
   try { fs.writeFileSync(stateFile(), JSON.stringify(state)); } catch {}
 }
+// 合并写入：只更新传入的字段，保留其余（位置 / scale 互不覆盖）。
+function patchState(patch) {
+  const cur = loadState() || {};
+  saveState({ ...cur, ...patch });
+}
+
+function currentScale() {
+  const s = loadState();
+  return clampScale(s && s.scale != null ? s.scale : 1);
+}
 
 function defaultBottomRight() {
   const { workArea } = screen.getPrimaryDisplay();
+  const [w, h] = win && !win.isDestroyed() ? win.getSize() : [PET_W, PET_H];
   return {
-    x: workArea.x + workArea.width - PET_W - 16,
-    y: workArea.y + workArea.height - PET_H - 16,
+    x: workArea.x + workArea.width - w - 16,
+    y: workArea.y + workArea.height - h - 16,
   };
 }
 
@@ -30,11 +50,20 @@ let tray = null;
 
 function createWindow() {
   const saved = loadState();
-  const pos = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) ? saved : defaultBottomRight();
+  const scale = clampScale(saved && saved.scale != null ? saved.scale : 1);
+  const w = Math.round(PET_W * scale);
+  const h = Math.round(PET_H * scale);
+  const hasPos = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y);
+  // 无保存位置：按当前尺寸贴右下角。
+  const fallbackPos = (() => {
+    const { workArea } = screen.getPrimaryDisplay();
+    return { x: workArea.x + workArea.width - w - 16, y: workArea.y + workArea.height - h - 16 };
+  })();
+  const pos = hasPos ? saved : fallbackPos;
 
   win = new BrowserWindow({
-    width: PET_W,
-    height: PET_H,
+    width: w,
+    height: h,
     x: pos.x,
     y: pos.y,
     transparent: true,
@@ -66,7 +95,7 @@ function createWindow() {
 
   win.on('moved', () => {
     const [x, y] = win.getPosition();
-    saveState({ x, y });
+    patchState({ x, y });
   });
 }
 
@@ -79,7 +108,7 @@ function createTray() {
     { label: 'Reset Position', click: () => {
         const p = defaultBottomRight();
         win?.setPosition(p.x, p.y);
-        saveState(p);
+        patchState({ x: p.x, y: p.y });
       } },
     { label: 'Reload', click: () => win?.reload() },
     { type: 'separator' },
@@ -109,24 +138,41 @@ ipcMain.on('pet:drag', (_e, { dx, dy }) => {
 function cornerPosition(corner) {
   const { workArea } = screen.getPrimaryDisplay();
   const margin = 16;
+  // 用当前窗口实际尺寸算贴角，缩放后才不会偏。
+  const [w, h] = win && !win.isDestroyed() ? win.getSize() : [PET_W, PET_H];
   switch (corner) {
     case 'top-left':
       return { x: workArea.x + margin, y: workArea.y + margin };
     case 'top-right':
-      return { x: workArea.x + workArea.width - PET_W - margin, y: workArea.y + margin };
+      return { x: workArea.x + workArea.width - w - margin, y: workArea.y + margin };
     case 'bottom-left':
-      return { x: workArea.x + margin, y: workArea.y + workArea.height - PET_H - margin };
+      return { x: workArea.x + margin, y: workArea.y + workArea.height - h - margin };
     case 'bottom-right':
     default:
-      return { x: workArea.x + workArea.width - PET_W - margin, y: workArea.y + workArea.height - PET_H - margin };
+      return { x: workArea.x + workArea.width - w - margin, y: workArea.y + workArea.height - h - margin };
   }
 }
 ipcMain.on('pet:relocate', (_e, corner) => {
   if (!win || win.isDestroyed()) return;
   const p = cornerPosition(corner);
   win.setPosition(p.x, p.y);
-  saveState(p);
+  patchState({ x: p.x, y: p.y });
 });
+
+// 远程/本地 resize：scale → 重算窗口尺寸，锚定底部中心，避免缩放跑位。
+ipcMain.on('pet:resize', (_e, rawScale) => {
+  if (!win || win.isDestroyed()) return;
+  const scale = clampScale(rawScale);
+  const w = Math.round(PET_W * scale);
+  const h = Math.round(PET_H * scale);
+  const b = win.getBounds();
+  const x = Math.round(b.x + (b.width - w) / 2);
+  const y = Math.round(b.y + (b.height - h));
+  win.setBounds({ x, y, width: w, height: h });
+  patchState({ x, y, scale });
+});
+
+ipcMain.handle('pet:get-scale', () => currentScale());
 
 // 60Hz 轮询光标位置 → 推给渲染层做 hit-test
 // macOS 透明窗 + setIgnoreMouseEvents 不会把 mousemove 转发给 renderer，必须主进程主动喂

@@ -64,6 +64,24 @@
         pointer-events: none;
       }
       #reply.on { opacity: 1; }
+
+      /* 大小调节滑块（右上角浮层，默认半透明，hover 才明显） */
+      #size {
+        position: absolute; top: 8px; right: 10px;
+        display: flex; align-items: center; gap: 8px;
+        background: rgba(15, 12, 22, 0.6);
+        border-radius: 14px;
+        padding: 5px 12px;
+        font-family: system-ui; font-size: 11px; color: #fff;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+        backdrop-filter: blur(6px);
+        opacity: 0.28; transition: opacity 160ms;
+      }
+      #size:hover { opacity: 1; }
+      #size input[type="range"] {
+        width: 96px; accent-color: #b6f; cursor: pointer;
+      }
+      #size-val { min-width: 34px; text-align: right; color: #ffd866; }
     </style>
   </head>
   <body>
@@ -72,6 +90,11 @@
     <div id="hud"></div>
     <div id="flash"></div>
     <div id="reply"></div>
+    <div id="size">
+      <span>大小</span>
+      <input id="size-range" type="range" min="50" max="200" step="5" value="100" />
+      <span id="size-val">100%</span>
+    </div>
     <div id="chat" class="hidden">
       <input id="chat-input" type="text" placeholder="跟我说点什么…  (Enter 发送 / Esc 取消)" maxlength="200" />
     </div>

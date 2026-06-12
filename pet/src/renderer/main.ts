@@ -10,6 +10,8 @@ declare global {
       setClickable: (clickable: boolean) => void;
       drag: (dx: number, dy: number) => void;
       relocate: (corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right') => void;
+      resize: (scale: number) => void;
+      getScale: () => Promise<number>;
       onCursor: (cb: (c: { cx: number; cy: number; ww: number; wh: number; inside: boolean }) => void) => void;
       onHotkey: (cb: (name: string) => void) => void;
       listVoices: () => Promise<string[]>;
@@ -26,6 +28,8 @@ const browserPetBridge: PetBridge = {
   setClickable: () => {},
   drag: () => {},
   relocate: () => {},
+  resize: () => {},
+  getScale: async () => 1,
   onCursor: (cb) => {
     const emit = (cx: number, cy: number, inside: boolean) => {
       cb({ cx, cy, ww: window.innerWidth, wh: window.innerHeight, inside });
@@ -48,6 +52,13 @@ const MOTION_MANIFEST_URL = '/motions/manifest.json';
 const MOTION_BASE_URL = '/motions/';
 const MOTION_FADE_SECONDS = 0.18;
 
+// 模型整体 Y 轴旋转：当前模型符合 VRM +Z 规范（背对相机），转 PI 面向用户。
+// 若换的模型原生已朝用户，改为 0。
+const MODEL_SCENE_ROT_Y = Math.PI;
+// 头骨跟随光标的 yaw 符号：随 MODEL_SCENE_ROT_Y 翻转。
+// rot=0（朝 -Z）时 θ = atan2(-dx,-dz)；rot=PI（朝 +Z）时 θ = atan2(dx,dz)。
+const MODEL_YAW_SIGN = MODEL_SCENE_ROT_Y === 0 ? -1 : 1;
+
 const app = document.getElementById('app')!;
 const fallback = document.getElementById('fallback')!;
 const hud = document.getElementById('hud')!;
@@ -55,6 +66,9 @@ const flash = document.getElementById('flash')!;
 const replyEl = document.getElementById('reply')!;
 const chatBox = document.getElementById('chat')!;
 const chatInput = document.getElementById('chat-input') as HTMLInputElement;
+const sizeBox = document.getElementById('size')!;
+const sizeRange = document.getElementById('size-range') as HTMLInputElement;
+const sizeVal = document.getElementById('size-val')!;
 
 type MotionFallbackPart = 'head' | 'body' | 'tail';
 
@@ -133,7 +147,10 @@ loader.load(
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
     VRMUtils.removeUnnecessaryJoints(gltf.scene);
     v.scene.traverse((obj: any) => { if (obj.isMesh) obj.frustumCulled = false; });
-    if (v.scene) v.scene.rotation.y = Math.PI;
+    // 模型朝向：VRM 规范模型默认面朝 +Z（背对相机），需转 PI 面向用户。
+    // 但本模型导出时已面朝 -Z（朝用户），故不旋转。换模型若背对屏幕，把这里改回 Math.PI，
+    // 并同步翻转下方头骨跟随的 yaw 符号（见 tick 里 MODEL_YAW_SIGN 说明）。
+    if (v.scene) v.scene.rotation.y = MODEL_SCENE_ROT_Y;
     scene.add(v.scene);
     if (v.lookAt) v.lookAt.target = lookTarget;
     vrm = v;
@@ -235,13 +252,22 @@ function updateExpressions(dt: number) {
 // === Cursor stream ===
 const ndc = new THREE.Vector2(-2, -2);
 let cursorInside = false;
+let cursorPx = { x: -1, y: -1 };
 petBridge.onCursor((c) => {
   cursorInside = c.inside;
+  cursorPx = { x: c.cx, y: c.cy };
   const rx = (c.cx / c.ww) * 2 - 1;
   const ry = -(c.cy / c.wh) * 2 + 1;
   ndc.x = Math.max(-2.5, Math.min(2.5, rx));
   ndc.y = Math.max(-2.5, Math.min(2.5, ry));
 });
+
+// 光标是否在滑块控件上（用屏幕坐标命中，因为透明窗穿透时 DOM pointer 事件不会触发）。
+function cursorOverSlider(): boolean {
+  const r = sizeBox.getBoundingClientRect();
+  const { x, y } = cursorPx;
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
 
 // === Drag + click reactions ===
 let dragging = false;
@@ -658,6 +684,26 @@ petBridge.onHotkey((name) => {
   }
 });
 
+// === 大小调节滑块 ===
+// 拖动 thumb 时光标可能短暂滑出控件边界，保持可点直到松手。
+let sliderDragging = false;
+sizeRange.addEventListener('pointerdown', () => { sliderDragging = true; });
+window.addEventListener('pointerup', () => { sliderDragging = false; });
+function updateSizeLabel(pct: number) {
+  sizeVal.textContent = `${pct}%`;
+}
+sizeRange.addEventListener('input', () => {
+  const pct = Number(sizeRange.value);
+  updateSizeLabel(pct);
+  petBridge.resize(pct / 100);
+});
+// 初始化滑块到已保存的 scale。
+petBridge.getScale().then((scale) => {
+  const pct = Math.round(scale * 100);
+  sizeRange.value = String(pct);
+  updateSizeLabel(pct);
+}).catch(() => {});
+
 // === 远程控制（M4a）===
 // A 端（controller）通过 Socket.IO 发指令，B 端（pet）路由到现有动作函数 / FBX 动作。
 type RemoteCommand =
@@ -1067,11 +1113,10 @@ function tick() {
         const dx = lookTarget.position.x - headWorld.x;
         const dy = lookTarget.position.y - headWorld.y;
         const dz = lookTarget.position.z - headWorld.z;
-        // v.scene 转了 PI（世界前向 +Z），但 headBone 是 normalized 骨骼，rotation 在它自己的坐标系里
-        // normalized 静止前向 = -Z；rotation.y=+θ 把 -Z 转向 -X。
-        // 世界方向 (dx,dy,dz) 映射到 normalized 系是 (-dx, dy, -dz)，需要 θ 让 -Z 转到 (-dx,*,-dz)：
-        //   sinθ = dx, cosθ = dz  →  θ = atan2(dx, dz)
-        const targetYaw = Math.atan2(dx, dz) * 0.35;
+        // headBone 是 normalized 骨骼，静止前向 = -Z；rotation.y=+θ 把前向绕 Y 转。
+        // 当 scene 不翻转（朝 -Z）时 θ = atan2(-dx,-dz)；翻转 PI（朝 +Z）时 θ = atan2(dx,dz)。
+        // 用 MODEL_YAW_SIGN 统一两种情况（见上方常量）。
+        const targetYaw = Math.atan2(MODEL_YAW_SIGN * dx, MODEL_YAW_SIGN * dz) * 0.35;
         const targetPitch = Math.atan2(dy, Math.hypot(dx, dz)) * 0.35;
         const clampedYaw = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetYaw));
         const clampedPitch = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetPitch));
@@ -1122,7 +1167,7 @@ function tick() {
 
   // clickable：chat 打开时强制开启（要能打字/点击）；否则按 hit-test
   let clickable = false;
-  if (chatOpen) clickable = true;
+  if (chatOpen || sliderDragging || (cursorInside && cursorOverSlider())) clickable = true;
   else if (vrm && cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
     const hits = raycaster.intersectObject(vrm.scene, true);
     clickable = hits.length > 0;
