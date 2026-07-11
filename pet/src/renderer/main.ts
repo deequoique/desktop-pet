@@ -17,6 +17,8 @@ declare global {
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
       getRoomSecret: () => Promise<string>;
+      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string }>;
+      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string } }>;
       getDesktopSourceId: () => Promise<string | null>;
     };
   }
@@ -42,6 +44,8 @@ const browserPetBridge: PetBridge = {
   listVoices: async () => [],
   getServerUrl: async () => 'http://localhost:3030',
   getRoomSecret: async () => 'change-me',
+  getPairingConfig: async () => ({ serverUrl: 'http://localhost:3030', roomSecret: 'change-me' }),
+  savePairingConfig: async (config) => ({ ok: true, config }),
   getDesktopSourceId: async () => null,
 };
 
@@ -66,6 +70,10 @@ const chatInput = document.getElementById('chat-input') as HTMLInputElement;
 const sizeBox = document.getElementById('size')!;
 const sizeRange = document.getElementById('size-range') as HTMLInputElement;
 const sizeVal = document.getElementById('size-val')!;
+const pairingForm = document.getElementById('pairing') as HTMLFormElement;
+const pairingServer = document.getElementById('pairing-server') as HTMLInputElement;
+const pairingSecret = document.getElementById('pairing-secret') as HTMLInputElement;
+const pairingError = document.getElementById('pairing-error')!;
 
 type MotionFallbackPart = 'head' | 'body' | 'tail';
 
@@ -662,16 +670,68 @@ function scheduleBlink() {
 scheduleBlink();
 
 // === 服务器地址 + 预录台词清单 ===
-let SERVER_URL = 'http://localhost:3030';
-let ROOM_SECRET = 'change-me';
+let SERVER_URL = '';
+let ROOM_SECRET = '';
+let pairingOpen = false;
 const voicesByPart: Record<'head' | 'body' | 'tail' | 'idle', string[]> = {
   head: [], body: [], tail: [], idle: [],
 };
 let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
 
+function isPairingReady() {
+  return !!SERVER_URL.trim() && !!ROOM_SECRET.trim();
+}
+
+function normalizeServerUrl(url: string) {
+  return url.trim().replace(/\/+$/, '');
+}
+
+function showPairing(config?: { serverUrl?: string; roomSecret?: string }) {
+  pairingOpen = true;
+  pairingForm.classList.remove('hidden');
+  pairingServer.value = config?.serverUrl || SERVER_URL || '';
+  pairingSecret.value = config?.roomSecret || '';
+  pairingError.textContent = '';
+  petBridge.setClickable(true);
+  setTimeout(() => (pairingServer.value ? pairingSecret : pairingServer).focus(), 0);
+}
+
+function hidePairing() {
+  pairingOpen = false;
+  pairingForm.classList.add('hidden');
+  pairingError.textContent = '';
+}
+
+pairingForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const serverUrl = normalizeServerUrl(pairingServer.value);
+  const roomSecret = pairingSecret.value.trim();
+  if (!serverUrl || !roomSecret) {
+    pairingError.textContent = '请填写服务器地址和房间密钥。';
+    return;
+  }
+  if (!/^https?:\/\//i.test(serverUrl)) {
+    pairingError.textContent = '服务器地址需要以 http:// 或 https:// 开头。';
+    return;
+  }
+
+  pairingError.textContent = '';
+  const res = await petBridge.savePairingConfig({ serverUrl, roomSecret });
+  if (!res.ok) {
+    pairingError.textContent = res.error || '保存失败，请重试。';
+    return;
+  }
+  SERVER_URL = res.config?.serverUrl || serverUrl;
+  ROOM_SECRET = res.config?.roomSecret || roomSecret;
+  hidePairing();
+  connectRemote();
+});
+
 (async () => {
-  try { SERVER_URL = await petBridge.getServerUrl(); } catch {}
-  try { ROOM_SECRET = await petBridge.getRoomSecret(); } catch {}
+  let pairingConfig: { serverUrl?: string; roomSecret?: string } = {};
+  try { pairingConfig = await petBridge.getPairingConfig(); } catch {}
+  SERVER_URL = normalizeServerUrl(pairingConfig.serverUrl || '');
+  ROOM_SECRET = (pairingConfig.roomSecret || '').trim();
   await loadMotionManifest();
   try {
     const files = await petBridge.listVoices();
@@ -686,7 +746,8 @@ let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
     console.warn('[voices] load failed:', e);
   }
   // motions / voices 加载完之后再连远程，ack 才有内容
-  connectRemote();
+  if (isPairingReady()) connectRemote();
+  else showPairing(pairingConfig);
 })();
 
 // === Web Audio：播放音频 + 实时口型同步 ===
@@ -1144,6 +1205,10 @@ async function handleRtcSignal(signal: WebRtcSignal) {
 
 function connectRemote() {
   if (remoteSocket) return;
+  if (!isPairingReady()) {
+    showPairing({ serverUrl: SERVER_URL, roomSecret: ROOM_SECRET });
+    return;
+  }
   try {
     remoteSocket = io(SERVER_URL, {
       transports: ['websocket', 'polling'],
@@ -1305,9 +1370,9 @@ function tick() {
     }
   }
 
-  // clickable：chat 打开时强制开启（要能打字/点击）；否则按 hit-test
+  // clickable：配对/chat 打开时强制开启（要能打字/点击）；否则按 hit-test
   let clickable = false;
-  if (chatOpen || sliderDragging || (cursorInside && cursorOverSlider())) clickable = true;
+  if (pairingOpen || chatOpen || sliderDragging || (cursorInside && cursorOverSlider())) clickable = true;
   else if (vrm && cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
     const hits = raycaster.intersectObject(vrm.scene, true);
     clickable = hits.length > 0;

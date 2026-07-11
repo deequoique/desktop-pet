@@ -34,14 +34,12 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ secrets.PET_SERVER_URL }}" -eq "") { throw "Missing repository secret: PET_SERVER_URL" }
-          if ("${{ secrets.PET_ROOM_SECRET }}" -eq "") { throw "Missing repository secret: PET_ROOM_SECRET" }
 
       - name: Generate production config
         shell: pwsh
         run: |
           $config = @{
             serverUrl = "${{ secrets.PET_SERVER_URL }}"
-            roomSecret = "${{ secrets.PET_ROOM_SECRET }}"
           }
           $config | ConvertTo-Json | Out-File -Encoding utf8 config/production.json
 

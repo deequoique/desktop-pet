@@ -1,4 +1,3 @@
 {
-  "serverUrl": "https://pet.example.com",
-  "roomSecret": "change-me"
+  "serverUrl": "https://pet.example.com"
 }

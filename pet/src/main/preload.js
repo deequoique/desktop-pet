@@ -11,5 +11,7 @@ contextBridge.exposeInMainWorld('pet', {
   listVoices: () => ipcRenderer.invoke('pet:voices'),
   getServerUrl: () => ipcRenderer.invoke('pet:server-url'),
   getRoomSecret: () => ipcRenderer.invoke('pet:room-secret'),
+  getPairingConfig: () => ipcRenderer.invoke('pet:pairing-config'),
+  savePairingConfig: (config) => ipcRenderer.invoke('pet:save-pairing-config', config),
   getDesktopSourceId: () => ipcRenderer.invoke('pet:desktop-source-id'),
 });

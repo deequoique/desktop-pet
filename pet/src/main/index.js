@@ -24,6 +24,7 @@ const clampScale = (s) => {
 };
 
 const stateFile = () => path.join(app.getPath('userData'), 'pet-state.json');
+const pairingFile = () => path.join(app.getPath('userData'), 'pairing.json');
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')); }
@@ -48,6 +49,16 @@ function readJson(file) {
   catch { return null; }
 }
 
+function writeJson(file, data) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    return true;
+  } catch (error) {
+    console.warn('[config] write failed:', error?.message || error);
+    return false;
+  }
+}
+
 function loadRuntimeConfig() {
   const candidates = app.isPackaged
     ? [
@@ -66,13 +77,21 @@ function loadRuntimeConfig() {
 }
 
 const runtimeConfig = loadRuntimeConfig();
+const pairingConfig = readJson(pairingFile()) || {};
 
 function configuredServerUrl() {
-  return runtimeConfig.serverUrl || process.env.PET_SERVER_URL || 'http://localhost:3030';
+  return pairingConfig.serverUrl || runtimeConfig.serverUrl || process.env.PET_SERVER_URL || '';
 }
 
 function configuredRoomSecret() {
-  return runtimeConfig.roomSecret || process.env.PET_ROOM_SECRET || 'change-me';
+  return pairingConfig.roomSecret || process.env.PET_ROOM_SECRET || '';
+}
+
+function pairingSnapshot() {
+  return {
+    serverUrl: configuredServerUrl(),
+    roomSecret: configuredRoomSecret(),
+  };
 }
 
 function defaultBottomRight() {
@@ -254,6 +273,21 @@ ipcMain.handle('pet:server-url', () => configuredServerUrl());
 
 // 房间密钥：和 server/.env 的 ROOM_SECRET 对齐。真实密钥不要提交进 Git。
 ipcMain.handle('pet:room-secret', () => configuredRoomSecret());
+
+ipcMain.handle('pet:pairing-config', () => pairingSnapshot());
+ipcMain.handle('pet:save-pairing-config', (_e, config) => {
+  const next = {
+    serverUrl: String(config?.serverUrl || '').trim(),
+    roomSecret: String(config?.roomSecret || '').trim(),
+  };
+  if (!next.serverUrl || !next.roomSecret) {
+    return { ok: false, error: 'serverUrl and roomSecret required' };
+  }
+  pairingConfig.serverUrl = next.serverUrl;
+  pairingConfig.roomSecret = next.roomSecret;
+  const ok = writeJson(pairingFile(), pairingConfig);
+  return ok ? { ok: true, config: pairingSnapshot() } : { ok: false, error: 'write failed' };
+});
 
 ipcMain.handle('pet:desktop-source-id', async () => {
   try {
