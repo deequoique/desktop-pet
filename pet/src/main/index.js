@@ -4,6 +4,13 @@ const fs = require('fs');
 
 const DEV_URL = 'http://localhost:5173';
 const isDev = !app.isPackaged;
+let autoUpdater = null;
+try {
+  ({ autoUpdater } = require('electron-updater'));
+} catch {
+  autoUpdater = null;
+}
+
 // scale=1 的基准尺寸；实际窗口 = 基准 * scale。
 const PET_W = 360;
 const PET_H = 480;
@@ -34,6 +41,38 @@ function patchState(patch) {
 function currentScale() {
   const s = loadState();
   return clampScale(s && s.scale != null ? s.scale : 1);
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+
+function loadRuntimeConfig() {
+  const candidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, 'config', 'production.json'),
+        path.join(path.dirname(process.execPath), 'config', 'production.json'),
+      ]
+    : [
+        path.join(__dirname, '..', '..', 'config', 'production.json'),
+      ];
+
+  for (const file of candidates) {
+    const config = readJson(file);
+    if (config && typeof config === 'object') return config;
+  }
+  return {};
+}
+
+const runtimeConfig = loadRuntimeConfig();
+
+function configuredServerUrl() {
+  return runtimeConfig.serverUrl || process.env.PET_SERVER_URL || 'http://localhost:3030';
+}
+
+function configuredRoomSecret() {
+  return runtimeConfig.roomSecret || process.env.PET_ROOM_SECRET || 'change-me';
 }
 
 function defaultBottomRight() {
@@ -198,7 +237,9 @@ function stopCursorPoll() {
 
 // 扫预录台词目录 → 让渲染层知道有哪些可以播
 // 命名规则：head_*.wav / body_*.wav / tail_*.wav / idle_*.wav
-const VOICES_DIR = path.join(__dirname, '..', '..', 'public', 'voices');
+const VOICES_DIR = app.isPackaged
+  ? path.join(__dirname, '..', '..', 'dist', 'voices')
+  : path.join(__dirname, '..', '..', 'public', 'voices');
 ipcMain.handle('pet:voices', () => {
   try {
     return fs.readdirSync(VOICES_DIR)
@@ -208,12 +249,11 @@ ipcMain.handle('pet:voices', () => {
   }
 });
 
-// 服务器地址（dev 期写死，部署后从配置读）
-ipcMain.handle('pet:server-url', () => process.env.PET_SERVER_URL || 'http://localhost:3030');
+// 服务器地址：生产包优先读 config/production.json；开发期可用环境变量覆盖。
+ipcMain.handle('pet:server-url', () => configuredServerUrl());
 
-// 房间密钥（M4 远程控制）；和 server/.env 的 ROOM_SECRET 对齐。
-// 没设就用 'change-me'（和 server 默认对齐，本机 dev 直接跑）。
-ipcMain.handle('pet:room-secret', () => process.env.PET_ROOM_SECRET || 'change-me');
+// 房间密钥：和 server/.env 的 ROOM_SECRET 对齐。真实密钥不要提交进 Git。
+ipcMain.handle('pet:room-secret', () => configuredRoomSecret());
 
 ipcMain.handle('pet:desktop-source-id', async () => {
   try {
@@ -231,6 +271,13 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   startCursorPoll();
+
+  if (app.isPackaged && autoUpdater) {
+    autoUpdater.autoDownload = true;
+    autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+      console.warn('[updater] check failed:', error?.message || error);
+    });
+  }
 
   // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
   globalShortcut.register('Control+Alt+D', () => {

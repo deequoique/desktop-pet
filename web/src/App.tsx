@@ -17,12 +17,19 @@ import {
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
 type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
+type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown' | 'failed';
+
+type RtcRoute = {
+  candidateType: CandidateType;
+  relayed: boolean;
+  detail: string;
+};
 
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 
-const DEFAULT_SERVER = 'http://localhost:3030';
-const DEFAULT_SECRET = 'change-me';
+const DEFAULT_SERVER = import.meta.env.VITE_PET_SERVER_URL || 'http://localhost:3030';
+const DEFAULT_SECRET = import.meta.env.VITE_PET_ROOM_SECRET || 'change-me';
 
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -45,6 +52,59 @@ const CORNERS: { corner: Corner; label: string }[] = [
   { corner: 'bottom-left', label: '左下' },
   { corner: 'bottom-right', label: '右下' },
 ];
+
+const EMPTY_RTC_ROUTE: RtcRoute = {
+  candidateType: 'unknown',
+  relayed: false,
+  detail: '等待 ICE 选路',
+};
+
+function candidateAddress(candidate: any): string {
+  return candidate?.address || candidate?.ip || candidate?.hostname || '';
+}
+
+async function readRtcRoute(pc: RTCPeerConnection): Promise<RtcRoute> {
+  if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
+    return { candidateType: 'failed', relayed: false, detail: 'ICE 连接失败' };
+  }
+
+  const stats = await pc.getStats();
+  let pair: any = null;
+
+  stats.forEach((report: any) => {
+    if (report.type === 'transport' && report.selectedCandidatePairId) {
+      pair = stats.get(report.selectedCandidatePairId);
+    }
+  });
+
+  if (!pair) {
+    stats.forEach((report: any) => {
+      if (report.type === 'candidate-pair' && (report.selected || report.nominated) && report.state === 'succeeded') {
+        pair = report;
+      }
+    });
+  }
+
+  if (!pair) return EMPTY_RTC_ROUTE;
+
+  const local: any = stats.get(pair.localCandidateId);
+  const remote: any = stats.get(pair.remoteCandidateId);
+  const candidateType = (local?.candidateType || 'unknown') as CandidateType;
+  const protocol = local?.protocol || pair.protocol || '';
+  const localAddr = candidateAddress(local);
+  const remoteAddr = candidateAddress(remote);
+  const detail = [
+    candidateType,
+    protocol,
+    localAddr && remoteAddr ? `${localAddr} → ${remoteAddr}` : '',
+  ].filter(Boolean).join(' · ');
+
+  return {
+    candidateType,
+    relayed: candidateType === 'relay',
+    detail: detail || 'ICE 已连接',
+  };
+}
 
 function voicePart(url: string): 'head' | 'body' | 'tail' | 'idle' | 'other' {
   const name = url.split('/').pop() || '';
@@ -70,6 +130,7 @@ export default function App() {
   const [pttPressed, setPttPressed] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
   const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
+  const [rtcRoute, setRtcRoute] = useState<RtcRoute>(EMPTY_RTC_ROUTE);
   const toastTimer = useRef<number | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
@@ -104,6 +165,7 @@ export default function App() {
     setMicEnabled(false);
     setRemoteReady(false);
     setRemoteTrackSummary('无');
+    setRtcRoute(EMPTY_RTC_ROUTE);
     remoteStreamRef.current = null;
     setCallState(opts?.nextState ?? 'idle');
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
@@ -210,13 +272,23 @@ export default function App() {
       console.log('[webrtc] controller connection state:', state);
       if (state === 'connected') {
         setCallState('in-call');
+        readRtcRoute(pc).then(setRtcRoute).catch(() => {});
         return;
       }
       if (state === 'failed' || state === 'disconnected') {
         showToast('通话断开了', true);
         teardownCall({ nextState: 'idle' });
+        setRtcRoute({ candidateType: 'failed', relayed: false, detail: `连接状态：${state}` });
       }
       if (state === 'closed') teardownCall({ nextState: 'idle' });
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        readRtcRoute(pc).then(setRtcRoute).catch(() => {});
+      }
+      if (pc.iceConnectionState === 'failed') {
+        setRtcRoute({ candidateType: 'failed', relayed: false, detail: 'ICE 连接失败' });
+      }
     };
 
     return pc;
@@ -304,6 +376,16 @@ export default function App() {
   useEffect(() => {
     if (remoteVideoRef.current) remoteVideoRef.current.muted = remoteMuted;
   }, [remoteMuted]);
+
+  useEffect(() => {
+    if (callState !== 'calling' && callState !== 'in-call') return;
+    const timer = window.setInterval(() => {
+      const pc = rtcPcRef.current;
+      if (!pc) return;
+      readRtcRoute(pc).then(setRtcRoute).catch(() => {});
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [callState]);
 
   const onConnect = useCallback(() => {
     if (!serverUrl.trim() || !secret.trim()) {
@@ -443,6 +525,11 @@ export default function App() {
           <span>{remoteReady ? '已收到桌面视频流' : '尚未收到视频流'}</span>
           <span>远端轨道：{remoteTrackSummary}</span>
           <span>{remoteMuted ? '对端声音默认静音' : '对端声音开启'}</span>
+        </div>
+        <div className={`rtc-route ${rtcRoute.candidateType}`}>
+          <span>ICE：{rtcRoute.candidateType}</span>
+          <span>{rtcRoute.relayed ? '正在走中继，会吃 TURN 带宽' : '优先点对点，不走本项目服务器视频带宽'}</span>
+          <span>{rtcRoute.detail}</span>
         </div>
         <div className="call-row">
           <CallPill state={callState} />

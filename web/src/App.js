@@ -3,8 +3,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { connect, disconnect, listMotions, listVoices, sendCommand, sendHangup, sendSignal, setListeners, } from './api';
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
-const DEFAULT_SERVER = 'http://localhost:3030';
-const DEFAULT_SECRET = 'change-me';
+const DEFAULT_SERVER = import.meta.env.VITE_PET_SERVER_URL || 'http://localhost:3030';
+const DEFAULT_SECRET = import.meta.env.VITE_PET_ROOM_SECRET || 'change-me';
 const RTC_CONFIG = {
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
 };
@@ -22,6 +22,51 @@ const CORNERS = [
     { corner: 'bottom-left', label: '左下' },
     { corner: 'bottom-right', label: '右下' },
 ];
+const EMPTY_RTC_ROUTE = {
+    candidateType: 'unknown',
+    relayed: false,
+    detail: '等待 ICE 选路',
+};
+function candidateAddress(candidate) {
+    return candidate?.address || candidate?.ip || candidate?.hostname || '';
+}
+async function readRtcRoute(pc) {
+    if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
+        return { candidateType: 'failed', relayed: false, detail: 'ICE 连接失败' };
+    }
+    const stats = await pc.getStats();
+    let pair = null;
+    stats.forEach((report) => {
+        if (report.type === 'transport' && report.selectedCandidatePairId) {
+            pair = stats.get(report.selectedCandidatePairId);
+        }
+    });
+    if (!pair) {
+        stats.forEach((report) => {
+            if (report.type === 'candidate-pair' && (report.selected || report.nominated) && report.state === 'succeeded') {
+                pair = report;
+            }
+        });
+    }
+    if (!pair)
+        return EMPTY_RTC_ROUTE;
+    const local = stats.get(pair.localCandidateId);
+    const remote = stats.get(pair.remoteCandidateId);
+    const candidateType = (local?.candidateType || 'unknown');
+    const protocol = local?.protocol || pair.protocol || '';
+    const localAddr = candidateAddress(local);
+    const remoteAddr = candidateAddress(remote);
+    const detail = [
+        candidateType,
+        protocol,
+        localAddr && remoteAddr ? `${localAddr} → ${remoteAddr}` : '',
+    ].filter(Boolean).join(' · ');
+    return {
+        candidateType,
+        relayed: candidateType === 'relay',
+        detail: detail || 'ICE 已连接',
+    };
+}
 function voicePart(url) {
     const name = url.split('/').pop() || '';
     const m = name.match(/^(head|body|tail|idle)_/i);
@@ -44,6 +89,7 @@ export default function App() {
     const [pttPressed, setPttPressed] = useState(false);
     const [remoteReady, setRemoteReady] = useState(false);
     const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
+    const [rtcRoute, setRtcRoute] = useState(EMPTY_RTC_ROUTE);
     const toastTimer = useRef(null);
     const remoteVideoRef = useRef(null);
     const remoteStreamRef = useRef(null);
@@ -82,6 +128,7 @@ export default function App() {
         setMicEnabled(false);
         setRemoteReady(false);
         setRemoteTrackSummary('无');
+        setRtcRoute(EMPTY_RTC_ROUTE);
         remoteStreamRef.current = null;
         setCallState(opts?.nextState ?? 'idle');
         if (remoteVideoRef.current)
@@ -186,14 +233,24 @@ export default function App() {
             console.log('[webrtc] controller connection state:', state);
             if (state === 'connected') {
                 setCallState('in-call');
+                readRtcRoute(pc).then(setRtcRoute).catch(() => { });
                 return;
             }
             if (state === 'failed' || state === 'disconnected') {
                 showToast('通话断开了', true);
                 teardownCall({ nextState: 'idle' });
+                setRtcRoute({ candidateType: 'failed', relayed: false, detail: `连接状态：${state}` });
             }
             if (state === 'closed')
                 teardownCall({ nextState: 'idle' });
+        };
+        pc.oniceconnectionstatechange = () => {
+            if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                readRtcRoute(pc).then(setRtcRoute).catch(() => { });
+            }
+            if (pc.iceConnectionState === 'failed') {
+                setRtcRoute({ candidateType: 'failed', relayed: false, detail: 'ICE 连接失败' });
+            }
         };
         return pc;
     }, [ensureLocalAudio, showToast, teardownCall]);
@@ -280,6 +337,17 @@ export default function App() {
         if (remoteVideoRef.current)
             remoteVideoRef.current.muted = remoteMuted;
     }, [remoteMuted]);
+    useEffect(() => {
+        if (callState !== 'calling' && callState !== 'in-call')
+            return;
+        const timer = window.setInterval(() => {
+            const pc = rtcPcRef.current;
+            if (!pc)
+                return;
+            readRtcRoute(pc).then(setRtcRoute).catch(() => { });
+        }, 2500);
+        return () => window.clearInterval(timer);
+    }, [callState]);
     const onConnect = useCallback(() => {
         if (!serverUrl.trim() || !secret.trim()) {
             showToast('填一下服务器和密钥', true);
@@ -353,7 +421,7 @@ export default function App() {
     }, [voices]);
     return (_jsxs("div", { className: "app", children: [_jsxs("header", { className: "hero", children: [_jsxs("div", { children: [_jsx("p", { className: "eyebrow", children: "REMOTE CONSOLE" }), _jsx("h1", { children: "\u684C\u5BA0\u8FDC\u7A0B\u63A7\u5236\u53F0" }), _jsx("p", { className: "hero-copy", children: "\u9ED1\u767D\u84DD\u4E3B\u754C\u9762\uFF0C\u4F18\u5148\u628A\u5C4F\u5E55\u3001\u901A\u8BDD\u548C\u63A7\u5236\u52A8\u4F5C\u653E\u5230\u4E00\u5C4F\u5185\u3002" })] }), _jsxs("div", { className: "hero-badge", children: [_jsx("span", { className: `signal ${peers.pet ? 'on' : ''}` }), _jsx("span", { children: peers.pet ? '桌宠在线' : '等待桌宠' })] })] }), _jsxs("div", { className: "status-bar", children: [_jsxs("div", { className: "status-row", children: [_jsx("label", { children: "\u670D\u52A1\u5668" }), _jsx("input", { value: serverUrl, onChange: (e) => setServerUrl(e.target.value), placeholder: "http://localhost:3030", disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("div", { className: "status-row", children: [_jsx("label", { children: "\u623F\u95F4\u5BC6\u94A5" }), _jsx("input", { type: "password", value: secret, onChange: (e) => setSecret(e.target.value), placeholder: "ROOM_SECRET", disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("div", { className: "status-row", children: [_jsx(StatusPill, { status: status }), _jsx(PeerPill, { role: "pet", online: peers.pet }), _jsx("div", { style: { flex: 1 } }), status === 'connected' || status === 'connecting' ? (_jsx("button", { className: "btn", onClick: onDisconnect, children: "\u65AD\u5F00" })) : (_jsx("button", { className: "btn accent", onClick: onConnect, children: "\u8FDE\u63A5" }))] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u901A\u8BDD" }), _jsxs("div", { className: "video-stage", children: [_jsx("video", { ref: remoteVideoRef, className: `video-frame ${remoteReady ? 'ready' : ''}`, playsInline: true, autoPlay: true }), !remoteReady && (_jsx("div", { className: "video-empty", children: callState === 'calling' || callState === 'requesting-media'
                                     ? '正在等桌宠把屏幕推过来。\n如果一直没画面，先去 B 端确认屏幕录制权限。'
-                                    : '点“开始通话”后，这里会显示她的屏幕。' }))] }), _jsxs("div", { className: "video-meta", children: [_jsx("span", { children: remoteReady ? '已收到桌面视频流' : '尚未收到视频流' }), _jsxs("span", { children: ["\u8FDC\u7AEF\u8F68\u9053\uFF1A", remoteTrackSummary] }), _jsx("span", { children: remoteMuted ? '对端声音默认静音' : '对端声音开启' })] }), _jsxs("div", { className: "call-row", children: [_jsx(CallPill, { state: callState }), _jsx("button", { className: "btn accent", disabled: !canCall || callState === 'calling' || callState === 'requesting-media' || callState === 'in-call', onClick: onStartCall, children: "\u5F00\u59CB\u901A\u8BDD" }), _jsx("button", { className: "btn", disabled: callState !== 'calling' && callState !== 'in-call', onClick: onEndCall, children: "\u7ED3\u675F\u901A\u8BDD" }), _jsx("button", { className: `btn ${pttPressed ? 'accent' : ''}`, disabled: callState !== 'calling' && callState !== 'in-call', onMouseDown: () => setTalkPressed(true), onMouseUp: () => setTalkPressed(false), onMouseLeave: () => setTalkPressed(false), onTouchStart: () => setTalkPressed(true), onTouchEnd: () => setTalkPressed(false), onTouchCancel: () => setTalkPressed(false), children: pttPressed ? '正在说话...' : '按住说话' }), _jsx("button", { className: "btn", disabled: !remoteReady, onClick: () => setRemoteMuted((v) => !v), children: remoteMuted ? '打开声音' : '静音对端' })] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u8868\u60C5" }), _jsx("div", { className: "grid tight", children: EXPRESSIONS.map((e) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'expression', name: e.name }, e.label), children: e.label }, e.name))) }), _jsx("h3", { children: "\u52A8\u4F5C" }), motions.length === 0 ? (_jsx("div", { className: "empty", children: canSend ? '当前模型还没配置动作；把 manifest 和 .vrma 放进 pet/public/motions/ 后重启即可' : '连上后会显示' })) : (_jsx("div", { className: "grid tight", children: motions.map((m) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'animation', name: m.id }, m.label), children: m.label }, m.id))) }))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u9884\u5F55\u53F0\u8BCD" }), voices.length === 0 ? (_jsx("div", { className: "empty", children: canSend ? '桌宠端没扫到台词；放 .wav 到 pet/public/voices/ 下重启即可' : '连上后会显示' })) : (['head', 'body', 'tail', 'idle', 'other'].map((part) => groupedVoices[part]?.length ? (_jsxs("div", { children: [_jsx("h3", { children: part }), _jsx("div", { className: "grid", children: groupedVoices[part].map((url) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'say_audio', url }, voiceLabel(url)), children: voiceLabel(url) }, url))) })] }, part)) : null))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u6253\u5B57\u5FF5\u51FA\u6765\uFF08\u7528\u4F60\u7684\u58F0\u97F3\uFF09" }), _jsxs("div", { className: "tts-area", children: [_jsx("textarea", { value: tts, onChange: (e) => setTts(e.target.value), placeholder: "\u60F3\u4F60\u4E86\u2026 (Ctrl/Cmd + Enter \u53D1\u9001)", maxLength: 200, onKeyDown: (e) => {
+                                    : '点“开始通话”后，这里会显示她的屏幕。' }))] }), _jsxs("div", { className: "video-meta", children: [_jsx("span", { children: remoteReady ? '已收到桌面视频流' : '尚未收到视频流' }), _jsxs("span", { children: ["\u8FDC\u7AEF\u8F68\u9053\uFF1A", remoteTrackSummary] }), _jsx("span", { children: remoteMuted ? '对端声音默认静音' : '对端声音开启' })] }), _jsxs("div", { className: `rtc-route ${rtcRoute.candidateType}`, children: [_jsxs("span", { children: ["ICE\uFF1A", rtcRoute.candidateType] }), _jsx("span", { children: rtcRoute.relayed ? '正在走中继，会吃 TURN 带宽' : '优先点对点，不走本项目服务器视频带宽' }), _jsx("span", { children: rtcRoute.detail })] }), _jsxs("div", { className: "call-row", children: [_jsx(CallPill, { state: callState }), _jsx("button", { className: "btn accent", disabled: !canCall || callState === 'calling' || callState === 'requesting-media' || callState === 'in-call', onClick: onStartCall, children: "\u5F00\u59CB\u901A\u8BDD" }), _jsx("button", { className: "btn", disabled: callState !== 'calling' && callState !== 'in-call', onClick: onEndCall, children: "\u7ED3\u675F\u901A\u8BDD" }), _jsx("button", { className: `btn ${pttPressed ? 'accent' : ''}`, disabled: callState !== 'calling' && callState !== 'in-call', onMouseDown: () => setTalkPressed(true), onMouseUp: () => setTalkPressed(false), onMouseLeave: () => setTalkPressed(false), onTouchStart: () => setTalkPressed(true), onTouchEnd: () => setTalkPressed(false), onTouchCancel: () => setTalkPressed(false), children: pttPressed ? '正在说话...' : '按住说话' }), _jsx("button", { className: "btn", disabled: !remoteReady, onClick: () => setRemoteMuted((v) => !v), children: remoteMuted ? '打开声音' : '静音对端' })] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u8868\u60C5" }), _jsx("div", { className: "grid tight", children: EXPRESSIONS.map((e) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'expression', name: e.name }, e.label), children: e.label }, e.name))) }), _jsx("h3", { children: "\u52A8\u4F5C" }), motions.length === 0 ? (_jsx("div", { className: "empty", children: canSend ? '当前模型还没配置动作；把 manifest 和 .vrma 放进 pet/public/motions/ 后重启即可' : '连上后会显示' })) : (_jsx("div", { className: "grid tight", children: motions.map((m) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'animation', name: m.id }, m.label), children: m.label }, m.id))) }))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u9884\u5F55\u53F0\u8BCD" }), voices.length === 0 ? (_jsx("div", { className: "empty", children: canSend ? '桌宠端没扫到台词；放 .wav 到 pet/public/voices/ 下重启即可' : '连上后会显示' })) : (['head', 'body', 'tail', 'idle', 'other'].map((part) => groupedVoices[part]?.length ? (_jsxs("div", { children: [_jsx("h3", { children: part }), _jsx("div", { className: "grid", children: groupedVoices[part].map((url) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'say_audio', url }, voiceLabel(url)), children: voiceLabel(url) }, url))) })] }, part)) : null))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u6253\u5B57\u5FF5\u51FA\u6765\uFF08\u7528\u4F60\u7684\u58F0\u97F3\uFF09" }), _jsxs("div", { className: "tts-area", children: [_jsx("textarea", { value: tts, onChange: (e) => setTts(e.target.value), placeholder: "\u60F3\u4F60\u4E86\u2026 (Ctrl/Cmd + Enter \u53D1\u9001)", maxLength: 200, onKeyDown: (e) => {
                                     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                                         e.preventDefault();
                                         onSendTts();

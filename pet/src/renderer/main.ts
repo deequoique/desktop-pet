@@ -47,17 +47,14 @@ const browserPetBridge: PetBridge = {
 
 const petBridge: PetBridge = window.pet ?? browserPetBridge;
 
-const VRM_URL = '/sample.vrm';
-const MOTION_MANIFEST_URL = '/motions/manifest.json';
-const MOTION_BASE_URL = '/motions/';
+const VRM_URL = './sample.vrm';
+const MOTION_MANIFEST_URL = './motions/manifest.json';
+const MOTION_BASE_URL = './motions/';
 const MOTION_FADE_SECONDS = 0.18;
 
 // 模型整体 Y 轴旋转：当前模型符合 VRM +Z 规范（背对相机），转 PI 面向用户。
 // 若换的模型原生已朝用户，改为 0。
 const MODEL_SCENE_ROT_Y = Math.PI;
-// 头骨跟随光标的 yaw 符号：随 MODEL_SCENE_ROT_Y 翻转。
-// rot=0（朝 -Z）时 θ = atan2(-dx,-dz)；rot=PI（朝 +Z）时 θ = atan2(dx,dz)。
-const MODEL_YAW_SIGN = MODEL_SCENE_ROT_Y === 0 ? -1 : 1;
 
 const app = document.getElementById('app')!;
 const fallback = document.getElementById('fallback')!;
@@ -136,6 +133,138 @@ let motionMixer: THREE.AnimationMixer | null = null;
 let currentMotionAction: THREE.AnimationAction | null = null;
 let currentMotionId = '';
 let currentMotionStopTimer = 0;
+let modelRotationY = MODEL_SCENE_ROT_Y;
+
+type TailBoneBinding = {
+  node: THREE.Object3D;
+  rest: THREE.Quaternion;
+  restPosition: THREE.Vector3;
+  phase: number;
+  weight: number;
+};
+
+let tailBones: TailBoneBinding[] = [];
+let tailReactionUntil = 0;
+let lastTailWagAt = 0;
+let tailDebugNextLogAt = 0;
+const tailEuler = new THREE.Euler();
+const tailQuat = new THREE.Quaternion();
+
+// 最终 sample.vrm 的尾巴链：h1 spring bone 加末端 child；球体.014 的主要权重在 骨骼.079。
+const FINAL_TAIL_BONE_NAMES = ['骨骼.075', '骨骼.076', '骨骼.077', '骨骼.078', '骨骼.079'];
+const FINAL_TAIL_MESH_NAMES = new Set(['球体.014']);
+const TAIL_HIT_RADIUS = 0.22;
+const tailHitA = new THREE.Vector3();
+const tailHitB = new THREE.Vector3();
+const tailHitC = new THREE.Vector3();
+const tailHitD = new THREE.Vector3();
+
+function bindTailBones(target: VRM) {
+  const named = new Map<string, THREE.Object3D>();
+  target.scene.traverse((obj) => {
+    if (!obj.name) return;
+    named.set(obj.name, obj);
+  });
+
+  tailBones = FINAL_TAIL_BONE_NAMES
+    .map((name) => named.get(name))
+    .filter((obj): obj is THREE.Object3D => !!obj)
+    .map((node, i) => ({
+      node,
+      rest: node.quaternion.clone(),
+      restPosition: node.position.clone(),
+      phase: i * 0.42,
+      weight: 1 + i * 0.18,
+    }));
+
+  console.log('[tail] bound bones:', tailBones.map((b) => b.node.name));
+}
+
+function applyModelRotation() {
+  if (vrm?.scene) vrm.scene.rotation.y = modelRotationY;
+}
+
+function triggerTailWag() {
+  lastTailWagAt = performance.now();
+  tailReactionUntil = performance.now() / 1000 + 1.6;
+  tailDebugNextLogAt = 0;
+  console.log('[tail] wag triggered', {
+    bones: tailBones.map((b) => b.node.name),
+    until: tailReactionUntil.toFixed(2),
+  });
+}
+
+function updateTailWag(t: number) {
+  if (!tailBones.length) return;
+  const boost = Math.max(0, Math.min(1, (tailReactionUntil - t) / 0.8));
+  const amp = 0.14 + boost * 0.62;
+  const shiftAmp = 0.012 + boost * 0.065;
+  const speed = 3.1 + boost * 9.5;
+
+  for (let i = 0; i < tailBones.length; i++) {
+    const bone = tailBones[i];
+    const side = Math.sin(t * speed + bone.phase) * amp * bone.weight;
+    const curl = Math.sin(t * speed * 0.63 + bone.phase) * amp * 0.45 * bone.weight;
+    const twist = Math.sin(t * speed * 0.78 + bone.phase) * amp * 0.22 * bone.weight;
+    const shift = Math.sin(t * speed + bone.phase) * shiftAmp * (1 + i * 0.35);
+    bone.node.position.copy(bone.restPosition);
+    bone.node.position.x += shift;
+    bone.node.position.y += Math.abs(shift) * 0.18;
+    tailEuler.set(curl, side, twist + side * 0.35, 'XYZ');
+    tailQuat.setFromEuler(tailEuler);
+    bone.node.quaternion.copy(bone.rest).multiply(tailQuat);
+  }
+  tailBones[0]?.node.updateMatrixWorld(true);
+
+  if (boost > 0 && t >= tailDebugNextLogAt) {
+    const root = tailBones[0];
+    console.log('[tail] wag frame', {
+      boost: boost.toFixed(2),
+      amp: amp.toFixed(2),
+      root: root?.node.name,
+      rootPos: root ? root.node.position.toArray().map((v) => Number(v.toFixed(3))) : [],
+      rootRot: root ? [root.node.rotation.x, root.node.rotation.y, root.node.rotation.z].map((v) => Number(v.toFixed(3))) : [],
+    });
+    tailDebugNextLogAt = t + 0.25;
+  }
+}
+
+function isHappyMotion(entry: MotionManifestEntry) {
+  const text = `${entry.id} ${entry.label}`.toLowerCase();
+  return /happy|joy|fun|开心|高兴|愉快|快乐/.test(text);
+}
+
+function isNearTail(point: THREE.Vector3) {
+  if (!tailBones.length) return false;
+  let closest = Infinity;
+
+  for (const bone of tailBones) {
+    bone.node.getWorldPosition(tailHitA);
+    closest = Math.min(closest, point.distanceTo(tailHitA));
+  }
+
+  for (let i = 0; i < tailBones.length - 1; i++) {
+    tailBones[i].node.getWorldPosition(tailHitA);
+    tailBones[i + 1].node.getWorldPosition(tailHitB);
+    tailHitC.subVectors(tailHitB, tailHitA);
+    const lenSq = tailHitC.lengthSq();
+    if (lenSq < 1e-6) continue;
+    const u = Math.max(0, Math.min(1, tailHitD.copy(point).sub(tailHitA).dot(tailHitC) / lenSq));
+    tailHitC.multiplyScalar(u).add(tailHitA);
+    closest = Math.min(closest, point.distanceTo(tailHitC));
+  }
+
+  return closest <= TAIL_HIT_RADIUS;
+}
+
+function isTailObject(obj: THREE.Object3D | null) {
+  let cur: THREE.Object3D | null = obj;
+  while (cur) {
+    if (FINAL_TAIL_MESH_NAMES.has(cur.name)) return true;
+    cur = cur.parent;
+  }
+  return false;
+}
 
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -147,14 +276,12 @@ loader.load(
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
     VRMUtils.removeUnnecessaryJoints(gltf.scene);
     v.scene.traverse((obj: any) => { if (obj.isMesh) obj.frustumCulled = false; });
-    // 模型朝向：VRM 规范模型默认面朝 +Z（背对相机），需转 PI 面向用户。
-    // 但本模型导出时已面朝 -Z（朝用户），故不旋转。换模型若背对屏幕，把这里改回 Math.PI，
-    // 并同步翻转下方头骨跟随的 yaw 符号（见 tick 里 MODEL_YAW_SIGN 说明）。
-    if (v.scene) v.scene.rotation.y = MODEL_SCENE_ROT_Y;
+    if (v.scene) v.scene.rotation.y = modelRotationY;
     scene.add(v.scene);
     if (v.lookAt) v.lookAt.target = lookTarget;
     vrm = v;
     modelBaseY = v.scene.position.y;
+    bindTailBones(v);
     motionMixer = new THREE.AnimationMixer(v.scene);
     motionMixer.addEventListener('finished', ((event: THREE.Event) => {
       const action = (event as THREE.Event & { action?: THREE.AnimationAction }).action;
@@ -227,6 +354,7 @@ type ExpSlot = { current: number; target: number; durationLeft: number };
 const expState = new Map<string, ExpSlot>();
 
 function setExpression(name: ExpName, target: number, fadeMs = 300) {
+  if (name === 'joy' && target > 0.2) triggerTailWag();
   const aliases = EXP_ALIASES[name] ?? [name];
   for (const n of aliases) {
     const prev = expState.get(n);
@@ -271,16 +399,18 @@ function cursorOverSlider(): boolean {
 
 // === Drag + click reactions ===
 let dragging = false;
+let rotatingModel = false;
 let lastClickable = false;
 let lastHitPart: string = '-';
 let lastReactionMsg = '';
 let lastReactionAt = 0;
 const cooldownUntil: Record<'head' | 'body' | 'tail', number> = { head: 0, body: 0, tail: 0 };
 
-function classifyHit(point: THREE.Vector3): 'head' | 'body' | 'tail' {
+function classifyHit(hit: THREE.Intersection): 'head' | 'body' | 'tail' {
+  if (isTailObject(hit.object) || isNearTail(hit.point)) return 'tail';
   const tailThreshold = modelMinY + (headY - modelMinY) * 0.30;
-  if (point.y > headY - 0.10) return 'head';
-  if (point.y < tailThreshold) return 'tail';
+  if (hit.point.y > headY - 0.10) return 'head';
+  if (hit.point.y < tailThreshold) return 'tail';
   return 'body';
 }
 
@@ -292,6 +422,7 @@ const PART_EXPRESSION: Record<'head' | 'body' | 'tail', ExpName> = {
 
 function triggerReaction(part: 'head' | 'body' | 'tail') {
   const now = performance.now();
+  if (part === 'tail') triggerTailWag();
   if (now < cooldownUntil[part]) return;
   cooldownUntil[part] = now + 1500;
 
@@ -475,6 +606,7 @@ async function playMotion(id: string): Promise<boolean> {
 
   currentMotionAction = nextAction;
   currentMotionId = id;
+  if (isHappyMotion(entry)) triggerTailWag();
   return true;
 }
 
@@ -483,19 +615,38 @@ window.addEventListener('mousedown', (e) => {
   // 输入框正在用，不当作戳模型
   if (document.activeElement === chatInput) return;
   dragging = true;
+  rotatingModel = e.shiftKey;
+  if (rotatingModel) {
+    lastHitPart = 'rotate';
+    return;
+  }
   raycaster.setFromCamera(ndc, camera);
   const hits = raycaster.intersectObject(vrm.scene, true);
   if (hits.length > 0) {
-    const part = classifyHit(hits[0].point);
-    lastHitPart = `${part} y=${hits[0].point.y.toFixed(2)}`;
+    const part = classifyHit(hits[0]);
+    lastHitPart = `${part} ${hits[0].object.name || '-'} y=${hits[0].point.y.toFixed(2)}`;
+    console.log('[hit]', {
+      part,
+      object: hits[0].object.name || '-',
+      isTailObject: isTailObject(hits[0].object),
+      nearTail: isNearTail(hits[0].point),
+      point: hits[0].point.toArray().map((v) => Number(v.toFixed(3))),
+      distance: Number(hits[0].distance.toFixed(3)),
+    });
     triggerReaction(part);
   } else {
     lastHitPart = 'miss';
+    console.log('[hit]', { part: 'miss' });
   }
 });
-window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mouseup', () => { dragging = false; rotatingModel = false; });
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
+  if (rotatingModel) {
+    modelRotationY += e.movementX * 0.01;
+    applyModelRotation();
+    return;
+  }
   if (e.movementX || e.movementY) petBridge.drag(e.movementX, e.movementY);
 });
 
@@ -509,18 +660,6 @@ function scheduleBlink() {
   }, delay);
 }
 scheduleBlink();
-
-function scheduleIdleExpression() {
-  const delay = 8000 + Math.random() * 12000;
-  setTimeout(() => {
-    const choices: ExpName[] = ['joy', 'surprised', 'sorrow'];
-    const pick = choices[Math.floor(Math.random() * choices.length)];
-    setExpression(pick, 0.55, 400);
-    setTimeout(() => setExpression(pick, 0, 700), 1600);
-    scheduleIdleExpression();
-  }, delay);
-}
-scheduleIdleExpression();
 
 // === 服务器地址 + 预录台词清单 ===
 let SERVER_URL = 'http://localhost:3030';
@@ -537,7 +676,7 @@ let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
   try {
     const files = await petBridge.listVoices();
     for (const f of files) {
-      const url = `/voices/${f}`;
+      const url = `./voices/${f}`;
       voicesFlat.push(url);
       const m = f.match(/^(head|body|tail|idle)_/i);
       if (m) voicesByPart[m[1].toLowerCase() as 'head' | 'body' | 'tail' | 'idle'].push(url);
@@ -1095,6 +1234,7 @@ function tick() {
   // 先更新主动作，再让 VRM 自己更新（含 SpringBone、lookAt 眼睛）
   if (motionMixer) motionMixer.update(dt);
   if (vrm) vrm.update(dt);
+  updateTailWag(t);
 
   // 再叠加头骨偏移（在 VRM 处理后做，否则被覆盖；同时只追加 yaw/pitch 不动 roll）
   // 动作播放期间不抢头骨：否则会逐帧覆盖 FBX 动作里的点头/转头。此时让偏移平滑归零，
@@ -1108,15 +1248,15 @@ function tick() {
         headOffsetYaw += (0 - headOffsetYaw) * HEAD_OFFSET_SLERP;
         headOffsetPitch += (0 - headOffsetPitch) * HEAD_OFFSET_SLERP;
       } else {
-        // 用世界坐标算 lookTarget 相对头部的方向
         const headWorld = headBone.getWorldPosition(new THREE.Vector3());
-        const dx = lookTarget.position.x - headWorld.x;
-        const dy = lookTarget.position.y - headWorld.y;
-        const dz = lookTarget.position.z - headWorld.z;
-        // headBone 是 normalized 骨骼，静止前向 = -Z；rotation.y=+θ 把前向绕 Y 转。
-        // 当 scene 不翻转（朝 -Z）时 θ = atan2(-dx,-dz)；翻转 PI（朝 +Z）时 θ = atan2(dx,dz)。
-        // 用 MODEL_YAW_SIGN 统一两种情况（见上方常量）。
-        const targetYaw = Math.atan2(MODEL_YAW_SIGN * dx, MODEL_YAW_SIGN * dz) * 0.35;
+        const parent = headBone.parent;
+        const headLocal = parent ? parent.worldToLocal(headWorld.clone()) : headWorld;
+        const targetLocal = parent ? parent.worldToLocal(lookTarget.position.clone()) : lookTarget.position.clone();
+        const dx = targetLocal.x - headLocal.x;
+        const dy = targetLocal.y - headLocal.y;
+        const dz = targetLocal.z - headLocal.z;
+        // 在头骨父节点的局部坐标里计算方向，模型被手动旋转后也能继续看向光标。
+        const targetYaw = Math.atan2(-dx, -dz) * 0.35;
         const targetPitch = Math.atan2(dy, Math.hypot(dx, dz)) * 0.35;
         const clampedYaw = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetYaw));
         const clampedPitch = Math.max(-HEAD_OFFSET_LIMIT, Math.min(HEAD_OFFSET_LIMIT, targetPitch));
@@ -1181,6 +1321,7 @@ function tick() {
   if (frame % 6 === 0) {
     const since = lastReactionAt ? ((performance.now() - lastReactionAt) / 1000).toFixed(1) : '-';
     const sinceRemote = lastRemoteAt ? ((performance.now() - lastRemoteAt) / 1000).toFixed(1) : '-';
+    const sinceTail = lastTailWagAt ? ((performance.now() - lastTailWagAt) / 1000).toFixed(1) : '-';
     const lookMode = vrm?.lookAt
       ? ((vrm.lookAt.applier as any)?.constructor?.name ?? 'on')
       : 'none';
@@ -1188,7 +1329,7 @@ function tick() {
       `vrm:${vrm ? 'ok' : '...'} inside:${cursorInside ? 'Y' : 'N'} click:${lastClickable ? 'Y' : 'N'}\n` +
       `look:${lookMode} chat:${chatOpen ? 'Y' : 'N'} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
       `hit:${lastHitPart}\n` +
-      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} active:${currentMotionId || '-'}\n` +
+      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} tail:${tailBones.length} wag:${sinceTail}s active:${currentMotionId || '-'}\n` +
       `last:${lastReactionMsg || '-'} (${since}s)  remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`;
   }
 

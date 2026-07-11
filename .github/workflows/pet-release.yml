@@ -1,0 +1,61 @@
+name: Pet Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-pet-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: pet
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: pet/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate release secrets
+        shell: pwsh
+        run: |
+          if ("${{ secrets.PET_SERVER_URL }}" -eq "") { throw "Missing repository secret: PET_SERVER_URL" }
+          if ("${{ secrets.PET_ROOM_SECRET }}" -eq "") { throw "Missing repository secret: PET_ROOM_SECRET" }
+
+      - name: Generate production config
+        shell: pwsh
+        run: |
+          $config = @{
+            serverUrl = "${{ secrets.PET_SERVER_URL }}"
+            roomSecret = "${{ secrets.PET_ROOM_SECRET }}"
+          }
+          $config | ConvertTo-Json | Out-File -Encoding utf8 config/production.json
+
+      - name: Build installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist:win -- --publish never
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pet/release/*.exe
+            pet/release/*.yml
+            pet/release/*.blockmap
+          draft: false
+          prerelease: false

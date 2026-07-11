@@ -10,6 +10,7 @@ npm-debug.log*
 .env
 .env.local
 .env.*.local
+pet/config/production.json
 
 # editor
 .DS_Store
@@ -18,6 +19,8 @@ npm-debug.log*
 
 # user data (Electron)
 *.app/
+pet/release/
+release/
 
 # 测试 / 临时
 tmp/

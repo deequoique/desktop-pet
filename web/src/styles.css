@@ -335,6 +335,42 @@ h1 {
   font-size: 12px;
 }
 
+.rtc-route {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 9px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(160, 193, 255, 0.14);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.rtc-route span {
+  display: inline-flex;
+  align-items: center;
+}
+
+.rtc-route.host,
+.rtc-route.srflx,
+.rtc-route.prflx {
+  color: var(--ok);
+  border-color: rgba(134, 239, 172, 0.18);
+}
+
+.rtc-route.relay {
+  color: var(--warn);
+  border-color: rgba(185, 221, 255, 0.22);
+}
+
+.rtc-route.failed {
+  color: var(--bad);
+  border-color: rgba(252, 165, 165, 0.24);
+}
+
 .tts-area {
   display: flex;
   flex-direction: column;
