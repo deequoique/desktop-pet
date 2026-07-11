@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -107,6 +107,119 @@ function defaultBottomRight() {
 
 let win = null;
 let tray = null;
+let updateState = {
+  checking: false,
+  available: false,
+  downloaded: false,
+  version: '',
+  error: '',
+};
+
+function showUpdateMessage(type, message) {
+  if (!win || win.isDestroyed()) return;
+  dialog.showMessageBox(win, {
+    type,
+    title: 'Desktop Pet Update',
+    message,
+    buttons: ['OK'],
+  }).catch(() => {});
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
+  const updateLabel = updateState.checking
+    ? 'Checking for Updates...'
+    : updateState.downloaded
+      ? `Install Update ${updateState.version || ''}`.trim()
+      : 'Check for Updates';
+
+  const menu = Menu.buildFromTemplate([
+    { label: 'Reset Position', click: () => {
+        const p = defaultBottomRight();
+        win?.setPosition(p.x, p.y);
+        patchState({ x: p.x, y: p.y });
+      } },
+    { label: updateLabel, enabled: app.isPackaged && !!autoUpdater && !updateState.checking, click: () => {
+        if (updateState.downloaded && autoUpdater) {
+          autoUpdater.quitAndInstall(false, true);
+          return;
+        }
+        checkForPetUpdates(true);
+      } },
+    { label: 'Reload', click: () => win?.reload() },
+    { type: 'separator' },
+    { label: 'Quit', click: () => app.quit() },
+  ]);
+  tray.setContextMenu(menu);
+}
+
+function checkForPetUpdates(manual = false) {
+  if (!app.isPackaged || !autoUpdater || updateState.checking) return;
+  updateState = { ...updateState, checking: true, error: '' };
+  rebuildTrayMenu();
+  autoUpdater.checkForUpdates().then((result) => {
+    if (!result?.updateInfo && manual) showUpdateMessage('info', 'No update information was returned.');
+  }).catch((error) => {
+    const message = error?.message || String(error);
+    updateState = { ...updateState, checking: false, error: message };
+    rebuildTrayMenu();
+    console.warn('[updater] check failed:', message);
+    if (manual) showUpdateMessage('warning', `Update check failed: ${message}`);
+  });
+}
+
+function setupAutoUpdater() {
+  if (!app.isPackaged || !autoUpdater) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    updateState = { ...updateState, checking: true, error: '' };
+    rebuildTrayMenu();
+  });
+  autoUpdater.on('update-available', (info) => {
+    updateState = {
+      ...updateState,
+      checking: false,
+      available: true,
+      downloaded: false,
+      version: info?.version || '',
+    };
+    rebuildTrayMenu();
+  });
+  autoUpdater.on('update-not-available', () => {
+    updateState = { ...updateState, checking: false, available: false, downloaded: false, version: '' };
+    rebuildTrayMenu();
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    updateState = {
+      ...updateState,
+      checking: false,
+      available: true,
+      downloaded: true,
+      version: info?.version || updateState.version,
+    };
+    rebuildTrayMenu();
+    dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Desktop Pet Update',
+      message: `Update ${updateState.version || ''} is ready.`,
+      detail: 'Restart Desktop Pet now to install it?',
+      buttons: ['Restart now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+    }).then((result) => {
+      if (result.response === 0) autoUpdater.quitAndInstall(false, true);
+    }).catch(() => {});
+  });
+  autoUpdater.on('error', (error) => {
+    const message = error?.message || String(error);
+    updateState = { ...updateState, checking: false, error: message };
+    rebuildTrayMenu();
+    console.warn('[updater] error:', message);
+  });
+}
 
 function createWindow() {
   const saved = loadState();
@@ -164,17 +277,7 @@ function createTray() {
   const img = nativeImage.createEmpty();
   tray = new Tray(img);
   tray.setToolTip('Desktop Pet');
-  const menu = Menu.buildFromTemplate([
-    { label: 'Reset Position', click: () => {
-        const p = defaultBottomRight();
-        win?.setPosition(p.x, p.y);
-        patchState({ x: p.x, y: p.y });
-      } },
-    { label: 'Reload', click: () => win?.reload() },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ]);
-  tray.setContextMenu(menu);
+  rebuildTrayMenu();
 }
 
 // 渲染层根据 raycast 结果告诉我们鼠标是否在模型上
@@ -307,13 +410,8 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   startCursorPoll();
-
-  if (app.isPackaged && autoUpdater) {
-    autoUpdater.autoDownload = true;
-    autoUpdater.checkForUpdatesAndNotify().catch((error) => {
-      console.warn('[updater] check failed:', error?.message || error);
-    });
-  }
+  setupAutoUpdater();
+  setTimeout(() => checkForPetUpdates(false), 3000);
 
   // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
   globalShortcut.register('Control+Alt+D', () => {

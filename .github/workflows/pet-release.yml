@@ -46,14 +46,4 @@ jobs:
       - name: Build installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run dist:win -- --publish never
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            pet/release/*.exe
-            pet/release/*.yml
-            pet/release/*.blockmap
-          draft: false
-          prerelease: false
+        run: npm run dist:win -- --publish always
