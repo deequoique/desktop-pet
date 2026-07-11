@@ -15,23 +15,6 @@
       }
       .hidden { display: none !important; }
 
-      #hud {
-        position: absolute; top: 4px; left: 6px;
-        color: #b6f; font-family: ui-monospace, Menlo, monospace; font-size: 10px;
-        line-height: 1.3; pointer-events: none;
-        text-shadow: 0 0 3px rgba(0,0,0,.9);
-        white-space: pre;
-      }
-      #flash {
-        position: absolute; inset: 0;
-        display: flex; align-items: center; justify-content: center;
-        color: #ffd866; font-family: system-ui; font-size: 36px; font-weight: 800;
-        pointer-events: none;
-        text-shadow: 0 0 8px rgba(0,0,0,.9), 0 0 2px #000;
-        opacity: 0; transition: opacity 120ms;
-      }
-      #flash.on { opacity: 1; }
-
       /* 对话气泡 + 输入框 */
       #chat {
         position: absolute; left: 12px; right: 12px; bottom: 12px;
@@ -65,23 +48,33 @@
       }
       #reply.on { opacity: 1; }
 
-      /* 大小调节滑块（右上角浮层，默认半透明，hover 才明显） */
+      /* 大小调节按钮：默认隐藏，鼠标移到右上角时浮现。 */
       #size {
         position: absolute; top: 8px; right: 10px;
-        display: flex; align-items: center; gap: 8px;
-        background: rgba(15, 12, 22, 0.6);
-        border-radius: 14px;
-        padding: 5px 12px;
-        font-family: system-ui; font-size: 11px; color: #fff;
-        box-shadow: 0 2px 12px rgba(0,0,0,0.35);
-        backdrop-filter: blur(6px);
-        opacity: 0.28; transition: opacity 160ms;
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px;
+        opacity: 0;
+        transition: opacity 160ms;
       }
       #size:hover { opacity: 1; }
-      #size input[type="range"] {
-        width: 96px; accent-color: #b6f; cursor: pointer;
+      #size.visible { opacity: 1; }
+      #size button {
+        width: 30px;
+        height: 30px;
+        border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 8px;
+        background: rgba(15, 12, 22, 0.72);
+        color: #fff;
+        font: 700 18px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+        backdrop-filter: blur(6px);
+        cursor: pointer;
       }
-      #size-val { min-width: 34px; text-align: right; color: #ffd866; }
+      #size button:hover {
+        background: rgba(32, 27, 44, 0.9);
+        border-color: rgba(255,255,255,0.28);
+      }
+      #size button:active { transform: translateY(1px); }
 
       #pairing {
         position: absolute; inset: 0;
@@ -148,13 +141,10 @@
   <body>
     <div id="app"></div>
     <div id="fallback">把任意 .vrm 文件放到 pet/public/sample.vrm<br/>（VRoid Hub 免费区可下载）</div>
-    <div id="hud"></div>
-    <div id="flash"></div>
     <div id="reply"></div>
-    <div id="size">
-      <span>大小</span>
-      <input id="size-range" type="range" min="50" max="200" step="5" value="100" />
-      <span id="size-val">100%</span>
+    <div id="size" aria-label="调整桌宠大小">
+      <button id="size-down" type="button" title="缩小" aria-label="缩小">-</button>
+      <button id="size-up" type="button" title="放大" aria-label="放大">+</button>
     </div>
     <form id="pairing" class="hidden">
       <div id="pairing-panel">

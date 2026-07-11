@@ -11,6 +11,8 @@ try {
   autoUpdater = null;
 }
 
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 // scale=1 的基准尺寸；实际窗口 = 基准 * scale。
 const PET_W = 360;
 const PET_H = 480;

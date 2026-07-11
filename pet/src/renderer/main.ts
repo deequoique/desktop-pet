@@ -55,6 +55,11 @@ const VRM_URL = './sample.vrm';
 const MOTION_MANIFEST_URL = './motions/manifest.json';
 const MOTION_BASE_URL = './motions/';
 const MOTION_FADE_SECONDS = 0.18;
+const DEBUG_UI = new URLSearchParams(window.location.search).has('debug-ui');
+const SIZE_STEP = 0.1;
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 2.0;
+const DRAG_POSE_SPEED = 12;
 
 // 模型整体 Y 轴旋转：当前模型符合 VRM +Z 规范（背对相机），转 PI 面向用户。
 // 若换的模型原生已朝用户，改为 0。
@@ -62,14 +67,12 @@ const MODEL_SCENE_ROT_Y = Math.PI;
 
 const app = document.getElementById('app')!;
 const fallback = document.getElementById('fallback')!;
-const hud = document.getElementById('hud')!;
-const flash = document.getElementById('flash')!;
 const replyEl = document.getElementById('reply')!;
 const chatBox = document.getElementById('chat')!;
 const chatInput = document.getElementById('chat-input') as HTMLInputElement;
 const sizeBox = document.getElementById('size')!;
-const sizeRange = document.getElementById('size-range') as HTMLInputElement;
-const sizeVal = document.getElementById('size-val')!;
+const sizeDown = document.getElementById('size-down') as HTMLButtonElement;
+const sizeUp = document.getElementById('size-up') as HTMLButtonElement;
 const pairingForm = document.getElementById('pairing') as HTMLFormElement;
 const pairingServer = document.getElementById('pairing-server') as HTMLInputElement;
 const pairingSecret = document.getElementById('pairing-secret') as HTMLInputElement;
@@ -113,12 +116,16 @@ const lookTarget = new THREE.Object3D();
 lookTarget.position.set(0, 1.3, 2);
 scene.add(lookTarget);
 
-const lookMarker = new THREE.Mesh(
-  new THREE.SphereGeometry(0.025, 12, 12),
-  new THREE.MeshBasicMaterial({ color: 0xff66cc, transparent: true, opacity: 0.85, depthTest: false }),
-);
-lookMarker.renderOrder = 999;
-scene.add(lookMarker);
+const lookMarker = DEBUG_UI
+  ? new THREE.Mesh(
+      new THREE.SphereGeometry(0.025, 12, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff66cc, transparent: true, opacity: 0.85, depthTest: false }),
+    )
+  : null;
+if (lookMarker) {
+  lookMarker.renderOrder = 999;
+  scene.add(lookMarker);
+}
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -185,7 +192,7 @@ function bindTailBones(target: VRM) {
       weight: 1 + i * 0.18,
     }));
 
-  console.log('[tail] bound bones:', tailBones.map((b) => b.node.name));
+  if (DEBUG_UI) console.log('[tail] bound bones:', tailBones.map((b) => b.node.name));
 }
 
 function applyModelRotation() {
@@ -196,10 +203,12 @@ function triggerTailWag() {
   lastTailWagAt = performance.now();
   tailReactionUntil = performance.now() / 1000 + 1.6;
   tailDebugNextLogAt = 0;
-  console.log('[tail] wag triggered', {
-    bones: tailBones.map((b) => b.node.name),
-    until: tailReactionUntil.toFixed(2),
-  });
+  if (DEBUG_UI) {
+    console.log('[tail] wag triggered', {
+      bones: tailBones.map((b) => b.node.name),
+      until: tailReactionUntil.toFixed(2),
+    });
+  }
 }
 
 function updateTailWag(t: number) {
@@ -224,7 +233,7 @@ function updateTailWag(t: number) {
   }
   tailBones[0]?.node.updateMatrixWorld(true);
 
-  if (boost > 0 && t >= tailDebugNextLogAt) {
+  if (DEBUG_UI && boost > 0 && t >= tailDebugNextLogAt) {
     const root = tailBones[0];
     console.log('[tail] wag frame', {
       boost: boost.toFixed(2),
@@ -304,7 +313,7 @@ loader.load(
       const exps: any[] = (v.expressionManager as any)?.expressions ?? [];
       for (const e of exps) if (e?.expressionName) availableExpressions.add(e.expressionName);
     } catch {}
-    console.log('[VRM] expressions:', Array.from(availableExpressions));
+    if (DEBUG_UI) console.log('[VRM] expressions:', Array.from(availableExpressions));
 
     try {
       const headBone = v.humanoid?.getNormalizedBoneNode('head');
@@ -398,8 +407,8 @@ petBridge.onCursor((c) => {
   ndc.y = Math.max(-2.5, Math.min(2.5, ry));
 });
 
-// 光标是否在滑块控件上（用屏幕坐标命中，因为透明窗穿透时 DOM pointer 事件不会触发）。
-function cursorOverSlider(): boolean {
+// 光标是否在缩放控件上（用屏幕坐标命中，因为透明窗穿透时 DOM pointer 事件不会触发）。
+function cursorOverSizeControls(): boolean {
   const r = sizeBox.getBoundingClientRect();
   const { x, y } = cursorPx;
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
@@ -410,8 +419,10 @@ let dragging = false;
 let rotatingModel = false;
 let lastClickable = false;
 let lastHitPart: string = '-';
-let lastReactionMsg = '';
-let lastReactionAt = 0;
+let clickMotionCandidate = false;
+let dragPoseTarget = 0;
+let dragPoseBlend = 0;
+let dragSway = 0;
 const cooldownUntil: Record<'head' | 'body' | 'tail', number> = { head: 0, body: 0, tail: 0 };
 
 function classifyHit(hit: THREE.Intersection): 'head' | 'body' | 'tail' {
@@ -438,15 +449,8 @@ function triggerReaction(part: 'head' | 'body' | 'tail') {
   setExpression(exp, 1.0, 120);
   setTimeout(() => setExpression(exp, 0, 350), 650);
 
-  lastReactionMsg = `${part.toUpperCase()}!`;
-  lastReactionAt = now;
-  flash.textContent = lastReactionMsg;
-  flash.classList.add('on');
-  setTimeout(() => flash.classList.remove('on'), 500);
-
   // 优先播预录台词；没有则只表情
   playVoiceFor(part).catch(() => {});
-  console.log('[reaction]', part, '→', exp);
 }
 
 function fadeOutAction(action: THREE.AnimationAction | null, immediate = false) {
@@ -486,7 +490,7 @@ async function loadMotionManifest() {
   try {
     const r = await fetch(MOTION_MANIFEST_URL, { cache: 'no-store' });
     if (r.status === 404) {
-      console.log('[motions] manifest missing');
+      if (DEBUG_UI) console.log('[motions] manifest missing');
       return;
     }
     if (!r.ok) throw new Error(`manifest ${r.status}`);
@@ -511,7 +515,7 @@ async function loadMotionManifest() {
       motionManifest.set(id, entry);
       motionList.push({ id, label, loop: entry.loop });
     }
-    console.log('[motions] loaded:', motionList.map((m) => m.id));
+    if (DEBUG_UI) console.log('[motions] loaded:', motionList.map((m) => m.id));
   } catch (e) {
     console.warn('[motions] load failed:', e);
   }
@@ -618,12 +622,68 @@ async function playMotion(id: string): Promise<boolean> {
   return true;
 }
 
+function normalizedBone(name: string): THREE.Object3D | null {
+  try {
+    return ((vrm?.humanoid as any)?.getNormalizedBoneNode(name) as THREE.Object3D | null) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function setDragPose(active: boolean) {
+  dragPoseTarget = active ? 1 : 0;
+  if (active) {
+    stopCurrentMotion();
+    setExpression('surprised', 0.65, 120);
+    triggerTailWag();
+  } else {
+    setExpression('surprised', 0, 320);
+  }
+}
+
+function applyBonePose(name: string, x: number, y: number, z: number, blend: number) {
+  const bone = normalizedBone(name);
+  if (!bone) return;
+  bone.rotation.x = x * blend;
+  bone.rotation.y = y * blend;
+  bone.rotation.z = z * blend;
+}
+
+function updateDragPose(dt: number, t: number) {
+  dragPoseBlend += (dragPoseTarget - dragPoseBlend) * Math.min(1, dt * DRAG_POSE_SPEED);
+  if (dragPoseBlend < 0.001 && dragPoseTarget === 0) {
+    dragPoseBlend = 0;
+    return;
+  }
+
+  const sway = Math.sin(t * 8) * 0.08 + dragSway * 0.18;
+  const b = dragPoseBlend;
+
+  applyBonePose('spine', -0.18, 0, sway * 0.35, b);
+  applyBonePose('chest', -0.28, 0, sway, b);
+  applyBonePose('neck', 0.18, 0, -sway * 0.4, b);
+  applyBonePose('leftUpperArm', -0.72, 0.2, -1.28, b);
+  applyBonePose('rightUpperArm', -0.72, -0.2, 1.28, b);
+  applyBonePose('leftLowerArm', -0.28, 0, -0.62, b);
+  applyBonePose('rightLowerArm', -0.28, 0, 0.62, b);
+  applyBonePose('leftHand', 0.08, 0, -0.2, b);
+  applyBonePose('rightHand', 0.08, 0, 0.2, b);
+  applyBonePose('leftUpperLeg', 0.34, 0.06, -0.08, b);
+  applyBonePose('rightUpperLeg', 0.34, -0.06, 0.08, b);
+  applyBonePose('leftLowerLeg', -0.38, 0, 0.04, b);
+  applyBonePose('rightLowerLeg', -0.38, 0, -0.04, b);
+
+  dragSway += (0 - dragSway) * Math.min(1, dt * 8);
+}
+
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0 || !lastClickable || !vrm) return;
   // 输入框正在用，不当作戳模型
   if (document.activeElement === chatInput) return;
+  if (sizeBox.contains(e.target as Node) || chatBox.contains(e.target as Node) || pairingForm.contains(e.target as Node)) return;
   dragging = true;
   rotatingModel = e.shiftKey;
+  clickMotionCandidate = false;
   if (rotatingModel) {
     lastHitPart = 'rotate';
     return;
@@ -633,21 +693,19 @@ window.addEventListener('mousedown', (e) => {
   if (hits.length > 0) {
     const part = classifyHit(hits[0]);
     lastHitPart = `${part} ${hits[0].object.name || '-'} y=${hits[0].point.y.toFixed(2)}`;
-    console.log('[hit]', {
-      part,
-      object: hits[0].object.name || '-',
-      isTailObject: isTailObject(hits[0].object),
-      nearTail: isNearTail(hits[0].point),
-      point: hits[0].point.toArray().map((v) => Number(v.toFixed(3))),
-      distance: Number(hits[0].distance.toFixed(3)),
-    });
+    clickMotionCandidate = true;
+    setDragPose(true);
     triggerReaction(part);
   } else {
     lastHitPart = 'miss';
-    console.log('[hit]', { part: 'miss' });
   }
 });
-window.addEventListener('mouseup', () => { dragging = false; rotatingModel = false; });
+window.addEventListener('mouseup', () => {
+  if (clickMotionCandidate) setDragPose(false);
+  dragging = false;
+  rotatingModel = false;
+  clickMotionCandidate = false;
+});
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
   if (rotatingModel) {
@@ -655,7 +713,10 @@ window.addEventListener('mousemove', (e) => {
     applyModelRotation();
     return;
   }
-  if (e.movementX || e.movementY) petBridge.drag(e.movementX, e.movementY);
+  if (e.movementX || e.movementY) {
+    dragSway = Math.max(-1, Math.min(1, e.movementX / 18));
+    petBridge.drag(e.movementX, e.movementY);
+  }
 });
 
 // === Idle behaviors ===
@@ -884,24 +945,48 @@ petBridge.onHotkey((name) => {
   }
 });
 
-// === 大小调节滑块 ===
-// 拖动 thumb 时光标可能短暂滑出控件边界，保持可点直到松手。
-let sliderDragging = false;
-sizeRange.addEventListener('pointerdown', () => { sliderDragging = true; });
-window.addEventListener('pointerup', () => { sliderDragging = false; });
-function updateSizeLabel(pct: number) {
-  sizeVal.textContent = `${pct}%`;
+// === 大小调节按钮 ===
+let currentScale = 1;
+let sizeControlsActive = false;
+let sizeControlsVisibleTimer = 0;
+
+function clampScale(scale: number) {
+  if (!Number.isFinite(scale)) return 1;
+  return Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
 }
-sizeRange.addEventListener('input', () => {
-  const pct = Number(sizeRange.value);
-  updateSizeLabel(pct);
-  petBridge.resize(pct / 100);
+
+function showSizeControls() {
+  sizeBox.classList.add('visible');
+  if (sizeControlsVisibleTimer) window.clearTimeout(sizeControlsVisibleTimer);
+  sizeControlsVisibleTimer = window.setTimeout(() => {
+    if (!cursorOverSizeControls()) sizeBox.classList.remove('visible');
+  }, 1200);
+}
+
+function resizeBy(delta: number) {
+  currentScale = clampScale(Math.round((currentScale + delta) * 10) / 10);
+  petBridge.resize(currentScale);
+  showSizeControls();
+}
+
+sizeBox.addEventListener('pointerdown', () => { sizeControlsActive = true; });
+window.addEventListener('pointerup', () => { sizeControlsActive = false; });
+sizeBox.addEventListener('mouseenter', showSizeControls);
+sizeBox.addEventListener('mouseleave', () => {
+  if (!sizeControlsActive) sizeControlsVisibleTimer = window.setTimeout(() => sizeBox.classList.remove('visible'), 500);
 });
-// 初始化滑块到已保存的 scale。
+sizeDown.addEventListener('click', (e) => {
+  e.stopPropagation();
+  resizeBy(-SIZE_STEP);
+});
+sizeUp.addEventListener('click', (e) => {
+  e.stopPropagation();
+  resizeBy(SIZE_STEP);
+});
+
+// 初始化到已保存的 scale。
 petBridge.getScale().then((scale) => {
-  const pct = Math.round(scale * 100);
-  sizeRange.value = String(pct);
-  updateSizeLabel(pct);
+  currentScale = clampScale(scale);
 }).catch(() => {});
 
 // === 远程控制（M4a）===
@@ -938,9 +1023,6 @@ const RTC_CONFIG: RTCConfiguration = {
 function noteRemote(msg: string) {
   lastRemoteMsg = msg;
   lastRemoteAt = performance.now();
-  flash.textContent = `📡 ${msg}`;
-  flash.classList.add('on');
-  setTimeout(() => flash.classList.remove('on'), 500);
 }
 
 function handleRemoteCommand(cmd: RemoteCommand) {
@@ -1300,6 +1382,7 @@ function tick() {
   if (motionMixer) motionMixer.update(dt);
   if (vrm) vrm.update(dt);
   updateTailWag(t);
+  updateDragPose(dt, t);
 
   // 再叠加头骨偏移（在 VRM 处理后做，否则被覆盖；同时只追加 yaw/pitch 不动 roll）
   // 动作播放期间不抢头骨：否则会逐帧覆盖 FBX 动作里的点头/转头。此时让偏移平滑归零，
@@ -1353,7 +1436,7 @@ function tick() {
   }
 
   updateExpressions(dt);
-  lookMarker.position.copy(lookTarget.position);
+  if (lookMarker) lookMarker.position.copy(lookTarget.position);
 
   if (vrm && cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
     raycaster.setFromCamera(ndc, camera);
@@ -1370,9 +1453,11 @@ function tick() {
     }
   }
 
-  // clickable：配对/chat 打开时强制开启（要能打字/点击）；否则按 hit-test
+  if (cursorInside && cursorOverSizeControls()) showSizeControls();
+
+  // clickable：配对/chat/缩放控件打开时强制开启（要能打字/点击）；否则按 hit-test
   let clickable = false;
-  if (pairingOpen || chatOpen || sliderDragging || (cursorInside && cursorOverSlider())) clickable = true;
+  if (pairingOpen || chatOpen || sizeControlsActive || (cursorInside && cursorOverSizeControls())) clickable = true;
   else if (vrm && cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
     const hits = raycaster.intersectObject(vrm.scene, true);
     clickable = hits.length > 0;
@@ -1383,19 +1468,19 @@ function tick() {
     petBridge.setClickable(clickable);
   }
 
-  if (frame % 6 === 0) {
-    const since = lastReactionAt ? ((performance.now() - lastReactionAt) / 1000).toFixed(1) : '-';
+  if (DEBUG_UI && frame % 6 === 0) {
     const sinceRemote = lastRemoteAt ? ((performance.now() - lastRemoteAt) / 1000).toFixed(1) : '-';
     const sinceTail = lastTailWagAt ? ((performance.now() - lastTailWagAt) / 1000).toFixed(1) : '-';
     const lookMode = vrm?.lookAt
       ? ((vrm.lookAt.applier as any)?.constructor?.name ?? 'on')
       : 'none';
-    hud.textContent =
+    console.info(
       `vrm:${vrm ? 'ok' : '...'} inside:${cursorInside ? 'Y' : 'N'} click:${lastClickable ? 'Y' : 'N'}\n` +
       `look:${lookMode} chat:${chatOpen ? 'Y' : 'N'} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
       `hit:${lastHitPart}\n` +
       `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} tail:${tailBones.length} wag:${sinceTail}s active:${currentMotionId || '-'}\n` +
-      `last:${lastReactionMsg || '-'} (${since}s)  remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`;
+      `remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`
+    );
   }
 
   renderer.render(scene, camera);

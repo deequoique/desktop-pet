@@ -59,6 +59,16 @@ const EMPTY_RTC_ROUTE: RtcRoute = {
   detail: '等待 ICE 选路',
 };
 
+function explainMediaDevicesUnavailable(): string {
+  const protocol = window.location.protocol;
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if (protocol !== 'https:' && !isLocalhost) {
+    return '当前控制台页面不是浏览器认可的安全上下文，麦克风被禁用；将只接收远程画面，请用可信 HTTPS 域名开启对讲。';
+  }
+  return '当前浏览器不支持麦克风采集；将只接收远程画面。';
+}
+
 function candidateAddress(candidate: any): string {
   return candidate?.address || candidate?.ip || candidate?.hostname || '';
 }
@@ -186,12 +196,14 @@ export default function App() {
     if (remoteVideoRef.current.srcObject !== stream) {
       remoteVideoRef.current.srcObject = stream;
     }
+    remoteVideoRef.current.volume = remoteMuted ? 0 : 1;
+    remoteVideoRef.current.muted = remoteMuted;
     try {
       await remoteVideoRef.current.play();
     } catch (e) {
       console.warn('[webrtc] remote video play failed:', e);
     }
-  }, []);
+  }, [remoteMuted]);
 
   const flushPendingCandidates = useCallback(async () => {
     const pc = rtcPcRef.current;
@@ -211,18 +223,29 @@ export default function App() {
     const live = localAudioRef.current?.getAudioTracks().some((track) => track.readyState === 'live');
     if (localAudioRef.current && live) return localAudioRef.current;
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
-    for (const track of stream.getAudioTracks()) track.enabled = false;
-    localAudioRef.current = stream;
-    return stream;
-  }, []);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showToast(explainMediaDevicesUnavailable(), true);
+      return null;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      for (const track of stream.getAudioTracks()) track.enabled = false;
+      localAudioRef.current = stream;
+      return stream;
+    } catch (e: any) {
+      console.warn('[webrtc] local microphone capture failed; starting receive-only call:', e);
+      showToast(`麦克风不可用，将只接收远程画面：${e?.message || e}`, true);
+      return null;
+    }
+  }, [showToast]);
 
   const ensurePeerConnection = useCallback(async () => {
     if (rtcPcRef.current) return rtcPcRef.current;
@@ -231,7 +254,11 @@ export default function App() {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     rtcPcRef.current = pc;
 
-    for (const track of localAudio.getTracks()) pc.addTrack(track, localAudio);
+    if (localAudio) {
+      for (const track of localAudio.getTracks()) pc.addTrack(track, localAudio);
+    } else {
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+    }
     pc.addTransceiver('video', { direction: 'recvonly' });
 
     pc.onicecandidate = (event) => {
@@ -374,8 +401,34 @@ export default function App() {
   }, [status, peers.pet, showToast, teardownCall]);
 
   useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.muted = remoteMuted;
-  }, [remoteMuted]);
+    const video = remoteVideoRef.current;
+    if (!video) return;
+    video.muted = remoteMuted;
+    video.volume = remoteMuted ? 0 : 1;
+    if (!remoteMuted) {
+      video.play().catch((e) => {
+        console.warn('[webrtc] remote audio unlock failed:', e);
+        showToast(`声音播放被浏览器拦截：${e?.message || e}`, true);
+      });
+    }
+  }, [remoteMuted, showToast]);
+
+  const toggleRemoteAudio = useCallback(() => {
+    const nextMuted = !remoteMuted;
+    setRemoteMuted(nextMuted);
+    const video = remoteVideoRef.current;
+    if (!video) return;
+    video.muted = nextMuted;
+    video.volume = nextMuted ? 0 : 1;
+    if (!nextMuted) {
+      video.play()
+        .then(() => showToast('对端声音已打开'))
+        .catch((e) => {
+          console.warn('[webrtc] remote audio play failed after click:', e);
+          showToast(`声音播放失败：${e?.message || e}`, true);
+        });
+    }
+  }, [remoteMuted, showToast]);
 
   useEffect(() => {
     if (callState !== 'calling' && callState !== 'in-call') return;
@@ -556,7 +609,7 @@ export default function App() {
           <button
             className="btn"
             disabled={!remoteReady}
-            onClick={() => setRemoteMuted((v) => !v)}
+            onClick={toggleRemoteAudio}
           >{remoteMuted ? '打开声音' : '静音对端'}</button>
         </div>
       </section>
