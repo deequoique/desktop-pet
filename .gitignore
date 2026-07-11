@@ -16,6 +16,7 @@ pet/config/production.json
 .DS_Store
 .vscode/
 .idea/
+AGENTS.md
 
 # user data (Electron)
 *.app/
