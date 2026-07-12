@@ -390,11 +390,24 @@ function createControlWindow() {
 }
 
 function createTray() {
-  // 单色 template 图标（Mac 自动反色；Windows 也能用 png）
+  // macOS 必须给空图标配 title，否则状态栏入口宽度为 0，菜单完全不可见。
+  // Windows 仍保留 Tray 对象；后续可替换为正式 .ico 品牌图标。
   const img = nativeImage.createEmpty();
   tray = new Tray(img);
+  if (process.platform === 'darwin') tray.setTitle('🐾');
   tray.setToolTip('Desktop Pet');
+  tray.on('click', () => showControlWindow());
   rebuildTrayMenu();
+
+  // Dock 右键菜单是 macOS 的备用入口，即使用户隐藏了菜单栏图标仍能打开控制面板。
+  if (process.platform === 'darwin' && app.dock) {
+    app.dock.setMenu(Menu.buildFromTemplate([
+      { label: 'Open Control Panel', click: () => showControlWindow() },
+      { label: 'Toggle Game Mode', click: () => setGameMode(!gameMode) },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() },
+    ]));
+  }
 }
 
 // 渲染层根据 raycast 结果告诉我们鼠标是否在模型上
@@ -550,6 +563,9 @@ app.whenReady().then(() => {
   });
   globalShortcut.register('Control+Alt+G', () => {
     setGameMode(!gameMode);
+  });
+  globalShortcut.register('Control+Alt+P', () => {
+    showControlWindow();
   });
 });
 
