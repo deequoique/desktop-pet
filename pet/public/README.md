@@ -7,4 +7,4 @@
 - [@pixiv/three-vrm 示例资源](https://github.com/pixiv/three-vrm/tree/dev/packages/three-vrm/examples/models)（AvatarSample_A.vrm / AvatarSample_B.vrm）
 
 加载路径在 `src/renderer/main.ts` 顶部的 `VRM_URL = '/sample.vrm'`。
-等老师交付真模型后，M5 阶段替换这里即可。
+交付正式模型后直接替换这里即可。

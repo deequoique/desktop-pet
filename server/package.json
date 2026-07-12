@@ -2,7 +2,7 @@
   "name": "desktop-pet-server",
   "version": "0.0.1",
   "private": true,
-  "description": "Backend for AI desktop pet — chat (DeepSeek) + TTS (ElevenLabs) + Socket.IO control relay",
+  "description": "Room relay, WebRTC signaling, remote control, and ElevenLabs voice streaming for desktop pet",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

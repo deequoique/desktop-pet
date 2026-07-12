@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
@@ -29,6 +29,7 @@ const clampScale = (s) => {
 
 const stateFile = () => path.join(app.getPath('userData'), 'pet-state.json');
 const pairingFile = () => path.join(app.getPath('userData'), 'pairing.json');
+const ttsCredentialsFile = () => path.join(app.getPath('userData'), 'tts-credentials.bin');
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')); }
@@ -133,6 +134,31 @@ function ensureParticipantId() {
     writeJson(pairingFile(), pairingConfig);
   }
   return pairingConfig.participantId;
+}
+
+function loadTtsApiKey() {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) return '';
+    const encrypted = fs.readFileSync(ttsCredentialsFile());
+    return safeStorage.decryptString(encrypted);
+  } catch {
+    return '';
+  }
+}
+
+function saveTtsApiKey(apiKey) {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) return { ok: false, error: 'secure storage unavailable' };
+    const value = String(apiKey || '').trim();
+    if (!value) {
+      try { fs.unlinkSync(ttsCredentialsFile()); } catch {}
+      return { ok: true, configured: false };
+    }
+    fs.writeFileSync(ttsCredentialsFile(), safeStorage.encryptString(value));
+    return { ok: true, configured: true };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'secure storage write failed' };
+  }
 }
 
 function defaultBottomRight() {
@@ -534,6 +560,12 @@ ipcMain.handle('pet:save-pairing-config', (_e, config) => {
   return ok ? { ok: true, config: snapshot } : { ok: false, error: 'write failed' };
 });
 
+ipcMain.handle('tts:get-credentials', () => {
+  const apiKey = loadTtsApiKey();
+  return { configured: !!apiKey, apiKey };
+});
+ipcMain.handle('tts:save-credentials', (_e, apiKey) => saveTtsApiKey(apiKey));
+
 ipcMain.handle('pet:desktop-source-id', async () => {
   try {
     const sources = await desktopCapturer.getSources({
@@ -557,10 +589,6 @@ app.whenReady().then(() => {
   setTimeout(() => checkForPetUpdates(false), 3000);
   if (!configuredServerUrl() || !configuredRoomSecret()) showControlWindow();
 
-  // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
-  globalShortcut.register('Control+Alt+D', () => {
-    win?.webContents.send('pet:hotkey', 'toggle-chat');
-  });
   globalShortcut.register('Control+Alt+G', () => {
     setGameMode(!gameMode);
   });

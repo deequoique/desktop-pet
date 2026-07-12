@@ -24,24 +24,7 @@
       }
       .hidden { display: none !important; }
 
-      /* 对话气泡 + 输入框 */
-      #chat {
-        position: absolute; left: 12px; right: 12px; bottom: 12px;
-        background: rgba(15, 12, 22, 0.88);
-        border-radius: 20px;
-        padding: 8px 14px;
-        font-family: system-ui; font-size: 13px; color: #fff;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-        backdrop-filter: blur(8px);
-      }
-      #chat-input {
-        width: 100%; background: transparent; color: #fff;
-        border: 0; outline: 0; font-family: inherit; font-size: 13px;
-        caret-color: #ffd866;
-      }
-      #chat-input::placeholder { color: rgba(255,255,255,0.45); }
-      #chat.loading #chat-input::placeholder { color: #ffd866; }
-
+      /* 远程语音文本和错误提示 */
       #reply {
         position: absolute; left: 12px; right: 12px; top: 24px;
         max-height: 40%; overflow: hidden;
@@ -166,9 +149,6 @@
         <div id="pairing-error"></div>
       </div>
     </form>
-    <div id="chat" class="hidden">
-      <input id="chat-input" type="text" placeholder="跟我说点什么…  (Enter 发送 / Esc 取消)" maxlength="200" />
-    </div>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

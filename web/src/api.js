@@ -1,6 +1,7 @@
 import { io } from 'socket.io-client';
 let socket = null;
 let listeners = {};
+let ttsApiKey = '';
 export function setListeners(l) {
     listeners = l;
 }
@@ -21,6 +22,8 @@ export function connect(serverUrl, secret, participantId) {
                 listeners.onStatus?.('connected');
                 if (res.peers)
                     listeners.onPeers?.(res.peers);
+                if (ttsApiKey)
+                    s.emit('tts:set-credentials', { apiKey: ttsApiKey }, () => { });
             }
             else {
                 listeners.onStatus?.('rejected');
@@ -51,6 +54,7 @@ export function connect(serverUrl, secret, participantId) {
     s.on('call:end', (payload) => {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);
     });
+    s.on('tts:status', (payload) => listeners.onTtsStatus?.(payload));
     return s;
 }
 export function disconnect() {
@@ -132,4 +136,46 @@ export function endCall(callId) {
         return false;
     socket.emit('call:end', { callId });
     return true;
+}
+export function setTtsCredentials(apiKey) {
+    const nextApiKey = String(apiKey || '').trim();
+    if (!nextApiKey)
+        ttsApiKey = '';
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected', voices: [] });
+        socket.timeout(12000).emit('tts:set-credentials', { apiKey: nextApiKey }, (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout', voices: [] });
+            else {
+                if (response?.ok)
+                    ttsApiKey = nextApiKey;
+                resolve(response || { ok: false, code: 'tts_credentials_failed', voices: [] });
+            }
+        });
+    });
+}
+export function listTtsVoices() {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected', voices: [] });
+        socket.timeout(12000).emit('tts:list-voices', (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout', voices: [] });
+            else
+                resolve(response || { ok: false, code: 'tts_unavailable', voices: [] });
+        });
+    });
+}
+export function createTts(text, voiceId) {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(5000).emit('tts:create', { text, voiceId }, (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout' });
+            else
+                resolve(response || { ok: false, code: 'tts_create_failed' });
+        });
+    });
 }

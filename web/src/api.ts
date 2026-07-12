@@ -13,8 +13,11 @@ export type Command =
   | { type: 'expression'; name: ExpressionName; strength?: number; holdMs?: number }
   | { type: 'animation'; name: string }
   | { type: 'say_audio'; url: string }
-  | { type: 'say_tts'; text: string }
   | { type: 'relocate'; corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' };
+
+export type TtsVoice = { id: string; label: string; previewUrl?: string };
+export type TtsStatus = { jobId: string; state: 'dispatched' | 'generating' | 'playing' | 'completed' | 'error'; error?: string };
+export type TtsVoiceResponse = { ok: boolean; mode?: 'managed' | 'byok'; code?: string; voices: TtsVoice[] };
 
 export type Peers = {
   selfReady: boolean;
@@ -40,10 +43,12 @@ export type Listeners = {
   onRtcError?: (msg: string) => void;
   onCallStart?: (callId: string) => void;
   onCallEnd?: (callId?: string, reason?: string) => void;
+  onTtsStatus?: (status: TtsStatus) => void;
 };
 
 let socket: Socket | null = null;
 let listeners: Listeners = {};
+let ttsApiKey = '';
 
 export function setListeners(l: Listeners) {
   listeners = l;
@@ -68,6 +73,7 @@ export function connect(serverUrl: string, secret: string, participantId: string
         if (res?.ok) {
           listeners.onStatus?.('connected');
           if (res.peers) listeners.onPeers?.(res.peers);
+          if (ttsApiKey) s.emit('tts:set-credentials', { apiKey: ttsApiKey }, () => {});
         } else {
           listeners.onStatus?.('rejected');
           listeners.onError?.(res?.code === 'room_full' ? '房间已满（最多两人）' : res?.error || '加入失败');
@@ -98,6 +104,7 @@ export function connect(serverUrl: string, secret: string, participantId: string
   s.on('call:end', (payload: { callId?: string; reason?: string }) => {
     listeners.onCallEnd?.(payload?.callId, payload?.reason);
   });
+  s.on('tts:status', (payload: TtsStatus) => listeners.onTtsStatus?.(payload));
 
   return s;
 }
@@ -170,4 +177,39 @@ export function endCall(callId?: string): boolean {
   if (!socket?.connected) return false;
   socket.emit('call:end', { callId });
   return true;
+}
+
+export function setTtsCredentials(apiKey: string): Promise<TtsVoiceResponse> {
+  const nextApiKey = String(apiKey || '').trim();
+  if (!nextApiKey) ttsApiKey = '';
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected', voices: [] });
+    socket.timeout(12_000).emit('tts:set-credentials', { apiKey: nextApiKey }, (err: Error | null, response: TtsVoiceResponse) => {
+      if (err) resolve({ ok: false, code: 'timeout', voices: [] });
+      else {
+        if (response?.ok) ttsApiKey = nextApiKey;
+        resolve(response || { ok: false, code: 'tts_credentials_failed', voices: [] });
+      }
+    });
+  });
+}
+
+export function listTtsVoices(): Promise<TtsVoiceResponse> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected', voices: [] });
+    socket.timeout(12_000).emit('tts:list-voices', (err: Error | null, response: TtsVoiceResponse) => {
+      if (err) resolve({ ok: false, code: 'timeout', voices: [] });
+      else resolve(response || { ok: false, code: 'tts_unavailable', voices: [] });
+    });
+  });
+}
+
+export function createTts(text: string, voiceId: string): Promise<{ ok: boolean; jobId?: string; state?: string; position?: number; code?: string }> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+    socket.timeout(5000).emit('tts:create', { text, voiceId }, (err: Error | null, response: any) => {
+      if (err) resolve({ ok: false, code: 'timeout' });
+      else resolve(response || { ok: false, code: 'tts_create_failed' });
+    });
+  });
 }

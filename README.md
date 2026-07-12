@@ -1,31 +1,47 @@
 # Desktop Pet
 
-一个可以远程陪伴、控制动作、发语音、开视频通话的桌宠 App。
+一个双人远程桌宠：双方安装同一个 Electron 客户端，即可控制对方桌宠、互相查看屏幕和通话，并让对方桌宠用自己的克隆声音播放文字消息。
 
-## 它是做什么的
+## 当前能力
 
-双方安装桌宠后，可以从桌宠托盘打开内置控制台互相连接；控制台也可独立部署到浏览器：
+- Electron 同时包含透明桌宠窗口与内置 Web 控制面板。
+- 一个房间严格容纳两名参与者；第三人会收到“房间已满”。
+- 控制命令只发给对方桌宠。
+- WebRTC 传输屏幕和通话媒体；server 只负责鉴权、状态、信令与命令转发。
+- ElevenLabs 语音支持服务端白名单，也支持用户自带 API Key（BYOK）。
+- 控制面板仍可作为独立浏览器页面运行。
 
-- 控制桌宠动作、表情和位置
-- 发送文字或语音，让桌宠替你说话
-- 发起语音 / 视频通话
-- 查看对方电脑上的桌宠状态
+## 快速开始
 
-## 适合的场景
+需要 Node.js 20。复制 `server/.env.example` 为 `server/.env`，至少修改 `ROOM_SECRET`，然后分别启动：
 
-- 异地时做一个常驻桌面的陪伴入口
-- 给对方电脑放一个能互动的小角色
-- 用网页远程控制桌宠，不需要反复让对方操作
-- 后续扩展成更完整的虚拟陪伴、语音互动和自动更新应用
+```bash
+npm install --prefix server
+npm install --prefix web
+npm install --prefix pet
+npm run dev:server
+npm run dev:pet:local
+```
 
-## 当前形态
+生产环境应给 server 配置 HTTPS。两台客户端填写相同服务器地址和房间密钥后，会以各自稳定的 `participantId` 加入同一房间。
 
-这个项目目前是一个 v1 桌宠系统：
+## ElevenLabs 语音
 
-- `web/` 是同时内置进 Electron、也可独立部署的控制台
-- `server/` 负责连接和转发
-- `pet/` 是包含桌宠窗口和控制面板的 Electron 客户端
+托管模式由部署者配置 `ELEVENLABS_API_KEY` 和 `ELEVENLABS_VOICES_JSON`。BYOK 模式允许使用者输入自己的 ElevenLabs API Key，并从该账号可访问的声音中选择。Electron 把密钥加密保存在系统安全存储；独立浏览器不会持久化密钥。无论哪种模式，服务端都不会将音频写入磁盘。
 
-## 项目笔记
+请只使用本人声音或已获得明确授权的声音。使用第三方部署的 server 时，BYOK 密钥会在生成语音期间经过该 server，因此必须信任其运营者。
 
-系统架构、消息流、运行方式、部署配置和排查笔记统一放在 [AGENTS.md](AGENTS.md)。
+## 仓库结构
+
+- `server/`：Express + Socket.IO 房间服务、WebRTC 信令和 ElevenLabs 流式代理。
+- `web/`：React + Vite 控制面板，可独立运行或内置进 Electron。
+- `pet/`：Electron 桌宠、控制面板宿主和跨平台打包配置。
+- `Mate-Engine/`：可选 Unity 方向，不属于当前 v1 工作流。
+
+## 文档
+
+- [架构](docs/architecture.md)
+- [部署](docs/deployment.md)
+- [发布与打包](docs/releases.md)
+- [故障排查](docs/troubleshooting.md)
+- [版本路线](docs/roadmap.md)

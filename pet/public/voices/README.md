@@ -8,7 +8,7 @@ voices/
   head_2.wav
   body_1.wav   ← 戳身体时
   tail_1.wav   ← 戳尾巴时
-  idle_1.wav   ← 暂时没用到，留作 M6 后续
+  idle_1.wav   ← 保留给后续空闲语音
 ```
 
 - 支持 `.wav` / `.mp3` / `.ogg` / `.m4a`

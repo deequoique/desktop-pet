@@ -13,7 +13,6 @@ declare global {
       resize: (scale: number) => void;
       getScale: () => Promise<number>;
       onCursor: (cb: (c: { cx: number; cy: number; ww: number; wh: number; inside: boolean }) => void) => void;
-      onHotkey: (cb: (name: string) => void) => void;
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
       getRoomSecret: () => Promise<string>;
@@ -41,7 +40,6 @@ const browserPetBridge: PetBridge = {
     window.addEventListener('mouseenter', (e) => emit(e.clientX, e.clientY, true));
     window.addEventListener('mouseleave', (e) => emit(e.clientX, e.clientY, false));
   },
-  onHotkey: () => {},
   listVoices: async () => [],
   getServerUrl: async () => 'http://localhost:3030',
   getRoomSecret: async () => 'change-me',
@@ -73,8 +71,6 @@ const MODEL_SCENE_ROT_Y = Math.PI;
 const app = document.getElementById('app')!;
 const fallback = document.getElementById('fallback')!;
 const replyEl = document.getElementById('reply')!;
-const chatBox = document.getElementById('chat')!;
-const chatInput = document.getElementById('chat-input') as HTMLInputElement;
 const sizeBox = document.getElementById('size')!;
 const sizeDown = document.getElementById('size-down') as HTMLButtonElement;
 const sizeUp = document.getElementById('size-up') as HTMLButtonElement;
@@ -1167,83 +1163,14 @@ async function playVoiceFor(part: 'head' | 'body' | 'tail' | 'idle'): Promise<bo
   return playUrl(url);
 }
 
-// === Chat overlay ===
-let chatOpen = false;
-let chatBusy = false;
+// === 远程文本气泡 ===
 let replyTimer = 0;
-
-function openChat() {
-  if (chatBusy) return;
-  chatOpen = true;
-  chatBox.classList.remove('hidden');
-  setTimeout(() => chatInput.focus(), 30);
-}
-function closeChat() {
-  chatOpen = false;
-  chatBox.classList.add('hidden');
-  chatBox.classList.remove('loading');
-  chatInput.value = '';
-  chatInput.placeholder = '跟我说点什么…  (Enter 发送 / Esc 取消)';
-  chatInput.blur();
-}
 function showReply(text: string, ms = 6000) {
   replyEl.textContent = text;
   replyEl.classList.add('on');
   if (replyTimer) window.clearTimeout(replyTimer);
   replyTimer = window.setTimeout(() => replyEl.classList.remove('on'), ms);
 }
-
-async function chatAndSpeak(text: string) {
-  let reply = '';
-  try {
-    const r = await fetch(`${SERVER_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      console.warn('[chat] http', r.status, err);
-      showReply(r.status === 503 ? '呜...服务器还没接 DeepSeek key' : '说不出话了…', 3000);
-      return;
-    }
-    const j = await r.json();
-    reply = (j.reply || '').trim();
-  } catch (e) {
-    console.warn('[chat] failed:', e);
-    showReply('网炸了…', 3000);
-    return;
-  }
-  if (!reply) { showReply('？', 2500); return; }
-  showReply(reply, 7000);
-  // M3 决定：AI 回复只显示文字气泡，不播声音。
-  // 声音留给：戳模型（预录）+ M4 A 端实时人声推过来。
-}
-
-chatInput.addEventListener('keydown', async (e) => {
-  if (e.key === 'Escape') { e.preventDefault(); closeChat(); return; }
-  if (e.key !== 'Enter') return;
-  e.preventDefault();
-  const text = chatInput.value.trim();
-  if (!text || chatBusy) return;
-  chatBusy = true;
-  chatBox.classList.add('loading');
-  chatInput.value = '';
-  chatInput.placeholder = '...';
-  try {
-    await chatAndSpeak(text);
-  } finally {
-    chatBusy = false;
-    closeChat();
-  }
-});
-
-petBridge.onHotkey((name) => {
-  if (name === 'toggle-chat') {
-    if (chatOpen) closeChat();
-    else openChat();
-  }
-});
 
 // === 大小调节按钮 ===
 let currentScale = 1;
@@ -1295,7 +1222,6 @@ type RemoteCommand =
   | { type: 'expression'; name: ExpName; strength?: number; holdMs?: number }
   | { type: 'animation'; name: string }
   | { type: 'say_audio'; url: string }
-  | { type: 'say_tts'; text: string }
   | { type: 'relocate'; corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' };
 
 let remoteSocket: Socket | null = null;
@@ -1311,6 +1237,61 @@ const rtcPendingCandidates: RTCIceCandidateInit[] = [];
 const rtcAudioEl = new Audio();
 rtcAudioEl.autoplay = true;
 rtcAudioEl.volume = 1;
+
+type TtsPlay = { jobId: string; text: string; streamUrl: string };
+const ttsAudioEl = new Audio();
+ttsAudioEl.autoplay = true;
+ttsAudioEl.preload = 'none';
+ttsAudioEl.crossOrigin = 'anonymous';
+let ttsAudioContext: AudioContext | null = null;
+let ttsMediaSource: MediaElementAudioSourceNode | null = null;
+let activeTtsJobId = '';
+
+function stopTtsPlayback() {
+  ttsAudioEl.pause();
+  ttsAudioEl.removeAttribute('src');
+  ttsAudioEl.load();
+  activeTtsJobId = '';
+  currentAnalyser = null;
+}
+
+async function playTtsStream(job: TtsPlay) {
+  if (!job?.jobId || !job.streamUrl) return;
+  stopTtsPlayback();
+  activeTtsJobId = job.jobId;
+  showReply(String(job.text || '').slice(0, 200), 7000);
+  try {
+    ttsAudioContext ||= new AudioContext();
+    await ttsAudioContext.resume();
+    ttsMediaSource ||= ttsAudioContext.createMediaElementSource(ttsAudioEl);
+    const analyser = ttsAudioContext.createAnalyser();
+    analyser.fftSize = 256;
+    ttsMediaSource.disconnect();
+    ttsMediaSource.connect(analyser);
+    analyser.connect(ttsAudioContext.destination);
+    currentAnalyser = analyser;
+    ttsAudioEl.src = `${SERVER_URL}${job.streamUrl}`;
+    await ttsAudioEl.play();
+    if (activeTtsJobId === job.jobId) remoteSocket?.emit('tts:status', { jobId: job.jobId, state: 'playing' });
+  } catch (error) {
+    console.warn('[tts] playback failed:', error);
+    remoteSocket?.emit('tts:status', { jobId: job.jobId, state: 'error', error: 'tts_playback_failed' });
+    showReply('语音播放失败', 3500);
+    stopTtsPlayback();
+  }
+}
+
+ttsAudioEl.addEventListener('ended', () => {
+  const jobId = activeTtsJobId;
+  if (jobId) remoteSocket?.emit('tts:status', { jobId, state: 'completed' });
+  stopTtsPlayback();
+});
+ttsAudioEl.addEventListener('error', () => {
+  const jobId = activeTtsJobId;
+  if (jobId) remoteSocket?.emit('tts:status', { jobId, state: 'error', error: 'tts_stream_failed' });
+  if (jobId) showReply('语音流中断', 3500);
+  stopTtsPlayback();
+});
 
 type WebRtcSignal = {
   callId?: string;
@@ -1353,15 +1334,6 @@ function handleRemoteCommand(cmd: RemoteCommand) {
       if (typeof cmd.url !== 'string' || !cmd.url) return;
       playUrl(cmd.url).catch(() => {});
       noteRemote(`audio ${cmd.url.split('/').pop()}`);
-      break;
-    }
-    case 'say_tts': {
-      const text = String(cmd.text ?? '').slice(0, 1000).trim();
-      if (!text) return;
-      const url = `${SERVER_URL}/api/tts?text=${encodeURIComponent(text)}`;
-      playUrl(url).catch(() => {});
-      showReply(text, 6000);
-      noteRemote(`tts "${text.slice(0, 16)}${text.length > 16 ? '…' : ''}"`);
       break;
     }
     case 'relocate': {
@@ -1651,6 +1623,7 @@ function connectRemote() {
   remoteSocket.on('connect', join);
   remoteSocket.on('disconnect', () => {
     remoteConnected = false;
+    stopTtsPlayback();
     cleanupRtc(false);
     console.log('[remote] disconnected');
   });
@@ -1661,6 +1634,9 @@ function connectRemote() {
   remoteSocket.on('pet:command', (cmd: RemoteCommand) => {
     console.log('[remote] cmd', cmd);
     handleRemoteCommand(cmd);
+  });
+  remoteSocket.on('tts:play', (job: TtsPlay) => {
+    void playTtsStream(job);
   });
   remoteSocket.on('webrtc:signal', (signal: WebRtcSignal) => {
     handleRtcSignal(signal).catch((e) => {
@@ -1790,9 +1766,9 @@ function tick() {
 
   if (cursorInside && cursorOverSizeControls()) showSizeControls();
 
-  // clickable：配对/chat/缩放控件打开时强制开启（要能打字/点击）；否则按 hit-test
+  // clickable：配对/缩放控件打开时强制开启；否则按 hit-test
   let clickable = false;
-  if (pairingOpen || chatOpen || sizeControlsActive || (cursorInside && cursorOverSizeControls())) clickable = true;
+  if (pairingOpen || sizeControlsActive || (cursorInside && cursorOverSizeControls())) clickable = true;
   else if (cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
     clickable = vrm ? raycaster.intersectObject(vrm.scene, true).length > 0 : true;
   }
@@ -1810,7 +1786,7 @@ function tick() {
       : 'none';
     console.info(
       `vrm:${vrm ? 'ok' : '...'} inside:${cursorInside ? 'Y' : 'N'} click:${lastClickable ? 'Y' : 'N'}\n` +
-      `look:${lookMode} chat:${chatOpen ? 'Y' : 'N'} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
+      `look:${lookMode} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
       `hit:${lastHitPart}\n` +
       `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} tail:${tailBones.length} ears:${earBones.left.length}/${earBones.right.length} wag:${sinceTail}s active:${currentMotionId || '-'}\n` +
       `remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`

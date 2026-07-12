@@ -4,15 +4,19 @@ import {
   disconnect,
   listMotions,
   listVoices,
+  createTts,
   endCall,
   requestCall,
   sendCommand,
   sendSignal,
   setListeners,
+  setTtsCredentials,
   type Command,
   type ExpressionName,
   type MotionMeta,
   type Peers,
+  type TtsStatus,
+  type TtsVoice,
   type WebRtcSignal,
 } from './api';
 
@@ -29,6 +33,8 @@ type RtcRoute = {
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
+const LS_TTS_MODE = 'pet.ttsMode';
+const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
 type PairingConfig = { serverUrl?: string; roomSecret?: string; participantId?: string };
 
@@ -38,6 +44,8 @@ declare global {
       getPairingConfig: () => Promise<PairingConfig>;
       savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
       onPairingChanged: (cb: (config: PairingConfig) => void) => void;
+      getTtsCredentials: () => Promise<{ configured: boolean; apiKey?: string }>;
+      saveTtsCredentials: (apiKey: string) => Promise<{ ok: boolean; configured?: boolean; error?: string }>;
     };
   }
 }
@@ -148,6 +156,27 @@ function voiceLabel(url: string): string {
   return (url.split('/').pop() || url).replace(/\.[^.]+$/, '');
 }
 
+function ttsErrorMessage(code?: string) {
+  const messages: Record<string, string> = {
+    disconnected: '尚未连接 server',
+    tts_not_configured: 'Server 尚未配置 ElevenLabs',
+    tts_no_voices: '没有可用声音',
+    tts_voice_not_allowed: '所选声音不可用，请重新选择',
+    tts_queue_full: '对方语音队列已满，请稍后再发',
+    tts_rate_limited: '发送太频繁，请一分钟后再试',
+    peer_pet_offline: '对方桌宠不在线',
+    tts_byok_unauthorized: 'ElevenLabs API Key 无效',
+    tts_byok_unavailable: '无法读取 ElevenLabs 声音列表',
+    tts_credentials_unavailable: '自定义 API Key 已断开，请重新连接',
+    tts_upstream_unauthorized: 'ElevenLabs 拒绝了 API Key',
+    tts_upstream_rate_limited: 'ElevenLabs 额度或频率已受限',
+    tts_upstream_error: 'ElevenLabs 生成失败',
+    tts_stream_failed: '语音流中断',
+    tts_job_expired: '语音任务已过期',
+  };
+  return messages[code || ''] || code || '语音发送失败';
+}
+
 export default function App() {
   const [serverUrl, setServerUrl] = useState(() => localStorage.getItem(LS_SERVER) || DEFAULT_SERVER);
   const [secret, setSecret] = useState(() => localStorage.getItem(LS_SECRET) || DEFAULT_SECRET);
@@ -160,6 +189,13 @@ export default function App() {
   const [motions, setMotions] = useState<MotionMeta[]>([]);
   const [voices, setVoices] = useState<string[]>([]);
   const [tts, setTts] = useState('');
+  const [ttsMode, setTtsMode] = useState<'managed' | 'byok'>(() => localStorage.getItem(LS_TTS_MODE) === 'byok' ? 'byok' : 'managed');
+  const [ttsApiKey, setTtsApiKey] = useState('');
+  const [ttsApiKeyInput, setTtsApiKeyInput] = useState('');
+  const [ttsKeyConfigured, setTtsKeyConfigured] = useState(false);
+  const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>([]);
+  const [ttsVoiceId, setTtsVoiceId] = useState(() => localStorage.getItem(LS_TTS_VOICE) || '');
+  const [ttsState, setTtsState] = useState('等待发送');
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
   const [callState, setCallState] = useState<CallState>('idle');
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
@@ -459,6 +495,15 @@ export default function App() {
         teardownCall({ nextState: 'idle' });
         showToast('通话结束了');
       },
+      onTtsStatus: (payload: TtsStatus) => {
+        const labels: Record<string, string> = {
+          dispatched: '已发送到对方桌宠', generating: '正在生成语音…',
+          playing: '对方正在播放', completed: '播放完成', error: ttsErrorMessage(payload.error),
+        };
+        const label = labels[payload.state] || payload.state;
+        setTtsState(label);
+        if (payload.state === 'error') showToast(label, true);
+      },
     });
     return () => {
       setListeners({});
@@ -484,6 +529,51 @@ export default function App() {
     });
     bridge.onPairingChanged(applyConfig);
   }, [showToast]);
+
+  useEffect(() => {
+    const bridge = window.desktopPetControl;
+    if (!bridge) return;
+    bridge.getTtsCredentials().then((result) => {
+      setTtsKeyConfigured(!!result.configured);
+      if (result.apiKey) setTtsApiKey(result.apiKey);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (status !== 'connected') {
+      setTtsVoices([]);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      if (ttsMode === 'byok' && !ttsApiKey) {
+        setTtsVoices([]);
+        setTtsState('请配置 ElevenLabs API Key');
+        return;
+      }
+      const response = ttsMode === 'byok'
+        ? await setTtsCredentials(ttsApiKey)
+        : await setTtsCredentials('');
+      if (cancelled) return;
+      setTtsVoices(response.voices || []);
+      if (!response.ok) {
+        setTtsState(ttsErrorMessage(response.code));
+        return;
+      }
+      const savedStillExists = response.voices.some((voice) => voice.id === ttsVoiceId);
+      if (!savedStillExists) {
+        const nextId = response.voices[0]?.id || '';
+        setTtsVoiceId(nextId);
+        if (nextId) localStorage.setItem(LS_TTS_VOICE, nextId);
+        else localStorage.removeItem(LS_TTS_VOICE);
+      }
+      setTtsState(response.voices.length ? '等待发送' : '没有可用声音');
+    };
+    load().catch((error) => {
+      if (!cancelled) setTtsState(`声音加载失败：${error?.message || error}`);
+    });
+    return () => { cancelled = true; };
+  }, [status, ttsApiKey, ttsMode]);
 
   useEffect(() => {
     if (status !== 'connected' || !peers.peerPetOnline) {
@@ -578,16 +668,80 @@ export default function App() {
     showToast(ok ? `✔ ${label}` : '发送失败', !ok);
   }, [canSend, showToast, status]);
 
-  const onSendTts = useCallback(() => {
+  const selectTtsMode = useCallback((mode: 'managed' | 'byok') => {
+    setTtsMode(mode);
+    localStorage.setItem(LS_TTS_MODE, mode);
+    setTtsState(mode === 'managed' ? '正在读取服务端声音…' : '请配置自己的 ElevenLabs API Key');
+  }, []);
+
+  const saveByokKey = useCallback(async () => {
+    const apiKey = ttsApiKeyInput.trim();
+    if (!apiKey) {
+      showToast('请输入 ElevenLabs API Key', true);
+      return;
+    }
+    setTtsState('正在验证 API Key…');
+    const validation = await setTtsCredentials(apiKey);
+    if (!validation.ok) {
+      const message = ttsErrorMessage(validation.code);
+      setTtsState(message);
+      showToast(message, true);
+      return;
+    }
+    if (window.desktopPetControl) {
+      const result = await window.desktopPetControl.saveTtsCredentials(apiKey);
+      if (!result.ok) {
+        showToast(`安全保存失败：${result.error || 'unknown'}`, true);
+        return;
+      }
+    }
+    setTtsApiKey(apiKey);
+    setTtsApiKeyInput('');
+    setTtsKeyConfigured(true);
+    setTtsVoices(validation.voices || []);
+    selectTtsMode('byok');
+  }, [selectTtsMode, showToast, ttsApiKeyInput]);
+
+  const clearByokKey = useCallback(async () => {
+    if (window.desktopPetControl) await window.desktopPetControl.saveTtsCredentials('');
+    setTtsApiKey('');
+    setTtsApiKeyInput('');
+    setTtsKeyConfigured(false);
+    selectTtsMode('managed');
+  }, [selectTtsMode]);
+
+  const previewTtsVoice = useCallback(() => {
+    const voice = ttsVoices.find((item) => item.id === ttsVoiceId);
+    if (!voice?.previewUrl) {
+      showToast('这个声音没有可用试听', true);
+      return;
+    }
+    const audio = new Audio(voice.previewUrl);
+    audio.play().catch((error) => showToast(`试听失败：${error?.message || error}`, true));
+  }, [showToast, ttsVoiceId, ttsVoices]);
+
+  const onSendTts = useCallback(async () => {
     const text = tts.trim();
     if (!text) return;
     if (text.length > 200) {
       showToast('太长了，控制在 200 字内', true);
       return;
     }
-    send({ type: 'say_tts', text }, `说："${text.slice(0, 12)}${text.length > 12 ? '…' : ''}"`);
+    if (!ttsVoiceId) {
+      showToast('请先选择自己的声音', true);
+      return;
+    }
+    setTtsState('正在提交…');
+    const result = await createTts(text, ttsVoiceId);
+    if (!result.ok) {
+      const message = ttsErrorMessage(result.code);
+      setTtsState(message);
+      showToast(message, true);
+      return;
+    }
     setTts('');
-  }, [send, showToast, tts]);
+    setTtsState(result.position ? `排队中（前面 ${result.position} 条）` : '已发送到对方桌宠');
+  }, [showToast, tts, ttsVoiceId]);
 
   const onStartCall = useCallback(async () => {
     if (!canCall) {
@@ -790,8 +944,43 @@ export default function App() {
       </section>
 
       <section className="section">
-        <h2>打字念出来（用你的声音）</h2>
+        <h2>语音消息 · ElevenLabs</h2>
         <div className="tts-area">
+          <div className="tts-mode-row">
+            <button className={`btn ${ttsMode === 'managed' ? 'accent' : ''}`} onClick={() => selectTtsMode('managed')}>服务端声音</button>
+            <button className={`btn ${ttsMode === 'byok' ? 'accent' : ''}`} onClick={() => selectTtsMode('byok')}>使用我的 API Key</button>
+            <span className="tts-hint">发送后由对方桌宠用你的克隆声音播放</span>
+          </div>
+          {ttsMode === 'byok' && (
+            <div className="tts-key-row">
+              <input
+                type="password"
+                value={ttsApiKeyInput}
+                onChange={(event) => setTtsApiKeyInput(event.target.value)}
+                placeholder={ttsKeyConfigured ? 'API Key 已安全保存，输入新 Key 可替换' : 'ElevenLabs API Key'}
+                autoComplete="off"
+              />
+              <button className="btn" disabled={!ttsApiKeyInput.trim()} onClick={saveByokKey}>验证并保存</button>
+              {ttsKeyConfigured && <button className="btn danger" onClick={clearByokKey}>删除 Key</button>}
+            </div>
+          )}
+          <div className="tts-voice-row">
+            <label htmlFor="tts-voice">我的声音</label>
+            <select
+              id="tts-voice"
+              value={ttsVoiceId}
+              disabled={status !== 'connected' || !ttsVoices.length}
+              onChange={(event) => {
+                setTtsVoiceId(event.target.value);
+                localStorage.setItem(LS_TTS_VOICE, event.target.value);
+              }}
+            >
+              {!ttsVoices.length && <option value="">暂无可用声音</option>}
+              {ttsVoices.map((voice) => <option key={voice.id} value={voice.id}>{voice.label}</option>)}
+            </select>
+            <button className="btn" disabled={!ttsVoices.find((voice) => voice.id === ttsVoiceId)?.previewUrl} onClick={previewTtsVoice}>试听</button>
+            <span className="tts-status">{ttsState}</span>
+          </div>
           <textarea
             value={tts}
             onChange={(e) => setTts(e.target.value)}
@@ -807,10 +996,10 @@ export default function App() {
           <div className="tts-row">
             <button
               className="btn accent"
-              disabled={!canSend || !tts.trim()}
+              disabled={!canSend || !tts.trim() || !ttsVoiceId}
               onClick={onSendTts}
             >让她听到 ▶</button>
-            <span className="tts-hint">需要后端配好 ELEVENLABS_API_KEY + VOICE_ID</span>
+            <span className="tts-hint">只使用本人所有或已获授权的克隆声音</span>
             <div style={{ flex: 1 }} />
             <span className="tts-hint">{tts.length}/200</span>
           </div>

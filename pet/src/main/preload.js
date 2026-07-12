@@ -7,7 +7,6 @@ contextBridge.exposeInMainWorld('pet', {
   resize: (scale) => ipcRenderer.send('pet:resize', scale),
   getScale: () => ipcRenderer.invoke('pet:get-scale'),
   onCursor: (cb) => ipcRenderer.on('pet:cursor', (_e, c) => cb(c)),
-  onHotkey: (cb) => ipcRenderer.on('pet:hotkey', (_e, name) => cb(name)),
   listVoices: () => ipcRenderer.invoke('pet:voices'),
   getServerUrl: () => ipcRenderer.invoke('pet:server-url'),
   getRoomSecret: () => ipcRenderer.invoke('pet:room-secret'),

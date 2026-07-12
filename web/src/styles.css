@@ -154,6 +154,8 @@ h1 {
 }
 
 .status-row input,
+.tts-key-row input,
+.tts-voice-row select,
 .tts-area textarea {
   width: 100%;
   background: linear-gradient(180deg, #091019, #0d1621);
@@ -173,6 +175,8 @@ h1 {
 }
 
 .status-row input:focus,
+.tts-key-row input:focus,
+.tts-voice-row select:focus,
 .tts-area textarea:focus {
   border-color: rgba(70, 162, 255, 0.7);
   box-shadow: 0 0 0 4px rgba(70, 162, 255, 0.12);
@@ -409,6 +413,39 @@ h1 {
 .tts-area textarea {
   min-height: 92px;
   resize: vertical;
+}
+
+.tts-mode-row,
+.tts-key-row,
+.tts-voice-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.tts-key-row input {
+  flex: 1;
+  min-width: 260px;
+}
+
+.tts-voice-row label {
+  color: var(--muted-2);
+  font-size: 12px;
+}
+
+.tts-voice-row select {
+  min-width: 210px;
+}
+
+.tts-status {
+  color: var(--ok);
+  font-size: 12px;
+}
+
+.btn.danger {
+  color: var(--bad);
+  border-color: rgba(252, 165, 165, 0.28);
 }
 
 .tts-hint,

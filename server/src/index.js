@@ -3,20 +3,37 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { createHash, randomUUID } from 'crypto';
+import { Readable } from 'stream';
 import { Server as SocketIOServer } from 'socket.io';
-import { getPersona, buildSystemPrompt } from './prompts.js';
 
 const PORT = process.env.PORT || 3030;
 
-// === Chat（DeepSeek，OpenAI 兼容接口）===
-const DEEPSEEK_KEY = process['env']['DEEPSEEK_API_KEY'];
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
-const DEEPSEEK_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/chat/completions';
-
 // === TTS（ElevenLabs）===
 const ELEVENLABS_KEY = process['env']['ELEVENLABS_API_KEY'];
-const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-const TTS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
+const ELEVENLABS_BASE_URL = String(process.env.ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io').replace(/\/+$/, '');
+const TTS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
+const TTS_JOB_TTL_MS = Math.max(5_000, Number(process.env.TTS_JOB_TTL_MS || 60_000));
+const TTS_RATE_LIMIT = Math.max(1, Number(process.env.TTS_RATE_LIMIT || 10));
+const TTS_QUEUE_LIMIT = 3;
+
+function loadAllowedVoices() {
+  const legacyId = String(process.env.ELEVENLABS_VOICE_ID || '').trim();
+  const raw = String(process.env.ELEVENLABS_VOICES_JSON || '').trim();
+  let parsed = [];
+  if (raw) {
+    try { parsed = JSON.parse(raw); }
+    catch (error) { console.warn('[tts] invalid ELEVENLABS_VOICES_JSON:', error?.message || error); }
+  }
+  const voices = Array.isArray(parsed) ? parsed : [];
+  const normalized = voices
+    .map((voice) => ({ id: String(voice?.id || '').trim(), label: String(voice?.label || '').trim() }))
+    .filter((voice) => voice.id && voice.label);
+  if (!normalized.length && legacyId) normalized.push({ id: legacyId, label: 'Default' });
+  return normalized;
+}
+
+const ALLOWED_VOICES = loadAllowedVoices();
+const ALLOWED_VOICE_IDS = new Set(ALLOWED_VOICES.map((voice) => voice.id));
 
 // === Socket.IO 房间 / 鉴权 ===
 // 房间密钥由服务端预配置。ROOM_SECRETS 支持逗号分隔；ROOM_SECRET 保持 v1.1 兼容。
@@ -26,10 +43,6 @@ const ROOM_SECRET_HASHES = new Set(
 );
 const ROOM_GRACE_MS = Math.max(0, Number(process.env.ROOM_GRACE_MS || 30_000));
 
-// 计划 §四 模块 4：人设抽到 prompts.js 里了；用 PET_PERSONA 切换
-const PERSONA = getPersona(process.env.PET_PERSONA);
-const SYSTEM_PROMPT = buildSystemPrompt(PERSONA);
-
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -37,99 +50,11 @@ app.use(express.json({ limit: '2mb' }));
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    chat: DEEPSEEK_KEY ? 'deepseek' : 'missing',
-    tts: !!(ELEVENLABS_KEY && VOICE_ID),
+    tts: ELEVENLABS_KEY && ALLOWED_VOICES.length ? 'ready' : 'disabled',
+    ttsVoices: ALLOWED_VOICES.length,
     socket: 'ready',
   });
 });
-
-// 文字对话 → DeepSeek 回复
-app.post('/api/chat', async (req, res) => {
-  if (!DEEPSEEK_KEY) {
-    return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured on server' });
-  }
-  const text = String(req.body?.text ?? '').slice(0, 1000).trim();
-  if (!text) return res.status(400).json({ error: 'text required' });
-
-  try {
-    const r = await fetch(DEEPSEEK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_KEY}`,
-      },
-      body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
-        max_tokens: 200,
-        temperature: 0.9,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-      }),
-    });
-    if (!r.ok) {
-      const errText = await r.text().catch(() => '');
-      console.error('[chat] deepseek', r.status, errText);
-      return res.status(r.status).json({ error: errText || `deepseek ${r.status}` });
-    }
-    const j = await r.json();
-    const reply = (j.choices?.[0]?.message?.content ?? '').trim();
-    res.json({ reply, usage: j.usage });
-  } catch (e) {
-    console.error('[chat] error:', e?.message || e);
-    res.status(500).json({ error: e?.message || 'chat failed' });
-  }
-});
-
-// === TTS：ElevenLabs 代理 ===
-// 支持 POST {text} 和 GET ?text=...
-// B 端收到 say_tts 指令后直接 GET 这个 URL（用 fetch 拿 ArrayBuffer 再 playAudioBuffer）。
-async function elevenlabsTTS(text) {
-  if (!ELEVENLABS_KEY || !VOICE_ID) {
-    const err = new Error('ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID not configured');
-    err.status = 503;
-    throw err;
-  }
-  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
-    method: 'POST',
-    headers: {
-      'xi-api-key': ELEVENLABS_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'audio/mpeg',
-    },
-    body: JSON.stringify({
-      text,
-      model_id: TTS_MODEL,
-      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.2 },
-    }),
-  });
-  if (!r.ok) {
-    const errText = await r.text().catch(() => '');
-    const err = new Error(errText || `elevenlabs ${r.status}`);
-    err.status = r.status;
-    throw err;
-  }
-  return Buffer.from(await r.arrayBuffer());
-}
-
-async function handleTTS(text, res) {
-  text = String(text ?? '').slice(0, 1000).trim();
-  if (!text) return res.status(400).json({ error: 'text required' });
-  try {
-    const buf = await elevenlabsTTS(text);
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', buf.length);
-    res.setHeader('Cache-Control', 'no-store');
-    res.send(buf);
-  } catch (e) {
-    console.error('[tts] error:', e?.message || e);
-    res.status(e?.status || 500).json({ error: e?.message || 'tts failed' });
-  }
-}
-
-app.post('/api/tts', (req, res) => handleTTS(req.body?.text, res));
-app.get('/api/tts', (req, res) => handleTTS(req.query?.text, res));
 
 // === HTTP server + Socket.IO ===
 const httpServer = createServer(app);
@@ -203,6 +128,207 @@ function endRoomCall(room, reason = 'ended') {
   emitToRoomEndpoints(room, 'call:end', { callId, reason });
   emitToRoomEndpoints(room, 'webrtc:hangup', { callId, reason });
 }
+
+// === ElevenLabs TTS jobs ===
+const ttsJobs = new Map();
+const ttsQueues = new Map();
+const ttsRateWindows = new Map();
+let voiceMetadataCache = { expiresAt: 0, voices: [] };
+
+function ttsQueueKey(roomHash, participantId) { return `${roomHash}:${participantId}`; }
+
+function ttsQueueFor(roomHash, participantId) {
+  const key = ttsQueueKey(roomHash, participantId);
+  let queue = ttsQueues.get(key);
+  if (!queue) {
+    queue = { key, roomHash, participantId, active: null, pending: [] };
+    ttsQueues.set(key, queue);
+  }
+  return queue;
+}
+
+function emitTtsStatus(job, state, error) {
+  const room = rooms.get(job.roomHash);
+  const requester = room?.participants.get(job.requesterId);
+  if (!requester?.controller) return;
+  io.to(requester.controller).emit('tts:status', {
+    jobId: job.id,
+    state,
+    ...(error ? { error } : {}),
+  });
+}
+
+function dispatchNextTts(queue) {
+  if (queue.active || !queue.pending.length) return;
+  const jobId = queue.pending.shift();
+  const job = ttsJobs.get(jobId);
+  if (!job) return dispatchNextTts(queue);
+  const room = rooms.get(job.roomHash);
+  const target = room?.participants.get(job.targetId);
+  if (!target?.pet) {
+    emitTtsStatus(job, 'error', 'peer_pet_offline');
+    ttsJobs.delete(job.id);
+    return dispatchNextTts(queue);
+  }
+  queue.active = job.id;
+  job.state = 'dispatched';
+  job.expiresAt = Date.now() + TTS_JOB_TTL_MS;
+  job.expiryTimer = setTimeout(() => finishTtsJob(job, 'error', 'tts_job_expired'), TTS_JOB_TTL_MS);
+  io.to(target.pet).emit('tts:play', {
+    jobId: job.id,
+    text: job.text,
+    streamUrl: `/api/tts/jobs/${job.id}`,
+  });
+  emitTtsStatus(job, 'dispatched');
+}
+
+function finishTtsJob(job, state, error) {
+  if (!job || job.finished) return;
+  job.finished = true;
+  if (job.expiryTimer) clearTimeout(job.expiryTimer);
+  emitTtsStatus(job, state, error);
+  ttsJobs.delete(job.id);
+  const queue = ttsQueues.get(ttsQueueKey(job.roomHash, job.targetId));
+  if (!queue) return;
+  if (queue.active === job.id) queue.active = null;
+  else queue.pending = queue.pending.filter((id) => id !== job.id);
+  if (!queue.active && !queue.pending.length) ttsQueues.delete(queue.key);
+  else dispatchNextTts(queue);
+}
+
+function failTtsForTarget(roomHash, participantId, error) {
+  const queue = ttsQueues.get(ttsQueueKey(roomHash, participantId));
+  if (!queue) return;
+  for (const id of [queue.active, ...queue.pending].filter(Boolean)) {
+    const job = ttsJobs.get(id);
+    if (job) finishTtsJob(job, 'error', error);
+  }
+}
+
+function consumeTtsRate(roomHash, participantId) {
+  const key = `${roomHash}:${participantId}`;
+  const now = Date.now();
+  const timestamps = (ttsRateWindows.get(key) || []).filter((at) => now - at < 60_000);
+  if (timestamps.length >= TTS_RATE_LIMIT) {
+    ttsRateWindows.set(key, timestamps);
+    return false;
+  }
+  timestamps.push(now);
+  ttsRateWindows.set(key, timestamps);
+  return true;
+}
+
+async function allowedVoicesWithPreviews() {
+  if (voiceMetadataCache.expiresAt > Date.now()) return voiceMetadataCache.voices;
+  const voices = await Promise.all(ALLOWED_VOICES.map(async (voice) => {
+    if (!ELEVENLABS_KEY) return voice;
+    try {
+      const response = await fetch(`${ELEVENLABS_BASE_URL}/v1/voices/${encodeURIComponent(voice.id)}`, {
+        headers: { 'xi-api-key': ELEVENLABS_KEY },
+      });
+      if (!response.ok) return voice;
+      const metadata = await response.json();
+      return { ...voice, previewUrl: metadata?.preview_url || undefined };
+    } catch {
+      return voice;
+    }
+  }));
+  voiceMetadataCache = { expiresAt: Date.now() + 10 * 60_000, voices };
+  return voices;
+}
+
+async function fetchByokVoices(apiKey) {
+  const response = await fetch(`${ELEVENLABS_BASE_URL}/v2/voices?page_size=100`, {
+    headers: { 'xi-api-key': apiKey },
+  });
+  if (!response.ok) {
+    const error = new Error(response.status === 401 ? 'tts_byok_unauthorized' : 'tts_byok_unavailable');
+    error.status = response.status;
+    throw error;
+  }
+  const body = await response.json();
+  return (Array.isArray(body?.voices) ? body.voices : []).map((voice) => ({
+    id: String(voice?.voice_id || ''),
+    label: String(voice?.name || voice?.voice_id || 'Voice'),
+    previewUrl: voice?.preview_url || undefined,
+  })).filter((voice) => voice.id);
+}
+
+function apiKeyForJob(job) {
+  if (job.credentialMode === 'managed') return ELEVENLABS_KEY;
+  const room = rooms.get(job.roomHash);
+  const requester = room?.participants.get(job.requesterId);
+  const controllerSocket = requester?.controller ? io.sockets.sockets.get(requester.controller) : null;
+  return controllerSocket?.data?.elevenlabsKey || '';
+}
+
+function failByokJobsForRequester(roomHash, participantId) {
+  for (const job of [...ttsJobs.values()]) {
+    if (job.roomHash === roomHash && job.requesterId === participantId && job.credentialMode === 'byok') {
+      finishTtsJob(job, 'error', 'tts_byok_disconnected');
+    }
+  }
+}
+
+app.get('/api/tts/jobs/:jobId', async (req, res) => {
+  const job = ttsJobs.get(String(req.params.jobId || ''));
+  if (!job || job.finished || Date.now() > job.expiresAt) {
+    return res.status(410).json({ error: 'tts_job_expired' });
+  }
+  if (job.consumed) return res.status(410).json({ error: 'tts_job_already_used' });
+  job.consumed = true;
+  emitTtsStatus(job, 'generating');
+  const apiKey = apiKeyForJob(job);
+  if (!apiKey) {
+    finishTtsJob(job, 'error', 'tts_credentials_unavailable');
+    return res.status(503).json({ error: 'tts_credentials_unavailable' });
+  }
+
+  const abortController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) abortController.abort();
+  });
+  try {
+    const upstream = await fetch(
+      `${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(job.voiceId)}/stream?output_format=mp3_44100_128`,
+      {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text: job.text,
+          model_id: TTS_MODEL,
+          voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0, use_speaker_boost: true },
+        }),
+        signal: abortController.signal,
+      }
+    );
+    if (!upstream.ok || !upstream.body) {
+      const code = upstream.status === 401 ? 'tts_upstream_unauthorized'
+        : upstream.status === 429 ? 'tts_upstream_rate_limited'
+          : 'tts_upstream_error';
+      const detail = await upstream.text().catch(() => '');
+      console.warn('[tts] upstream failed:', upstream.status, detail.slice(0, 300));
+      finishTtsJob(job, 'error', code);
+      return res.status(upstream.status || 502).json({ error: code });
+    }
+    res.status(200);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store, private');
+    Readable.fromWeb(upstream.body).on('error', (error) => {
+      console.warn('[tts] stream failed:', error?.message || error);
+      finishTtsJob(job, 'error', 'tts_stream_failed');
+      res.destroy(error);
+    }).pipe(res);
+  } catch (error) {
+    if (error?.name !== 'AbortError') console.warn('[tts] request failed:', error?.message || error);
+    finishTtsJob(job, 'error', error?.name === 'AbortError' ? 'tts_stream_cancelled' : 'tts_upstream_unavailable');
+    if (!res.headersSent) res.status(502).json({ error: 'tts_upstream_unavailable' });
+  }
+});
 
 io.on('connection', (socket) => {
   socket.on('pet:join', (data, ack) => {
@@ -308,6 +434,119 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('tts:set-credentials', async (payload, ack) => {
+    if (socket.data?.role !== 'controller' || !roomForSocket(socket)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_joined', voices: [] });
+      return;
+    }
+    const apiKey = String(payload?.apiKey || '').trim();
+    if (!apiKey) {
+      delete socket.data.elevenlabsKey;
+      delete socket.data.elevenlabsVoices;
+      if (typeof ack === 'function') ack({ ok: true, mode: 'managed', voices: await allowedVoicesWithPreviews() });
+      return;
+    }
+    try {
+      const voices = await fetchByokVoices(apiKey);
+      socket.data.elevenlabsKey = apiKey;
+      socket.data.elevenlabsVoices = voices;
+      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', voices });
+    } catch (error) {
+      delete socket.data.elevenlabsKey;
+      delete socket.data.elevenlabsVoices;
+      if (typeof ack === 'function') ack({ ok: false, code: error?.message || 'tts_byok_unavailable', voices: [] });
+    }
+  });
+
+  socket.on('tts:list-voices', async (ack) => {
+    if (socket.data?.role !== 'controller' || !roomForSocket(socket)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_joined', voices: [] });
+      return;
+    }
+    if (socket.data.elevenlabsKey && Array.isArray(socket.data.elevenlabsVoices)) {
+      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', voices: socket.data.elevenlabsVoices });
+      return;
+    }
+    const voices = await allowedVoicesWithPreviews();
+    if (typeof ack === 'function') ack({
+      ok: !!(ELEVENLABS_KEY && voices.length),
+      mode: 'managed',
+      code: !ELEVENLABS_KEY ? 'tts_not_configured' : voices.length ? undefined : 'tts_no_voices',
+      voices,
+    });
+  });
+
+  socket.on('tts:create', (payload, ack) => {
+    if (socket.data?.role !== 'controller') {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_controller' });
+      return;
+    }
+    const room = roomForSocket(socket);
+    if (!room) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_joined' });
+      return;
+    }
+    const byokVoices = Array.isArray(socket.data.elevenlabsVoices) ? socket.data.elevenlabsVoices : [];
+    const credentialMode = socket.data.elevenlabsKey ? 'byok' : 'managed';
+    const allowedIds = credentialMode === 'byok'
+      ? new Set(byokVoices.map((voice) => voice.id))
+      : ALLOWED_VOICE_IDS;
+    if (credentialMode === 'managed' && (!ELEVENLABS_KEY || !ALLOWED_VOICES.length)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_not_configured' });
+      return;
+    }
+    const text = String(payload?.text || '').trim();
+    const voiceId = String(payload?.voiceId || '').trim();
+    if (!text) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_text_required' });
+      return;
+    }
+    if (text.length > 200) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_text_too_long' });
+      return;
+    }
+    if (!allowedIds.has(voiceId)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_voice_not_allowed' });
+      return;
+    }
+    const target = otherParticipant(room, socket.data.participantId);
+    if (!target?.pet) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'peer_pet_offline' });
+      return;
+    }
+    const queue = ttsQueueFor(room.hash, target.id);
+    const depth = (queue.active ? 1 : 0) + queue.pending.length;
+    if (depth >= TTS_QUEUE_LIMIT) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_queue_full' });
+      return;
+    }
+    if (!consumeTtsRate(room.hash, socket.data.participantId)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'tts_rate_limited' });
+      return;
+    }
+    const job = {
+      id: randomUUID(), roomHash: room.hash,
+      requesterId: socket.data.participantId, targetId: target.id,
+      text, voiceId, credentialMode,
+      state: 'queued', consumed: false, finished: false, expiresAt: 0, expiryTimer: null,
+    };
+    ttsJobs.set(job.id, job);
+    queue.pending.push(job.id);
+    dispatchNextTts(queue);
+    const position = queue.active === job.id ? 0 : queue.pending.indexOf(job.id) + 1;
+    if (typeof ack === 'function') ack({ ok: true, jobId: job.id, state: position ? 'queued' : 'dispatched', position });
+  });
+
+  socket.on('tts:status', (payload) => {
+    if (socket.data?.role !== 'pet') return;
+    const job = ttsJobs.get(String(payload?.jobId || ''));
+    if (!job || job.targetId !== socket.data.participantId || job.roomHash !== socket.data.roomHash) return;
+    const state = String(payload?.state || '');
+    if (state === 'playing') emitTtsStatus(job, 'playing');
+    else if (state === 'completed') finishTtsJob(job, 'completed');
+    else if (state === 'error') finishTtsJob(job, 'error', String(payload?.error || 'tts_playback_failed').slice(0, 120));
+  });
+
   socket.on('webrtc:signal', (payload) => {
     const room = roomForSocket(socket);
     if (!room) return;
@@ -362,6 +601,8 @@ io.on('connection', (socket) => {
     const role = socket.data?.role;
     if (!room || !participant || !role || participant[role] !== socket.id) return;
     participant[role] = null;
+    if (role === 'pet') failTtsForTarget(room.hash, participant.id, 'peer_pet_offline');
+    if (role === 'controller') failByokJobsForRequester(room.hash, participant.id);
     endRoomCall(room, 'peer_disconnected');
     if (!participantOnline(participant)) {
       participant.releaseTimer = setTimeout(() => {
@@ -378,8 +619,6 @@ io.on('connection', (socket) => {
 
 httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);
-  console.log(`  chat:   ${DEEPSEEK_KEY ? `deepseek (${DEEPSEEK_MODEL})` : 'MISSING (set DEEPSEEK_API_KEY)'}`);
-  console.log(`  tts:    ${ELEVENLABS_KEY && VOICE_ID ? `elevenlabs ok (voice=${VOICE_ID})` : 'disabled (set ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID)'}`);
+  console.log(`  tts:    ${ELEVENLABS_KEY && ALLOWED_VOICES.length ? `managed (${TTS_MODEL}, voices=${ALLOWED_VOICES.length})` : 'managed disabled; BYOK available'}`);
   console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
-  console.log(`  persona: ${PERSONA.id} (${PERSONA.name})`);
 });
