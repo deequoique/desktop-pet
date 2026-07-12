@@ -1,6 +1,6 @@
 {
   "name": "desktop-pet",
-  "version": "1.2.0-beta.1",
+  "version": "1.2.0-beta.2",
   "private": true,
   "description": "AI desktop pet (VRM) with remote control",
   "main": "src/main/index.js",
@@ -45,6 +45,20 @@
           "arch": [
             "x64"
           ]
+        }
+      ]
+    },
+    "mac": {
+      "category": "public.app-category.entertainment",
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64", "arm64"]
         }
       ]
     },
