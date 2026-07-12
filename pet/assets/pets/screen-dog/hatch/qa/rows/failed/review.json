@@ -1,0 +1,142 @@
+{
+  "ok": true,
+  "frames_root": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames",
+  "states": [
+    "failed"
+  ],
+  "errors": [],
+  "warnings": [],
+  "rows": [
+    {
+      "state": "failed",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": "components",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19666,
+          "bbox": [
+            5,
+            23,
+            187,
+            185
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 310
+        },
+        {
+          "index": 1,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19123,
+          "bbox": [
+            5,
+            25,
+            187,
+            183
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 293
+        },
+        {
+          "index": 2,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19642,
+          "bbox": [
+            5,
+            30,
+            187,
+            177
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 389
+        },
+        {
+          "index": 3,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21078,
+          "bbox": [
+            5,
+            32,
+            187,
+            176
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 281
+        },
+        {
+          "index": 4,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21187,
+          "bbox": [
+            5,
+            23,
+            187,
+            184
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 353
+        },
+        {
+          "index": 5,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21716,
+          "bbox": [
+            5,
+            20,
+            187,
+            188
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 350
+        },
+        {
+          "index": 6,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 22569,
+          "bbox": [
+            5,
+            15,
+            187,
+            192
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 348
+        },
+        {
+          "index": 7,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/failed/frames/failed/07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 22151,
+          "bbox": [
+            5,
+            19,
+            187,
+            189
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 336
+        }
+      ]
+    }
+  ]
+}

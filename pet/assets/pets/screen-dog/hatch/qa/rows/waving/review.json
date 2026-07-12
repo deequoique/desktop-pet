@@ -1,0 +1,82 @@
+{
+  "ok": true,
+  "frames_root": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames",
+  "states": [
+    "waving"
+  ],
+  "errors": [],
+  "warnings": [],
+  "rows": [
+    {
+      "state": "waving",
+      "expected_frames": 4,
+      "actual_frames": 4,
+      "extraction_method": "components",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19442,
+          "bbox": [
+            5,
+            25,
+            187,
+            182
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 151
+        },
+        {
+          "index": 1,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 15896,
+          "bbox": [
+            5,
+            26,
+            187,
+            182
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 107
+        },
+        {
+          "index": 2,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17210,
+          "bbox": [
+            5,
+            23,
+            187,
+            185
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 134
+        },
+        {
+          "index": 3,
+          "file": "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20073,
+          "bbox": [
+            5,
+            23,
+            187,
+            184
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 170
+        }
+      ]
+    }
+  ]
+}

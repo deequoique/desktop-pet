@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "chroma_key": {
+    "hex": "#0000FF",
+    "rgb": [
+      0,
+      0,
+      255
+    ],
+    "threshold": 96.0
+  },
+  "rows": [
+    {
+      "state": "waiting",
+      "frames": [
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/00.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/01.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/02.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/03.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/04.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waiting/frames/waiting/05.png"
+      ],
+      "method": "components"
+    }
+  ]
+}

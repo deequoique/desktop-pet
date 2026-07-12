@@ -46,6 +46,34 @@ function currentScale() {
   return clampScale(s && s.scale != null ? s.scale : 1);
 }
 
+function launchAtStartupEnabled() {
+  if (!app.isPackaged) return false;
+  try { return app.getLoginItemSettings().openAtLogin; }
+  catch { return false; }
+}
+
+function setLaunchAtStartup(enabled) {
+  if (!app.isPackaged) return false;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: !!enabled,
+      path: process.execPath,
+    });
+    patchState({ launchAtStartupConfigured: true });
+    return true;
+  } catch (error) {
+    console.warn('[startup] update failed:', error?.message || error);
+    return false;
+  }
+}
+
+function ensureDefaultLaunchAtStartup() {
+  if (!app.isPackaged) return;
+  const state = loadState() || {};
+  if (state.launchAtStartupConfigured) return;
+  setLaunchAtStartup(true);
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
@@ -107,6 +135,7 @@ function defaultBottomRight() {
 
 let win = null;
 let tray = null;
+let gameMode = false;
 let updateState = {
   checking: false,
   available: false,
@@ -134,6 +163,25 @@ function rebuildTrayMenu() {
       : 'Check for Updates';
 
   const menu = Menu.buildFromTemplate([
+    {
+      label: 'Game Mode (mouse click-through)',
+      type: 'checkbox',
+      checked: gameMode,
+      accelerator: 'Control+Alt+G',
+      click: (item) => setGameMode(item.checked),
+    },
+    { type: 'separator' },
+    {
+      label: 'Launch at startup',
+      type: 'checkbox',
+      checked: launchAtStartupEnabled(),
+      enabled: app.isPackaged,
+      click: (item) => {
+        if (!setLaunchAtStartup(item.checked)) item.checked = !item.checked;
+        rebuildTrayMenu();
+      },
+    },
+    { type: 'separator' },
     { label: 'Reset Position', click: () => {
         const p = defaultBottomRight();
         win?.setPosition(p.x, p.y);
@@ -151,6 +199,18 @@ function rebuildTrayMenu() {
     { label: 'Quit', click: () => app.quit() },
   ]);
   tray.setContextMenu(menu);
+}
+
+function setGameMode(enabled) {
+  gameMode = !!enabled;
+  patchState({ gameMode });
+  if (win && !win.isDestroyed()) {
+    // Game mode is an unconditional lock: renderer hit-testing must not make
+    // any part of the pet clickable while the user is playing. When leaving
+    // game mode, start from pass-through until the next renderer hit-test.
+    win.setIgnoreMouseEvents(true);
+  }
+  rebuildTrayMenu();
 }
 
 function checkForPetUpdates(manual = false) {
@@ -223,6 +283,7 @@ function setupAutoUpdater() {
 
 function createWindow() {
   const saved = loadState();
+  gameMode = !!saved?.gameMode;
   const scale = clampScale(saved && saved.scale != null ? saved.scale : 1);
   const w = Math.round(PET_W * scale);
   const h = Math.round(PET_H * scale);
@@ -257,8 +318,16 @@ function createWindow() {
   // 默认整窗穿透；渲染层 raycast 命中模型时再切换。
   // 注意：macOS 上 forward:true 不可靠，所以我们用主进程轮询 cursor，不依赖 OS 转发。
   win.setIgnoreMouseEvents(true);
-  win.setAlwaysOnTop(true, 'screen-saver');
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  const reinforceTopmost = () => {
+    if (!win || win.isDestroyed()) return;
+    win.setAlwaysOnTop(true, 'screen-saver', 1);
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  };
+  reinforceTopmost();
+  win.setFullScreenable(false);
+
+  // 部分无边框全屏游戏获得焦点时会重排顶层窗口；失焦后重新声明置顶层级。
+  win.on('blur', () => setTimeout(reinforceTopmost, 100));
 
   if (isDev) {
     win.loadURL(DEV_URL);
@@ -283,6 +352,10 @@ function createTray() {
 // 渲染层根据 raycast 结果告诉我们鼠标是否在模型上
 ipcMain.on('pet:set-clickable', (_e, clickable) => {
   if (!win || win.isDestroyed()) return;
+  if (gameMode) {
+    win.setIgnoreMouseEvents(true);
+    return;
+  }
   if (clickable) {
     win.setIgnoreMouseEvents(false);
   } else {
@@ -407,6 +480,7 @@ ipcMain.handle('pet:desktop-source-id', async () => {
 });
 
 app.whenReady().then(() => {
+  ensureDefaultLaunchAtStartup();
   createWindow();
   createTray();
   startCursorPoll();
@@ -416,6 +490,9 @@ app.whenReady().then(() => {
   // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
   globalShortcut.register('Control+Alt+D', () => {
     win?.webContents.send('pet:hotkey', 'toggle-chat');
+  });
+  globalShortcut.register('Control+Alt+G', () => {
+    setGameMode(!gameMode);
   });
 });
 
