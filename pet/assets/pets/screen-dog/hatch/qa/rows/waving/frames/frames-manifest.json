@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "chroma_key": {
+    "hex": "#0000FF",
+    "rgb": [
+      0,
+      0,
+      255
+    ],
+    "threshold": 96.0
+  },
+  "rows": [
+    {
+      "state": "waving",
+      "frames": [
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/00.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/01.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/02.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/waving/frames/waving/03.png"
+      ],
+      "method": "components"
+    }
+  ]
+}

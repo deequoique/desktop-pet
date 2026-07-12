@@ -17,8 +17,9 @@ declare global {
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
       getRoomSecret: () => Promise<string>;
-      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string }>;
-      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string } }>;
+      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string; participantId?: string }>;
+      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string; participantId?: string } }>;
+      onPairingChanged: (cb: (config: { serverUrl?: string; roomSecret?: string; participantId?: string }) => void) => void;
       getDesktopSourceId: () => Promise<string | null>;
     };
   }
@@ -46,6 +47,7 @@ const browserPetBridge: PetBridge = {
   getRoomSecret: async () => 'change-me',
   getPairingConfig: async () => ({ serverUrl: 'http://localhost:3030', roomSecret: 'change-me' }),
   savePairingConfig: async (config) => ({ ok: true, config }),
+  onPairingChanged: () => {},
   getDesktopSourceId: async () => null,
 };
 
@@ -60,6 +62,9 @@ const SIZE_STEP = 0.1;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 2.0;
 const DRAG_POSE_SPEED = 12;
+const EAR_RAISE_SECONDS = 1.2;
+const EAR_HIT_RADIUS = 0.14;
+const EAR_POSE_SPEED = 14;
 
 // 模型整体 Y 轴旋转：当前模型符合 VRM +Z 规范（背对相机），转 PI 面向用户。
 // 若换的模型原生已朝用户，改为 0。
@@ -93,6 +98,97 @@ type MotionMeta = {
   label: string;
   loop: boolean;
 };
+
+type SpriteState = 'idle' | 'running-right' | 'running-left' | 'waving' | 'jumping' | 'failed' | 'waiting';
+
+const SPRITE_BASE_URL = './sprites/screen-dog';
+const SPRITE_FRAMES: Record<SpriteState, number> = {
+  idle: 6,
+  'running-right': 8,
+  'running-left': 8,
+  waving: 4,
+  jumping: 5,
+  failed: 8,
+  waiting: 6,
+};
+const SPRITE_FPS: Record<SpriteState, number> = {
+  idle: 4,
+  'running-right': 10,
+  'running-left': 10,
+  waving: 7,
+  jumping: 8,
+  failed: 6,
+  waiting: 5,
+};
+const SPRITE_MOTIONS: MotionMeta[] = [
+  { id: 'idle', label: '待机', loop: true },
+  { id: 'running-right', label: '向右移动', loop: true },
+  { id: 'running-left', label: '向左移动', loop: true },
+  { id: 'waving', label: '招手', loop: false },
+  { id: 'jumping', label: '跳跃', loop: false },
+  { id: 'failed', label: '失败', loop: false },
+  { id: 'waiting', label: '等待', loop: true },
+];
+
+const spritePet = document.createElement('img');
+spritePet.id = 'sprite-pet';
+spritePet.alt = '';
+spritePet.draggable = false;
+app.appendChild(spritePet);
+
+let spriteState: SpriteState = 'idle';
+let spriteFrame = -1;
+let spriteStartedAt = performance.now();
+let spriteReturnTimer = 0;
+
+function spriteFrameUrl(state: SpriteState, frameIndex: number) {
+  const assetState = state === 'running-left' ? 'running-right' : state;
+  return `${SPRITE_BASE_URL}/${assetState}/${String(frameIndex).padStart(2, '0')}.png`;
+}
+
+function setSpriteState(state: SpriteState, returnToIdleMs = 0) {
+  if (state === spriteState && returnToIdleMs === 0 && spriteReturnTimer === 0) return;
+  if (spriteReturnTimer) window.clearTimeout(spriteReturnTimer);
+  spriteReturnTimer = 0;
+  spriteState = state;
+  spriteFrame = -1;
+  spriteStartedAt = performance.now();
+  currentMotionId = state === 'idle' ? '' : state;
+  if (returnToIdleMs > 0) {
+    spriteReturnTimer = window.setTimeout(() => setSpriteState('idle'), returnToIdleMs);
+  }
+}
+
+function updateSprite(now: number) {
+  const frameCount = SPRITE_FRAMES[spriteState];
+  const elapsed = Math.max(0, now - spriteStartedAt);
+  const nextFrame = Math.floor(elapsed * SPRITE_FPS[spriteState] / 1000) % frameCount;
+  if (nextFrame === spriteFrame) return;
+  spriteFrame = nextFrame;
+  spritePet.style.transform = spriteState === 'running-left' ? 'scaleX(-1)' : '';
+  spritePet.src = spriteFrameUrl(spriteState, nextFrame);
+}
+
+function spriteStateForCommand(id: string): SpriteState | null {
+  const key = id.toLowerCase();
+  if (/left|左/.test(key)) return 'running-left';
+  if (/right|右/.test(key)) return 'running-right';
+  if (/wave|hello|greet|招手|打招呼/.test(key)) return 'waving';
+  if (/jump|hop|跳/.test(key)) return 'jumping';
+  if (/fail|sad|error|失败|难过|错误/.test(key)) return 'failed';
+  if (/wait|ask|等待|询问/.test(key)) return 'waiting';
+  if (/idle|stand|待机|静止/.test(key)) return 'idle';
+  return null;
+}
+
+for (const state of Object.keys(SPRITE_FRAMES) as SpriteState[]) {
+  for (let i = 0; i < SPRITE_FRAMES[state]; i++) {
+    const preload = new Image();
+    preload.src = spriteFrameUrl(state, i);
+  }
+}
+updateSprite(performance.now());
+fallback.classList.add('hidden');
 
 // === Three.js scene ===
 const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: false, premultipliedAlpha: false });
@@ -158,21 +254,46 @@ type TailBoneBinding = {
   weight: number;
 };
 
+type EarSide = 'left' | 'right';
+
+type EarBoneBinding = {
+  node: THREE.Object3D;
+  rest: THREE.Quaternion;
+  restPosition: THREE.Vector3;
+  phase: number;
+  weight: number;
+};
+
 let tailBones: TailBoneBinding[] = [];
 let tailReactionUntil = 0;
 let lastTailWagAt = 0;
 let tailDebugNextLogAt = 0;
 const tailEuler = new THREE.Euler();
 const tailQuat = new THREE.Quaternion();
+let earBones: Record<EarSide, EarBoneBinding[]> = { left: [], right: [] };
+const earRaiseUntil: Record<EarSide, number> = { left: 0, right: 0 };
+const earRaiseBlend: Record<EarSide, number> = { left: 0, right: 0 };
+const earEuler = new THREE.Euler();
+const earQuat = new THREE.Quaternion();
 
 // 最终 sample.vrm 的尾巴链：h1 spring bone 加末端 child；球体.014 的主要权重在 骨骼.079。
 const FINAL_TAIL_BONE_NAMES = ['骨骼.075', '骨骼.076', '骨骼.077', '骨骼.078', '骨骼.079'];
 const FINAL_TAIL_MESH_NAMES = new Set(['球体.014']);
+// 最终 sample.vrm 的两只耳朵 spring bone 链：左侧 x < 0，右侧 x > 0。
+const FINAL_EAR_BONE_NAMES: Record<EarSide, string[]> = {
+  left: ['骨骼.072', '骨骼.073', '骨骼.074'],
+  right: ['骨骼.080', '骨骼.081', '骨骼.082'],
+};
 const TAIL_HIT_RADIUS = 0.22;
 const tailHitA = new THREE.Vector3();
 const tailHitB = new THREE.Vector3();
 const tailHitC = new THREE.Vector3();
 const tailHitD = new THREE.Vector3();
+const earHitA = new THREE.Vector3();
+const earHitB = new THREE.Vector3();
+const earHitC = new THREE.Vector3();
+const earHitD = new THREE.Vector3();
+const earHitHeadLocal = new THREE.Vector3();
 
 function bindTailBones(target: VRM) {
   const named = new Map<string, THREE.Object3D>();
@@ -193,6 +314,34 @@ function bindTailBones(target: VRM) {
     }));
 
   if (DEBUG_UI) console.log('[tail] bound bones:', tailBones.map((b) => b.node.name));
+}
+
+function bindEarBones(target: VRM) {
+  const named = new Map<string, THREE.Object3D>();
+  target.scene.traverse((obj) => {
+    if (!obj.name) return;
+    named.set(obj.name, obj);
+  });
+
+  for (const side of ['left', 'right'] as const) {
+    earBones[side] = FINAL_EAR_BONE_NAMES[side]
+      .map((name) => named.get(name))
+      .filter((obj): obj is THREE.Object3D => !!obj)
+      .map((node, i) => ({
+        node,
+        rest: node.quaternion.clone(),
+        restPosition: node.position.clone(),
+        phase: i * 0.55,
+        weight: 1 + i * 0.22,
+      }));
+  }
+
+  if (DEBUG_UI) {
+    console.log('[ears] bound bones:', {
+      left: earBones.left.map((b) => b.node.name),
+      right: earBones.right.map((b) => b.node.name),
+    });
+  }
 }
 
 function applyModelRotation() {
@@ -246,6 +395,47 @@ function updateTailWag(t: number) {
   }
 }
 
+function triggerEarRaise(side: EarSide) {
+  earRaiseUntil[side] = performance.now() / 1000 + EAR_RAISE_SECONDS;
+  setExpression('joy', 0.7, 120);
+  window.setTimeout(() => setExpression('joy', 0, 320), 520);
+  if (DEBUG_UI) console.log('[ears] raise', side);
+}
+
+function updateEarRaise(dt: number, t: number) {
+  for (const side of ['left', 'right'] as const) {
+    const target = t < earRaiseUntil[side] ? 1 : 0;
+    earRaiseBlend[side] += (target - earRaiseBlend[side]) * Math.min(1, dt * EAR_POSE_SPEED);
+    const blend = earRaiseBlend[side];
+    if (blend < 0.001 && target === 0) {
+      earRaiseBlend[side] = 0;
+      for (const bone of earBones[side]) {
+        bone.node.position.copy(bone.restPosition);
+        bone.node.quaternion.copy(bone.rest);
+      }
+      continue;
+    }
+
+    const sideSign = side === 'left' ? -1 : 1;
+    const lift = 0.72 * blend;
+    const perk = Math.sin(t * 16) * 0.035 * blend;
+    const bones = earBones[side];
+
+    for (let i = 0; i < bones.length; i++) {
+      const bone = bones[i];
+      bone.node.position.copy(bone.restPosition);
+      earEuler.set(
+        -lift * (0.72 + i * 0.12) + perk,
+        sideSign * lift * 0.16,
+        -sideSign * lift * (0.45 + i * 0.08),
+        'XYZ',
+      );
+      earQuat.setFromEuler(earEuler);
+      bone.node.quaternion.copy(bone.rest).multiply(earQuat);
+    }
+  }
+}
+
 function isHappyMotion(entry: MotionManifestEntry) {
   const text = `${entry.id} ${entry.label}`.toLowerCase();
   return /happy|joy|fun|开心|高兴|愉快|快乐/.test(text);
@@ -274,6 +464,50 @@ function isNearTail(point: THREE.Vector3) {
   return closest <= TAIL_HIT_RADIUS;
 }
 
+function distanceToBoneChain(point: THREE.Vector3, bones: EarBoneBinding[]) {
+  if (!bones.length) return Infinity;
+  let closest = Infinity;
+
+  for (const bone of bones) {
+    bone.node.getWorldPosition(earHitA);
+    closest = Math.min(closest, point.distanceTo(earHitA));
+  }
+
+  for (let i = 0; i < bones.length - 1; i++) {
+    bones[i].node.getWorldPosition(earHitA);
+    bones[i + 1].node.getWorldPosition(earHitB);
+    earHitC.subVectors(earHitB, earHitA);
+    const lenSq = earHitC.lengthSq();
+    if (lenSq < 1e-6) continue;
+    const u = Math.max(0, Math.min(1, earHitD.copy(point).sub(earHitA).dot(earHitC) / lenSq));
+    earHitC.multiplyScalar(u).add(earHitA);
+    closest = Math.min(closest, point.distanceTo(earHitC));
+  }
+
+  return closest;
+}
+
+function classifyEarHit(point: THREE.Vector3): EarSide | null {
+  if (!vrm) return null;
+  const headBone = vrm.humanoid?.getNormalizedBoneNode('head');
+  if (!headBone) return null;
+
+  earHitHeadLocal.copy(point);
+  headBone.worldToLocal(earHitHeadLocal);
+  if (earHitHeadLocal.y < 0.16) return null;
+
+  const leftDistance = distanceToBoneChain(point, earBones.left);
+  const rightDistance = distanceToBoneChain(point, earBones.right);
+  const side: EarSide = leftDistance <= rightDistance ? 'left' : 'right';
+  const distance = Math.min(leftDistance, rightDistance);
+  if (distance > EAR_HIT_RADIUS) return null;
+
+  // Guard against face/top clicks that happen to be near both roots: require the chosen side to match head-local x.
+  if (side === 'left' && earHitHeadLocal.x > -0.04) return null;
+  if (side === 'right' && earHitHeadLocal.x < 0.04) return null;
+  return side;
+}
+
 function isTailObject(obj: THREE.Object3D | null) {
   let cur: THREE.Object3D | null = obj;
   while (cur) {
@@ -286,7 +520,8 @@ function isTailObject(obj: THREE.Object3D | null) {
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
-loader.load(
+const ENABLE_LEGACY_VRM = false;
+if (ENABLE_LEGACY_VRM) loader.load(
   VRM_URL,
   (gltf) => {
     const v: VRM = gltf.userData.vrm;
@@ -299,15 +534,16 @@ loader.load(
     vrm = v;
     modelBaseY = v.scene.position.y;
     bindTailBones(v);
+    bindEarBones(v);
     motionMixer = new THREE.AnimationMixer(v.scene);
-    motionMixer.addEventListener('finished', ((event: THREE.Event) => {
-      const action = (event as THREE.Event & { action?: THREE.AnimationAction }).action;
+    motionMixer.addEventListener('finished', (event) => {
+      const action = event.action;
       if (action && action === currentMotionAction) {
         action.stop();
         currentMotionAction = null;
         currentMotionId = '';
       }
-    }) as THREE.EventListener);
+    });
 
     try {
       const exps: any[] = (v.expressionManager as any)?.expressions ?? [];
@@ -371,6 +607,11 @@ type ExpSlot = { current: number; target: number; durationLeft: number };
 const expState = new Map<string, ExpSlot>();
 
 function setExpression(name: ExpName, target: number, fadeMs = 300) {
+  if (target > 0.2) {
+    if (name === 'joy') setSpriteState('waving', 1100);
+    else if (name === 'sorrow' || name === 'angry') setSpriteState('failed', 1800);
+    else if (name === 'surprised') setSpriteState('jumping', 900);
+  }
   if (name === 'joy' && target > 0.2) triggerTailWag();
   const aliases = EXP_ALIASES[name] ?? [name];
   for (const n of aliases) {
@@ -423,6 +664,8 @@ let clickMotionCandidate = false;
 let dragPoseTarget = 0;
 let dragPoseBlend = 0;
 let dragSway = 0;
+let dragLastScreenX = 0;
+let dragDirection: -1 | 0 | 1 = 0;
 const cooldownUntil: Record<'head' | 'body' | 'tail', number> = { head: 0, body: 0, tail: 0 };
 
 function classifyHit(hit: THREE.Intersection): 'head' | 'body' | 'tail' {
@@ -446,6 +689,7 @@ function triggerReaction(part: 'head' | 'body' | 'tail') {
   cooldownUntil[part] = now + 1500;
 
   const exp = PART_EXPRESSION[part];
+  setSpriteState(part === 'tail' ? 'waving' : 'jumping', part === 'tail' ? 1100 : 900);
   setExpression(exp, 1.0, 120);
   setTimeout(() => setExpression(exp, 0, 350), 650);
 
@@ -486,7 +730,9 @@ function stopCurrentMotion(immediate = false) {
 async function loadMotionManifest() {
   motionManifest.clear();
   motionClipCache.clear();
-  motionList = [];
+  motionList = SPRITE_MOTIONS.slice();
+  return;
+  // The VRMA loader remains below temporarily for v1.1 compatibility.
   try {
     const r = await fetch(MOTION_MANIFEST_URL, { cache: 'no-store' });
     if (r.status === 404) {
@@ -577,6 +823,12 @@ async function loadVrmaMotion(id: string): Promise<THREE.AnimationClip | null> {
 }
 
 async function playMotion(id: string): Promise<boolean> {
+  const sprite = spriteStateForCommand(id);
+  if (sprite) {
+    const oneShotMs = sprite === 'waving' ? 1100 : sprite === 'jumping' ? 900 : sprite === 'failed' ? 1800 : 0;
+    setSpriteState(sprite, oneShotMs);
+    return true;
+  }
   const entry = motionManifest.get(id);
 
   if (!entry) {
@@ -637,6 +889,7 @@ function setDragPose(active: boolean) {
     setExpression('surprised', 0.65, 120);
     triggerTailWag();
   } else {
+    setSpriteState('idle');
     setExpression('surprised', 0, 320);
   }
 }
@@ -677,25 +930,43 @@ function updateDragPose(dt: number, t: number) {
 }
 
 window.addEventListener('mousedown', (e) => {
-  if (e.button !== 0 || !lastClickable || !vrm) return;
+  if (e.button !== 0 || !lastClickable) return;
   // 输入框正在用，不当作戳模型
   if (document.activeElement === chatInput) return;
   if (sizeBox.contains(e.target as Node) || chatBox.contains(e.target as Node) || pairingForm.contains(e.target as Node)) return;
   dragging = true;
+  dragLastScreenX = e.screenX;
+  dragDirection = 0;
   rotatingModel = e.shiftKey;
   clickMotionCandidate = false;
+  setSpriteState('waving', 1100);
+  if (rotatingModel) {
+    if (!vrm) rotatingModel = false;
+  }
   if (rotatingModel) {
     lastHitPart = 'rotate';
+    return;
+  }
+  if (!vrm) {
+    clickMotionCandidate = true;
+    lastHitPart = 'sprite';
+    setDragPose(true);
     return;
   }
   raycaster.setFromCamera(ndc, camera);
   const hits = raycaster.intersectObject(vrm.scene, true);
   if (hits.length > 0) {
-    const part = classifyHit(hits[0]);
-    lastHitPart = `${part} ${hits[0].object.name || '-'} y=${hits[0].point.y.toFixed(2)}`;
+    const earSide = classifyEarHit(hits[0].point);
     clickMotionCandidate = true;
     setDragPose(true);
-    triggerReaction(part);
+    if (earSide) {
+      lastHitPart = `${earSide}-ear ${hits[0].object.name || '-'} y=${hits[0].point.y.toFixed(2)}`;
+      triggerEarRaise(earSide);
+    } else {
+      const part = classifyHit(hits[0]);
+      lastHitPart = `${part} ${hits[0].object.name || '-'} y=${hits[0].point.y.toFixed(2)}`;
+      triggerReaction(part);
+    }
   } else {
     lastHitPart = 'miss';
   }
@@ -703,6 +974,7 @@ window.addEventListener('mousedown', (e) => {
 window.addEventListener('mouseup', () => {
   if (clickMotionCandidate) setDragPose(false);
   dragging = false;
+  dragDirection = 0;
   rotatingModel = false;
   clickMotionCandidate = false;
 });
@@ -714,7 +986,16 @@ window.addEventListener('mousemove', (e) => {
     return;
   }
   if (e.movementX || e.movementY) {
-    dragSway = Math.max(-1, Math.min(1, e.movementX / 18));
+    const screenDeltaX = e.screenX - dragLastScreenX;
+    dragLastScreenX = e.screenX;
+    if (Math.abs(screenDeltaX) >= 1) {
+      const nextDirection: -1 | 1 = screenDeltaX < 0 ? -1 : 1;
+      if (nextDirection !== dragDirection) {
+        dragDirection = nextDirection;
+        setSpriteState(nextDirection < 0 ? 'running-right' : 'running-left');
+      }
+      dragSway = Math.max(-1, Math.min(1, screenDeltaX / 18));
+    }
     petBridge.drag(e.movementX, e.movementY);
   }
 });
@@ -733,6 +1014,7 @@ scheduleBlink();
 // === 服务器地址 + 预录台词清单 ===
 let SERVER_URL = '';
 let ROOM_SECRET = '';
+let PARTICIPANT_ID = '';
 let pairingOpen = false;
 const voicesByPart: Record<'head' | 'body' | 'tail' | 'idle', string[]> = {
   head: [], body: [], tail: [], idle: [],
@@ -784,15 +1066,17 @@ pairingForm.addEventListener('submit', async (e) => {
   }
   SERVER_URL = res.config?.serverUrl || serverUrl;
   ROOM_SECRET = res.config?.roomSecret || roomSecret;
+  PARTICIPANT_ID = res.config?.participantId || PARTICIPANT_ID;
   hidePairing();
   connectRemote();
 });
 
 (async () => {
-  let pairingConfig: { serverUrl?: string; roomSecret?: string } = {};
+  let pairingConfig: { serverUrl?: string; roomSecret?: string; participantId?: string } = {};
   try { pairingConfig = await petBridge.getPairingConfig(); } catch {}
   SERVER_URL = normalizeServerUrl(pairingConfig.serverUrl || '');
   ROOM_SECRET = (pairingConfig.roomSecret || '').trim();
+  PARTICIPANT_ID = (pairingConfig.participantId || '').trim();
   await loadMotionManifest();
   try {
     const files = await petBridge.listVoices();
@@ -808,8 +1092,24 @@ pairingForm.addEventListener('submit', async (e) => {
   }
   // motions / voices 加载完之后再连远程，ack 才有内容
   if (isPairingReady()) connectRemote();
-  else showPairing(pairingConfig);
+  // 缺少配置时由 Electron 主进程自动打开统一控制面板。
 })();
+
+petBridge.onPairingChanged((config) => {
+  const nextServer = normalizeServerUrl(config.serverUrl || '');
+  const nextSecret = String(config.roomSecret || '').trim();
+  const nextParticipant = String(config.participantId || '').trim();
+  if (nextServer === SERVER_URL && nextSecret === ROOM_SECRET && nextParticipant === PARTICIPANT_ID) return;
+  cleanupRtc(false);
+  remoteSocket?.removeAllListeners();
+  remoteSocket?.disconnect();
+  remoteSocket = null;
+  remoteConnected = false;
+  SERVER_URL = nextServer;
+  ROOM_SECRET = nextSecret;
+  PARTICIPANT_ID = nextParticipant;
+  if (isPairingReady() && PARTICIPANT_ID) connectRemote();
+});
 
 // === Web Audio：播放音频 + 实时口型同步 ===
 let audioCtx: AudioContext | null = null;
@@ -1003,6 +1303,7 @@ let remoteConnected = false;
 let lastRemoteMsg = '';
 let lastRemoteAt = 0;
 let rtcPc: RTCPeerConnection | null = null;
+let activeCallId = '';
 let rtcScreenStream: MediaStream | null = null;
 let rtcMicStream: MediaStream | null = null;
 let rtcRemoteAudioStream: MediaStream | null = null;
@@ -1012,6 +1313,7 @@ rtcAudioEl.autoplay = true;
 rtcAudioEl.volume = 1;
 
 type WebRtcSignal = {
+  callId?: string;
   description?: RTCSessionDescriptionInit | null;
   candidate?: RTCIceCandidateInit | null;
 };
@@ -1080,7 +1382,7 @@ function reportRtcError(message: string) {
 }
 
 function cleanupRtc(sendHangup = false) {
-  if (sendHangup) remoteSocket?.emit('webrtc:hangup');
+  if (sendHangup) remoteSocket?.emit('call:end', { callId: activeCallId || undefined });
   try { rtcPc?.close(); } catch {}
   rtcPc = null;
   rtcPendingCandidates.length = 0;
@@ -1092,6 +1394,7 @@ function cleanupRtc(sendHangup = false) {
   rtcMicStream = null;
   rtcRemoteAudioStream = null;
   rtcAudioEl.srcObject = null;
+  activeCallId = '';
 }
 
 async function ensurePetMedia(): Promise<MediaStream> {
@@ -1105,6 +1408,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
     return new MediaStream([
       ...rtcScreenStream.getVideoTracks(),
       ...rtcMicStream.getAudioTracks(),
+      ...rtcScreenStream.getAudioTracks(),
     ]);
   }
 
@@ -1112,7 +1416,12 @@ async function ensurePetMedia(): Promise<MediaStream> {
 
   if (sourceId) {
     const screenConstraints: any = {
-      audio: false,
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sourceId,
+        },
+      },
       video: {
         mandatory: {
           chromeMediaSource: 'desktop',
@@ -1127,9 +1436,17 @@ async function ensurePetMedia(): Promise<MediaStream> {
 
     try {
       rtcScreenStream = await navigator.mediaDevices.getUserMedia(screenConstraints);
-      console.log('[webrtc] captured screen via desktop source', sourceId);
+      console.log('[webrtc] captured screen and system audio via desktop source', sourceId);
     } catch (error) {
-      console.warn('[webrtc] desktop source capture failed, falling back to getDisplayMedia:', error);
+      console.warn('[webrtc] desktop audio capture failed, retrying video-only desktop capture:', error);
+      try {
+        rtcScreenStream = await navigator.mediaDevices.getUserMedia({
+          ...screenConstraints,
+          audio: false,
+        });
+      } catch (videoOnlyError) {
+        console.warn('[webrtc] desktop source capture failed, falling back to getDisplayMedia:', videoOnlyError);
+      }
     }
   }
 
@@ -1141,7 +1458,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
           width: { ideal: 1600 },
           height: { ideal: 900 },
         },
-        audio: false,
+        audio: true,
       });
       console.log('[webrtc] captured screen via getDisplayMedia');
     } catch (error: any) {
@@ -1159,6 +1476,13 @@ async function ensurePetMedia(): Promise<MediaStream> {
   });
   console.log('[webrtc] captured microphone');
 
+  const systemTracks = rtcScreenStream.getAudioTracks();
+  if (systemTracks.length) {
+    console.log('[webrtc] captured separate microphone and system audio tracks');
+  } else {
+    console.warn('[webrtc] system audio unavailable; sending microphone only');
+  }
+
   const screenTrack = rtcScreenStream.getVideoTracks()[0];
   if (screenTrack) {
     screenTrack.addEventListener('ended', () => {
@@ -1170,6 +1494,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
   return new MediaStream([
     ...rtcScreenStream.getVideoTracks(),
     ...rtcMicStream.getAudioTracks(),
+    ...systemTracks,
   ]);
 }
 
@@ -1203,7 +1528,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       console.log('[webrtc] pet sent ice candidate');
-      remoteSocket?.emit('webrtc:signal', { candidate: event.candidate.toJSON() });
+      remoteSocket?.emit('webrtc:signal', { callId: activeCallId || undefined, candidate: event.candidate.toJSON() });
     }
   };
   pc.ontrack = async (event) => {
@@ -1231,7 +1556,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     console.log('[webrtc] pet connection state:', state);
     if (state === 'connected') noteRemote('call on');
     if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-      cleanupRtc(false);
+      cleanupRtc(state !== 'closed');
       if (state !== 'closed') showReply('通话断开了', 2500);
     }
   };
@@ -1241,6 +1566,10 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
 
 async function handleRtcSignal(signal: WebRtcSignal) {
   if (!signal) return;
+  if (signal.callId) {
+    if (activeCallId && signal.callId !== activeCallId) return;
+    activeCallId = signal.callId;
+  }
   if (signal.description) {
     const desc = signal.description;
     console.log('[webrtc] pet got description:', desc.type);
@@ -1253,7 +1582,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         console.log('[webrtc] pet created answer');
-        remoteSocket?.emit('webrtc:signal', { description: pc.localDescription });
+        remoteSocket?.emit('webrtc:signal', { callId: activeCallId || undefined, description: pc.localDescription });
       } catch (e: any) {
         reportRtcError(`接通失败：${e?.message || e}`);
         cleanupRtc(false);
@@ -1288,7 +1617,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
 function connectRemote() {
   if (remoteSocket) return;
   if (!isPairingReady()) {
-    showPairing({ serverUrl: SERVER_URL, roomSecret: ROOM_SECRET });
+    console.warn('[remote] pairing incomplete; open the control panel to configure it');
     return;
   }
   try {
@@ -1306,14 +1635,14 @@ function connectRemote() {
   const join = () => {
     remoteSocket!.emit(
       'pet:join',
-      { secret: ROOM_SECRET, role: 'pet' },
-      (res: { ok: boolean; error?: string }) => {
+      { secret: ROOM_SECRET, role: 'pet', participantId: PARTICIPANT_ID },
+      (res: { ok: boolean; code?: string; error?: string }) => {
         if (res?.ok) {
           remoteConnected = true;
           console.log('[remote] joined as pet');
         } else {
           remoteConnected = false;
-          console.warn('[remote] join rejected:', res?.error);
+          console.warn('[remote] join rejected:', res?.code || res?.error);
         }
       }
     );
@@ -1339,6 +1668,10 @@ function connectRemote() {
     });
   });
   remoteSocket.on('webrtc:hangup', () => {
+    cleanupRtc(false);
+    showReply('通话结束了', 2200);
+  });
+  remoteSocket.on('call:end', () => {
     cleanupRtc(false);
     showReply('通话结束了', 2200);
   });
@@ -1375,6 +1708,7 @@ function tick() {
   const dt = clock.getDelta();
   const t = performance.now() / 1000;
   frame++;
+  updateSprite(performance.now());
 
   if (vrm) vrm.scene.position.y = modelBaseY + Math.sin(t * 1.2) * 0.015;
 
@@ -1382,6 +1716,7 @@ function tick() {
   if (motionMixer) motionMixer.update(dt);
   if (vrm) vrm.update(dt);
   updateTailWag(t);
+  updateEarRaise(dt, t);
   updateDragPose(dt, t);
 
   // 再叠加头骨偏移（在 VRM 处理后做，否则被覆盖；同时只追加 yaw/pitch 不动 roll）
@@ -1458,9 +1793,8 @@ function tick() {
   // clickable：配对/chat/缩放控件打开时强制开启（要能打字/点击）；否则按 hit-test
   let clickable = false;
   if (pairingOpen || chatOpen || sizeControlsActive || (cursorInside && cursorOverSizeControls())) clickable = true;
-  else if (vrm && cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
-    const hits = raycaster.intersectObject(vrm.scene, true);
-    clickable = hits.length > 0;
+  else if (cursorInside && ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1) {
+    clickable = vrm ? raycaster.intersectObject(vrm.scene, true).length > 0 : true;
   }
   if (dragging) clickable = true;
   if (clickable !== lastClickable) {
@@ -1478,7 +1812,7 @@ function tick() {
       `vrm:${vrm ? 'ok' : '...'} inside:${cursorInside ? 'Y' : 'N'} click:${lastClickable ? 'Y' : 'N'}\n` +
       `look:${lookMode} chat:${chatOpen ? 'Y' : 'N'} audio:${currentAnalyser ? 'Y' : 'N'} remote:${remoteConnected ? 'Y' : 'N'}\n` +
       `hit:${lastHitPart}\n` +
-      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} tail:${tailBones.length} wag:${sinceTail}s active:${currentMotionId || '-'}\n` +
+      `voices: h=${voicesByPart.head.length} b=${voicesByPart.body.length} t=${voicesByPart.tail.length}  motions:${motionList.length} tail:${tailBones.length} ears:${earBones.left.length}/${earBones.right.length} wag:${sinceTail}s active:${currentMotionId || '-'}\n` +
       `remote:${lastRemoteMsg || '-'} (${sinceRemote}s)`
     );
   }

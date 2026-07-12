@@ -13,5 +13,6 @@ contextBridge.exposeInMainWorld('pet', {
   getRoomSecret: () => ipcRenderer.invoke('pet:room-secret'),
   getPairingConfig: () => ipcRenderer.invoke('pet:pairing-config'),
   savePairingConfig: (config) => ipcRenderer.invoke('pet:save-pairing-config', config),
+  onPairingChanged: (cb) => ipcRenderer.on('pet:pairing-changed', (_e, config) => cb(config)),
   getDesktopSourceId: () => ipcRenderer.invoke('pet:desktop-source-id'),
 });

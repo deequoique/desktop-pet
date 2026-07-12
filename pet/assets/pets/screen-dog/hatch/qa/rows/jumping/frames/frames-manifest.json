@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "chroma_key": {
+    "hex": "#0000FF",
+    "rgb": [
+      0,
+      0,
+      255
+    ],
+    "threshold": 96.0
+  },
+  "rows": [
+    {
+      "state": "jumping",
+      "frames": [
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/jumping/frames/jumping/00.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/jumping/frames/jumping/01.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/jumping/frames/jumping/02.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/jumping/frames/jumping/03.png",
+        "/Volumes/PeeB/desktop-pet/pet/assets/pets/screen-dog/hatch/qa/rows/jumping/frames/jumping/04.png"
+      ],
+      "method": "components"
+    }
+  ]
+}

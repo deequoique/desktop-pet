@@ -1,8 +1,10 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 
 const DEV_URL = 'http://localhost:5173';
+const CONTROL_DEV_URL = 'http://localhost:5174';
 const isDev = !app.isPackaged;
 let autoUpdater = null;
 try {
@@ -44,6 +46,34 @@ function patchState(patch) {
 function currentScale() {
   const s = loadState();
   return clampScale(s && s.scale != null ? s.scale : 1);
+}
+
+function launchAtStartupEnabled() {
+  if (!app.isPackaged) return false;
+  try { return app.getLoginItemSettings().openAtLogin; }
+  catch { return false; }
+}
+
+function setLaunchAtStartup(enabled) {
+  if (!app.isPackaged) return false;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: !!enabled,
+      path: process.execPath,
+    });
+    patchState({ launchAtStartupConfigured: true });
+    return true;
+  } catch (error) {
+    console.warn('[startup] update failed:', error?.message || error);
+    return false;
+  }
+}
+
+function ensureDefaultLaunchAtStartup() {
+  if (!app.isPackaged) return;
+  const state = loadState() || {};
+  if (state.launchAtStartupConfigured) return;
+  setLaunchAtStartup(true);
 }
 
 function readJson(file) {
@@ -93,7 +123,16 @@ function pairingSnapshot() {
   return {
     serverUrl: configuredServerUrl(),
     roomSecret: configuredRoomSecret(),
+    participantId: pairingConfig.participantId || '',
   };
+}
+
+function ensureParticipantId() {
+  if (!pairingConfig.participantId) {
+    pairingConfig.participantId = randomUUID();
+    writeJson(pairingFile(), pairingConfig);
+  }
+  return pairingConfig.participantId;
 }
 
 function defaultBottomRight() {
@@ -106,7 +145,9 @@ function defaultBottomRight() {
 }
 
 let win = null;
+let controlWin = null;
 let tray = null;
+let gameMode = false;
 let updateState = {
   checking: false,
   available: false,
@@ -134,6 +175,30 @@ function rebuildTrayMenu() {
       : 'Check for Updates';
 
   const menu = Menu.buildFromTemplate([
+    {
+      label: 'Open Control Panel',
+      click: () => showControlWindow(),
+    },
+    { type: 'separator' },
+    {
+      label: 'Game Mode (mouse click-through)',
+      type: 'checkbox',
+      checked: gameMode,
+      accelerator: 'Control+Alt+G',
+      click: (item) => setGameMode(item.checked),
+    },
+    { type: 'separator' },
+    {
+      label: 'Launch at startup',
+      type: 'checkbox',
+      checked: launchAtStartupEnabled(),
+      enabled: app.isPackaged,
+      click: (item) => {
+        if (!setLaunchAtStartup(item.checked)) item.checked = !item.checked;
+        rebuildTrayMenu();
+      },
+    },
+    { type: 'separator' },
     { label: 'Reset Position', click: () => {
         const p = defaultBottomRight();
         win?.setPosition(p.x, p.y);
@@ -151,6 +216,18 @@ function rebuildTrayMenu() {
     { label: 'Quit', click: () => app.quit() },
   ]);
   tray.setContextMenu(menu);
+}
+
+function setGameMode(enabled) {
+  gameMode = !!enabled;
+  patchState({ gameMode });
+  if (win && !win.isDestroyed()) {
+    // Game mode is an unconditional lock: renderer hit-testing must not make
+    // any part of the pet clickable while the user is playing. When leaving
+    // game mode, start from pass-through until the next renderer hit-test.
+    win.setIgnoreMouseEvents(true);
+  }
+  rebuildTrayMenu();
 }
 
 function checkForPetUpdates(manual = false) {
@@ -223,6 +300,7 @@ function setupAutoUpdater() {
 
 function createWindow() {
   const saved = loadState();
+  gameMode = !!saved?.gameMode;
   const scale = clampScale(saved && saved.scale != null ? saved.scale : 1);
   const w = Math.round(PET_W * scale);
   const h = Math.round(PET_H * scale);
@@ -257,8 +335,16 @@ function createWindow() {
   // 默认整窗穿透；渲染层 raycast 命中模型时再切换。
   // 注意：macOS 上 forward:true 不可靠，所以我们用主进程轮询 cursor，不依赖 OS 转发。
   win.setIgnoreMouseEvents(true);
-  win.setAlwaysOnTop(true, 'screen-saver');
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  const reinforceTopmost = () => {
+    if (!win || win.isDestroyed()) return;
+    win.setAlwaysOnTop(true, 'screen-saver', 1);
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  };
+  reinforceTopmost();
+  win.setFullScreenable(false);
+
+  // 部分无边框全屏游戏获得焦点时会重排顶层窗口；失焦后重新声明置顶层级。
+  win.on('blur', () => setTimeout(reinforceTopmost, 100));
 
   if (isDev) {
     win.loadURL(DEV_URL);
@@ -272,17 +358,65 @@ function createWindow() {
   });
 }
 
+function showControlWindow() {
+  if (!controlWin || controlWin.isDestroyed()) createControlWindow();
+  controlWin.show();
+  controlWin.focus();
+}
+
+function createControlWindow() {
+  if (controlWin && !controlWin.isDestroyed()) return controlWin;
+  controlWin = new BrowserWindow({
+    width: 1040,
+    height: 780,
+    minWidth: 760,
+    minHeight: 600,
+    show: false,
+    title: 'Desktop Pet Control Panel',
+    webPreferences: {
+      preload: path.join(__dirname, 'control-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  if (isDev) controlWin.loadURL(CONTROL_DEV_URL);
+  else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
+  controlWin.on('close', (event) => {
+    if (app.isQuiting) return;
+    event.preventDefault();
+    controlWin.hide();
+  });
+  return controlWin;
+}
+
 function createTray() {
-  // 单色 template 图标（Mac 自动反色；Windows 也能用 png）
+  // macOS 必须给空图标配 title，否则状态栏入口宽度为 0，菜单完全不可见。
+  // Windows 仍保留 Tray 对象；后续可替换为正式 .ico 品牌图标。
   const img = nativeImage.createEmpty();
   tray = new Tray(img);
+  if (process.platform === 'darwin') tray.setTitle('🐾');
   tray.setToolTip('Desktop Pet');
+  tray.on('click', () => showControlWindow());
   rebuildTrayMenu();
+
+  // Dock 右键菜单是 macOS 的备用入口，即使用户隐藏了菜单栏图标仍能打开控制面板。
+  if (process.platform === 'darwin' && app.dock) {
+    app.dock.setMenu(Menu.buildFromTemplate([
+      { label: 'Open Control Panel', click: () => showControlWindow() },
+      { label: 'Toggle Game Mode', click: () => setGameMode(!gameMode) },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() },
+    ]));
+  }
 }
 
 // 渲染层根据 raycast 结果告诉我们鼠标是否在模型上
 ipcMain.on('pet:set-clickable', (_e, clickable) => {
   if (!win || win.isDestroyed()) return;
+  if (gameMode) {
+    win.setIgnoreMouseEvents(true);
+    return;
+  }
   if (clickable) {
     win.setIgnoreMouseEvents(false);
   } else {
@@ -376,7 +510,7 @@ ipcMain.handle('pet:voices', () => {
 // 服务器地址：生产包优先读 config/production.json；开发期可用环境变量覆盖。
 ipcMain.handle('pet:server-url', () => configuredServerUrl());
 
-// 房间密钥：和 server/.env 的 ROOM_SECRET 对齐。真实密钥不要提交进 Git。
+// 房间密钥：必须存在于 server 的 ROOM_SECRETS / ROOM_SECRET 中。真实密钥不要提交进 Git。
 ipcMain.handle('pet:room-secret', () => configuredRoomSecret());
 
 ipcMain.handle('pet:pairing-config', () => pairingSnapshot());
@@ -390,8 +524,14 @@ ipcMain.handle('pet:save-pairing-config', (_e, config) => {
   }
   pairingConfig.serverUrl = next.serverUrl;
   pairingConfig.roomSecret = next.roomSecret;
+  ensureParticipantId();
   const ok = writeJson(pairingFile(), pairingConfig);
-  return ok ? { ok: true, config: pairingSnapshot() } : { ok: false, error: 'write failed' };
+  const snapshot = pairingSnapshot();
+  if (ok) {
+    win?.webContents.send('pet:pairing-changed', snapshot);
+    controlWin?.webContents.send('pet:pairing-changed', snapshot);
+  }
+  return ok ? { ok: true, config: snapshot } : { ok: false, error: 'write failed' };
 });
 
 ipcMain.handle('pet:desktop-source-id', async () => {
@@ -407,21 +547,35 @@ ipcMain.handle('pet:desktop-source-id', async () => {
 });
 
 app.whenReady().then(() => {
+  ensureParticipantId();
+  ensureDefaultLaunchAtStartup();
   createWindow();
+  createControlWindow();
   createTray();
   startCursorPoll();
   setupAutoUpdater();
   setTimeout(() => checkForPetUpdates(false), 3000);
+  if (!configuredServerUrl() || !configuredRoomSecret()) showControlWindow();
 
   // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
   globalShortcut.register('Control+Alt+D', () => {
     win?.webContents.send('pet:hotkey', 'toggle-chat');
+  });
+  globalShortcut.register('Control+Alt+G', () => {
+    setGameMode(!gameMode);
+  });
+  globalShortcut.register('Control+Alt+P', () => {
+    showControlWindow();
   });
 });
 
 app.on('window-all-closed', (e) => {
   // 桌宠模式：关窗不退出
   e.preventDefault();
+});
+
+app.on('before-quit', () => {
+  app.isQuiting = true;
 });
 
 app.on('will-quit', () => {

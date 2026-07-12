@@ -8,7 +8,7 @@
     "dev:pet": "npm run dev --prefix pet",
     "dev:pet:local": "npm run dev:local --prefix pet",
     "dev:web": "npm run dev --prefix web",
-    "dev:all-local": "./pet/node_modules/.bin/concurrently -k -n server,pet,web -c yellow,green,cyan \"npm run dev:server\" \"npm run dev:pet:local\" \"npm run dev:web\"",
+    "dev:all-local": "npm run dev:pet:local",
     "build:web": "npm run build --prefix web",
     "build:pet": "npm run build:renderer --prefix pet",
     "dist:pet:win": "npm run dist:win --prefix pet"

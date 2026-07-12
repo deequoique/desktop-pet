@@ -16,9 +16,17 @@ export type Command =
   | { type: 'say_tts'; text: string }
   | { type: 'relocate'; corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' };
 
-export type Peers = { controller: boolean; pet: boolean };
+export type Peers = {
+  selfReady: boolean;
+  peerOnline: boolean;
+  peerPetOnline: boolean;
+  peerControllerOnline: boolean;
+  controller: boolean;
+  pet: boolean;
+};
 
 export type WebRtcSignal = {
+  callId?: string;
   description?: RTCSessionDescriptionInit | null;
   candidate?: RTCIceCandidateInit | null;
 };
@@ -30,6 +38,8 @@ export type Listeners = {
   onSignal?: (signal: WebRtcSignal) => void;
   onHangup?: () => void;
   onRtcError?: (msg: string) => void;
+  onCallStart?: (callId: string) => void;
+  onCallEnd?: (callId?: string, reason?: string) => void;
 };
 
 let socket: Socket | null = null;
@@ -39,7 +49,7 @@ export function setListeners(l: Listeners) {
   listeners = l;
 }
 
-export function connect(serverUrl: string, secret: string): Socket {
+export function connect(serverUrl: string, secret: string, participantId: string): Socket {
   if (socket) disconnect();
   listeners.onStatus?.('connecting');
   const s = io(serverUrl, {
@@ -53,14 +63,14 @@ export function connect(serverUrl: string, secret: string): Socket {
   const join = () => {
     s.emit(
       'pet:join',
-      { secret, role: 'controller' },
-      (res: { ok: boolean; error?: string; peers?: Peers }) => {
+      { secret, role: 'controller', participantId },
+      (res: { ok: boolean; code?: string; error?: string; peers?: Peers }) => {
         if (res?.ok) {
           listeners.onStatus?.('connected');
           if (res.peers) listeners.onPeers?.(res.peers);
         } else {
           listeners.onStatus?.('rejected');
-          listeners.onError?.(res?.error || '加入失败');
+          listeners.onError?.(res?.code === 'room_full' ? '房间已满（最多两人）' : res?.error || '加入失败');
         }
       }
     );
@@ -81,6 +91,12 @@ export function connect(serverUrl: string, secret: string): Socket {
   s.on('webrtc:hangup', () => listeners.onHangup?.());
   s.on('webrtc:error', (payload: { message?: string }) => {
     listeners.onRtcError?.(payload?.message || '通话出错');
+  });
+  s.on('call:start', (payload: { callId?: string }) => {
+    if (payload?.callId) listeners.onCallStart?.(payload.callId);
+  });
+  s.on('call:end', (payload: { callId?: string; reason?: string }) => {
+    listeners.onCallEnd?.(payload?.callId, payload?.reason);
   });
 
   return s;
@@ -137,5 +153,21 @@ export function sendSignal(signal: WebRtcSignal): boolean {
 export function sendHangup(): boolean {
   if (!socket || !socket.connected) return false;
   socket.emit('webrtc:hangup');
+  return true;
+}
+
+export function requestCall(): Promise<{ ok: boolean; callId?: string; code?: string }> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+    socket.timeout(4000).emit('call:start', (err: Error | null, response: any) => {
+      if (err) resolve({ ok: false, code: 'timeout' });
+      else resolve(response || { ok: false });
+    });
+  });
+}
+
+export function endCall(callId?: string): boolean {
+  if (!socket?.connected) return false;
+  socket.emit('call:end', { callId });
   return true;
 }

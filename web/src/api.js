@@ -4,7 +4,7 @@ let listeners = {};
 export function setListeners(l) {
     listeners = l;
 }
-export function connect(serverUrl, secret) {
+export function connect(serverUrl, secret, participantId) {
     if (socket)
         disconnect();
     listeners.onStatus?.('connecting');
@@ -16,7 +16,7 @@ export function connect(serverUrl, secret) {
     });
     socket = s;
     const join = () => {
-        s.emit('pet:join', { secret, role: 'controller' }, (res) => {
+        s.emit('pet:join', { secret, role: 'controller', participantId }, (res) => {
             if (res?.ok) {
                 listeners.onStatus?.('connected');
                 if (res.peers)
@@ -24,7 +24,7 @@ export function connect(serverUrl, secret) {
             }
             else {
                 listeners.onStatus?.('rejected');
-                listeners.onError?.(res?.error || '加入失败');
+                listeners.onError?.(res?.code === 'room_full' ? '房间已满（最多两人）' : res?.error || '加入失败');
             }
         });
     };
@@ -43,6 +43,13 @@ export function connect(serverUrl, secret) {
     s.on('webrtc:hangup', () => listeners.onHangup?.());
     s.on('webrtc:error', (payload) => {
         listeners.onRtcError?.(payload?.message || '通话出错');
+    });
+    s.on('call:start', (payload) => {
+        if (payload?.callId)
+            listeners.onCallStart?.(payload.callId);
+    });
+    s.on('call:end', (payload) => {
+        listeners.onCallEnd?.(payload?.callId, payload?.reason);
     });
     return s;
 }
@@ -106,5 +113,23 @@ export function sendHangup() {
     if (!socket || !socket.connected)
         return false;
     socket.emit('webrtc:hangup');
+    return true;
+}
+export function requestCall() {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(4000).emit('call:start', (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout' });
+            else
+                resolve(response || { ok: false });
+        });
+    });
+}
+export function endCall(callId) {
+    if (!socket?.connected)
+        return false;
+    socket.emit('call:end', { callId });
     return true;
 }
