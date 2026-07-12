@@ -81,7 +81,8 @@ jobs:
       - name: Generate production config
         env:
           PET_SERVER_URL: ${{ secrets.PET_SERVER_URL }}
-        run: node -e "require('fs').writeFileSync('config/production.json', JSON.stringify({serverUrl: process.env.PET_SERVER_URL}, null, 2))"
+        run: |
+          node -e "require('fs').writeFileSync('config/production.json', JSON.stringify({serverUrl: process.env.PET_SERVER_URL}, null, 2))"
 
       - name: Build macOS packages
         env:
