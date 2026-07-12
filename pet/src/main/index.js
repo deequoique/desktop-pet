@@ -1,8 +1,10 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 
 const DEV_URL = 'http://localhost:5173';
+const CONTROL_DEV_URL = 'http://localhost:5174';
 const isDev = !app.isPackaged;
 let autoUpdater = null;
 try {
@@ -121,7 +123,16 @@ function pairingSnapshot() {
   return {
     serverUrl: configuredServerUrl(),
     roomSecret: configuredRoomSecret(),
+    participantId: pairingConfig.participantId || '',
   };
+}
+
+function ensureParticipantId() {
+  if (!pairingConfig.participantId) {
+    pairingConfig.participantId = randomUUID();
+    writeJson(pairingFile(), pairingConfig);
+  }
+  return pairingConfig.participantId;
 }
 
 function defaultBottomRight() {
@@ -134,6 +145,7 @@ function defaultBottomRight() {
 }
 
 let win = null;
+let controlWin = null;
 let tray = null;
 let gameMode = false;
 let updateState = {
@@ -163,6 +175,11 @@ function rebuildTrayMenu() {
       : 'Check for Updates';
 
   const menu = Menu.buildFromTemplate([
+    {
+      label: 'Open Control Panel',
+      click: () => showControlWindow(),
+    },
+    { type: 'separator' },
     {
       label: 'Game Mode (mouse click-through)',
       type: 'checkbox',
@@ -341,6 +358,37 @@ function createWindow() {
   });
 }
 
+function showControlWindow() {
+  if (!controlWin || controlWin.isDestroyed()) createControlWindow();
+  controlWin.show();
+  controlWin.focus();
+}
+
+function createControlWindow() {
+  if (controlWin && !controlWin.isDestroyed()) return controlWin;
+  controlWin = new BrowserWindow({
+    width: 1040,
+    height: 780,
+    minWidth: 760,
+    minHeight: 600,
+    show: false,
+    title: 'Desktop Pet Control Panel',
+    webPreferences: {
+      preload: path.join(__dirname, 'control-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  if (isDev) controlWin.loadURL(CONTROL_DEV_URL);
+  else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
+  controlWin.on('close', (event) => {
+    if (app.isQuiting) return;
+    event.preventDefault();
+    controlWin.hide();
+  });
+  return controlWin;
+}
+
 function createTray() {
   // 单色 template 图标（Mac 自动反色；Windows 也能用 png）
   const img = nativeImage.createEmpty();
@@ -449,7 +497,7 @@ ipcMain.handle('pet:voices', () => {
 // 服务器地址：生产包优先读 config/production.json；开发期可用环境变量覆盖。
 ipcMain.handle('pet:server-url', () => configuredServerUrl());
 
-// 房间密钥：和 server/.env 的 ROOM_SECRET 对齐。真实密钥不要提交进 Git。
+// 房间密钥：必须存在于 server 的 ROOM_SECRETS / ROOM_SECRET 中。真实密钥不要提交进 Git。
 ipcMain.handle('pet:room-secret', () => configuredRoomSecret());
 
 ipcMain.handle('pet:pairing-config', () => pairingSnapshot());
@@ -463,8 +511,14 @@ ipcMain.handle('pet:save-pairing-config', (_e, config) => {
   }
   pairingConfig.serverUrl = next.serverUrl;
   pairingConfig.roomSecret = next.roomSecret;
+  ensureParticipantId();
   const ok = writeJson(pairingFile(), pairingConfig);
-  return ok ? { ok: true, config: pairingSnapshot() } : { ok: false, error: 'write failed' };
+  const snapshot = pairingSnapshot();
+  if (ok) {
+    win?.webContents.send('pet:pairing-changed', snapshot);
+    controlWin?.webContents.send('pet:pairing-changed', snapshot);
+  }
+  return ok ? { ok: true, config: snapshot } : { ok: false, error: 'write failed' };
 });
 
 ipcMain.handle('pet:desktop-source-id', async () => {
@@ -480,12 +534,15 @@ ipcMain.handle('pet:desktop-source-id', async () => {
 });
 
 app.whenReady().then(() => {
+  ensureParticipantId();
   ensureDefaultLaunchAtStartup();
   createWindow();
+  createControlWindow();
   createTray();
   startCursorPoll();
   setupAutoUpdater();
   setTimeout(() => checkForPetUpdates(false), 3000);
+  if (!configuredServerUrl() || !configuredRoomSecret()) showControlWindow();
 
   // 全局快捷键：唤起文字输入框（M3 是文字对话，不是录音）
   globalShortcut.register('Control+Alt+D', () => {
@@ -499,6 +556,10 @@ app.whenReady().then(() => {
 app.on('window-all-closed', (e) => {
   // 桌宠模式：关窗不退出
   e.preventDefault();
+});
+
+app.on('before-quit', () => {
+  app.isQuiting = true;
 });
 
 app.on('will-quit', () => {

@@ -17,8 +17,9 @@ declare global {
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
       getRoomSecret: () => Promise<string>;
-      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string }>;
-      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string } }>;
+      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string; participantId?: string }>;
+      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string; participantId?: string } }>;
+      onPairingChanged: (cb: (config: { serverUrl?: string; roomSecret?: string; participantId?: string }) => void) => void;
       getDesktopSourceId: () => Promise<string | null>;
     };
   }
@@ -46,6 +47,7 @@ const browserPetBridge: PetBridge = {
   getRoomSecret: async () => 'change-me',
   getPairingConfig: async () => ({ serverUrl: 'http://localhost:3030', roomSecret: 'change-me' }),
   savePairingConfig: async (config) => ({ ok: true, config }),
+  onPairingChanged: () => {},
   getDesktopSourceId: async () => null,
 };
 
@@ -1012,6 +1014,7 @@ scheduleBlink();
 // === 服务器地址 + 预录台词清单 ===
 let SERVER_URL = '';
 let ROOM_SECRET = '';
+let PARTICIPANT_ID = '';
 let pairingOpen = false;
 const voicesByPart: Record<'head' | 'body' | 'tail' | 'idle', string[]> = {
   head: [], body: [], tail: [], idle: [],
@@ -1063,15 +1066,17 @@ pairingForm.addEventListener('submit', async (e) => {
   }
   SERVER_URL = res.config?.serverUrl || serverUrl;
   ROOM_SECRET = res.config?.roomSecret || roomSecret;
+  PARTICIPANT_ID = res.config?.participantId || PARTICIPANT_ID;
   hidePairing();
   connectRemote();
 });
 
 (async () => {
-  let pairingConfig: { serverUrl?: string; roomSecret?: string } = {};
+  let pairingConfig: { serverUrl?: string; roomSecret?: string; participantId?: string } = {};
   try { pairingConfig = await petBridge.getPairingConfig(); } catch {}
   SERVER_URL = normalizeServerUrl(pairingConfig.serverUrl || '');
   ROOM_SECRET = (pairingConfig.roomSecret || '').trim();
+  PARTICIPANT_ID = (pairingConfig.participantId || '').trim();
   await loadMotionManifest();
   try {
     const files = await petBridge.listVoices();
@@ -1087,8 +1092,24 @@ pairingForm.addEventListener('submit', async (e) => {
   }
   // motions / voices 加载完之后再连远程，ack 才有内容
   if (isPairingReady()) connectRemote();
-  else showPairing(pairingConfig);
+  // 缺少配置时由 Electron 主进程自动打开统一控制面板。
 })();
+
+petBridge.onPairingChanged((config) => {
+  const nextServer = normalizeServerUrl(config.serverUrl || '');
+  const nextSecret = String(config.roomSecret || '').trim();
+  const nextParticipant = String(config.participantId || '').trim();
+  if (nextServer === SERVER_URL && nextSecret === ROOM_SECRET && nextParticipant === PARTICIPANT_ID) return;
+  cleanupRtc(false);
+  remoteSocket?.removeAllListeners();
+  remoteSocket?.disconnect();
+  remoteSocket = null;
+  remoteConnected = false;
+  SERVER_URL = nextServer;
+  ROOM_SECRET = nextSecret;
+  PARTICIPANT_ID = nextParticipant;
+  if (isPairingReady() && PARTICIPANT_ID) connectRemote();
+});
 
 // === Web Audio：播放音频 + 实时口型同步 ===
 let audioCtx: AudioContext | null = null;
@@ -1282,6 +1303,7 @@ let remoteConnected = false;
 let lastRemoteMsg = '';
 let lastRemoteAt = 0;
 let rtcPc: RTCPeerConnection | null = null;
+let activeCallId = '';
 let rtcScreenStream: MediaStream | null = null;
 let rtcMicStream: MediaStream | null = null;
 let rtcRemoteAudioStream: MediaStream | null = null;
@@ -1291,6 +1313,7 @@ rtcAudioEl.autoplay = true;
 rtcAudioEl.volume = 1;
 
 type WebRtcSignal = {
+  callId?: string;
   description?: RTCSessionDescriptionInit | null;
   candidate?: RTCIceCandidateInit | null;
 };
@@ -1359,7 +1382,7 @@ function reportRtcError(message: string) {
 }
 
 function cleanupRtc(sendHangup = false) {
-  if (sendHangup) remoteSocket?.emit('webrtc:hangup');
+  if (sendHangup) remoteSocket?.emit('call:end', { callId: activeCallId || undefined });
   try { rtcPc?.close(); } catch {}
   rtcPc = null;
   rtcPendingCandidates.length = 0;
@@ -1371,6 +1394,7 @@ function cleanupRtc(sendHangup = false) {
   rtcMicStream = null;
   rtcRemoteAudioStream = null;
   rtcAudioEl.srcObject = null;
+  activeCallId = '';
 }
 
 async function ensurePetMedia(): Promise<MediaStream> {
@@ -1504,7 +1528,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       console.log('[webrtc] pet sent ice candidate');
-      remoteSocket?.emit('webrtc:signal', { candidate: event.candidate.toJSON() });
+      remoteSocket?.emit('webrtc:signal', { callId: activeCallId || undefined, candidate: event.candidate.toJSON() });
     }
   };
   pc.ontrack = async (event) => {
@@ -1532,7 +1556,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     console.log('[webrtc] pet connection state:', state);
     if (state === 'connected') noteRemote('call on');
     if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-      cleanupRtc(false);
+      cleanupRtc(state !== 'closed');
       if (state !== 'closed') showReply('通话断开了', 2500);
     }
   };
@@ -1542,6 +1566,10 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
 
 async function handleRtcSignal(signal: WebRtcSignal) {
   if (!signal) return;
+  if (signal.callId) {
+    if (activeCallId && signal.callId !== activeCallId) return;
+    activeCallId = signal.callId;
+  }
   if (signal.description) {
     const desc = signal.description;
     console.log('[webrtc] pet got description:', desc.type);
@@ -1554,7 +1582,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         console.log('[webrtc] pet created answer');
-        remoteSocket?.emit('webrtc:signal', { description: pc.localDescription });
+        remoteSocket?.emit('webrtc:signal', { callId: activeCallId || undefined, description: pc.localDescription });
       } catch (e: any) {
         reportRtcError(`接通失败：${e?.message || e}`);
         cleanupRtc(false);
@@ -1589,7 +1617,7 @@ async function handleRtcSignal(signal: WebRtcSignal) {
 function connectRemote() {
   if (remoteSocket) return;
   if (!isPairingReady()) {
-    showPairing({ serverUrl: SERVER_URL, roomSecret: ROOM_SECRET });
+    console.warn('[remote] pairing incomplete; open the control panel to configure it');
     return;
   }
   try {
@@ -1607,14 +1635,14 @@ function connectRemote() {
   const join = () => {
     remoteSocket!.emit(
       'pet:join',
-      { secret: ROOM_SECRET, role: 'pet' },
-      (res: { ok: boolean; error?: string }) => {
+      { secret: ROOM_SECRET, role: 'pet', participantId: PARTICIPANT_ID },
+      (res: { ok: boolean; code?: string; error?: string }) => {
         if (res?.ok) {
           remoteConnected = true;
           console.log('[remote] joined as pet');
         } else {
           remoteConnected = false;
-          console.warn('[remote] join rejected:', res?.error);
+          console.warn('[remote] join rejected:', res?.code || res?.error);
         }
       }
     );
@@ -1640,6 +1668,10 @@ function connectRemote() {
     });
   });
   remoteSocket.on('webrtc:hangup', () => {
+    cleanupRtc(false);
+    showReply('通话结束了', 2200);
+  });
+  remoteSocket.on('call:end', () => {
     cleanupRtc(false);
     showReply('通话结束了', 2200);
   });

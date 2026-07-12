@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
+import { createHash, randomUUID } from 'crypto';
 import { Server as SocketIOServer } from 'socket.io';
 import { getPersona, buildSystemPrompt } from './prompts.js';
 
@@ -18,9 +19,12 @@ const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const TTS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
 
 // === Socket.IO 房间 / 鉴权 ===
-// 私人项目两人用：硬编码一个固定房间 + 共享密钥；secret 不对直接断开。
-const ROOM_SECRET = process['env']['ROOM_SECRET'] || 'change-me';
-const ROOM_ID = 'pet-room-1';
+// 房间密钥由服务端预配置。ROOM_SECRETS 支持逗号分隔；ROOM_SECRET 保持 v1.1 兼容。
+const ROOM_SECRET_HASHES = new Set(
+  String(process.env.ROOM_SECRETS || process.env.ROOM_SECRET || 'change-me')
+    .split(',').map((value) => value.trim()).filter(Boolean).map(hashSecret)
+);
+const ROOM_GRACE_MS = Math.max(0, Number(process.env.ROOM_GRACE_MS || 30_000));
 
 // 计划 §四 模块 4：人设抽到 prompts.js 里了；用 PET_PERSONA 切换
 const PERSONA = getPersona(process.env.PET_PERSONA);
@@ -135,39 +139,110 @@ const io = new SocketIOServer(httpServer, {
   transports: ['websocket', 'polling'],
 });
 
-// 简单 in-memory 状态：当前房间里 controller / pet 的 socketId
-const room = { controller: null, pet: null };
+// roomHash -> { participants: Map<participantId, participant>, callId }
+// 密钥只用于入房并立即哈希，内存与日志均不保留明文。
+const rooms = new Map();
 
-function roleOf(socket) { return socket.data?.role; }
+function hashSecret(secret) {
+  return createHash('sha256').update(secret).digest('hex');
+}
 
-function peerSnapshot() {
+function roomChannel(roomHash) { return `pet-room:${roomHash}`; }
+
+function roomForSocket(socket) {
+  return socket.data?.roomHash ? rooms.get(socket.data.roomHash) : null;
+}
+
+function participantForSocket(socket) {
+  return roomForSocket(socket)?.participants.get(socket.data?.participantId) || null;
+}
+
+function otherParticipant(room, participantId) {
+  return [...room.participants.values()].find((p) => p.id !== participantId) || null;
+}
+
+function participantOnline(participant) {
+  return !!(participant?.pet || participant?.controller);
+}
+
+function peerSnapshot(room, participantId) {
+  const self = room.participants.get(participantId);
+  const peer = otherParticipant(room, participantId);
   return {
-    controller: !!room.controller,
-    pet: !!room.pet,
+    selfReady: !!(self?.pet && self?.controller),
+    peerOnline: participantOnline(peer),
+    peerPetOnline: !!peer?.pet,
+    peerControllerOnline: !!peer?.controller,
+    // v1.1 UI compatibility: from this participant's perspective these mean remote endpoints.
+    pet: !!peer?.pet,
+    controller: !!peer?.controller,
   };
 }
 
-function otherRole(role) {
-  return role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
+function emitPeerSnapshots(room) {
+  for (const participant of room.participants.values()) {
+    const snapshot = peerSnapshot(room, participant.id);
+    for (const socketId of [participant.pet, participant.controller]) {
+      if (socketId) io.to(socketId).emit('room:peers', snapshot);
+    }
+  }
+}
+
+function emitToRoomEndpoints(room, event, payload) {
+  for (const participant of room.participants.values()) {
+    for (const socketId of [participant.pet, participant.controller]) {
+      if (socketId) io.to(socketId).emit(event, payload);
+    }
+  }
+}
+
+function endRoomCall(room, reason = 'ended') {
+  if (!room.callId) return;
+  const callId = room.callId;
+  room.callId = null;
+  emitToRoomEndpoints(room, 'call:end', { callId, reason });
+  emitToRoomEndpoints(room, 'webrtc:hangup', { callId, reason });
 }
 
 io.on('connection', (socket) => {
   socket.on('pet:join', (data, ack) => {
-    const secret = data?.secret;
+    const secret = String(data?.secret || '');
     const role = data?.role;
-    if (secret !== ROOM_SECRET) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'bad secret' });
+    const roomHash = hashSecret(secret);
+    if (!ROOM_SECRET_HASHES.has(roomHash)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'bad_secret', error: 'bad secret' });
       console.warn('[socket] reject bad secret from', socket.id);
-      socket.disconnect(true);
       return;
     }
     if (role !== 'controller' && role !== 'pet') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'bad role' });
-      socket.disconnect(true);
+      if (typeof ack === 'function') ack({ ok: false, code: 'bad_role', error: 'bad role' });
       return;
     }
-    // 同角色只允许一个：踢掉旧的
-    const prevId = room[role];
+
+    let room = rooms.get(roomHash);
+    if (!room) {
+      room = { hash: roomHash, participants: new Map(), callId: null };
+      rooms.set(roomHash, room);
+    }
+    // 老客户端没有 participantId：controller 与 pet 各视为一名参与者，保持旧式配对。
+    const participantId = String(data?.participantId || `legacy-${role}`).slice(0, 128);
+    let participant = room.participants.get(participantId);
+    if (!participant && room.participants.size >= 2) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'room_full', error: 'room full' });
+      return;
+    }
+    if (!participant) {
+      participant = { id: participantId, pet: null, controller: null, releaseTimer: null };
+      room.participants.set(participantId, participant);
+    }
+    if (participant.releaseTimer) {
+      clearTimeout(participant.releaseTimer);
+      participant.releaseTimer = null;
+    }
+
+    // 同一参与者的同类端点重连时只替换自己，不影响房间内另一人。
+    const prevId = participant[role];
+    participant[role] = socket.id;
     if (prevId && prevId !== socket.id) {
       const prev = io.sockets.sockets.get(prevId);
       if (prev) {
@@ -175,28 +250,31 @@ io.on('connection', (socket) => {
         prev.disconnect(true);
       }
     }
-    room[role] = socket.id;
     socket.data.role = role;
-    socket.join(ROOM_ID);
-    if (typeof ack === 'function') ack({ ok: true, peers: peerSnapshot() });
-    io.to(ROOM_ID).emit('room:peers', peerSnapshot());
-    console.log(`[socket] ${role} joined (${socket.id})`);
+    socket.data.roomHash = roomHash;
+    socket.data.participantId = participantId;
+    socket.join(roomChannel(roomHash));
+    if (typeof ack === 'function') ack({ ok: true, peers: peerSnapshot(room, participantId) });
+    emitPeerSnapshots(room);
+    console.log(`[socket] ${role} joined room=${roomHash.slice(0, 8)} participant=${participantId}`);
   });
 
   socket.on('pet:command', (cmd) => {
-    if (roleOf(socket) !== 'controller') return;
-    const petId = room.pet;
+    if (socket.data?.role !== 'controller') return;
+    const room = roomForSocket(socket);
+    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
     if (!petId) return;
     io.to(petId).emit('pet:command', cmd);
   });
 
   // controller 想知道 pet 当前有哪些预录台词；ack 链：server 转发给 pet，pet 回 callback。
   socket.on('pet:list-voices', (ack) => {
-    if (roleOf(socket) !== 'controller') {
+    if (socket.data?.role !== 'controller') {
       if (typeof ack === 'function') ack([]);
       return;
     }
-    const petId = room.pet;
+    const room = roomForSocket(socket);
+    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
     if (!petId) {
       if (typeof ack === 'function') ack([]);
       return;
@@ -211,11 +289,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('pet:list-motions', (ack) => {
-    if (roleOf(socket) !== 'controller') {
+    if (socket.data?.role !== 'controller') {
       if (typeof ack === 'function') ack([]);
       return;
     }
-    const petId = room.pet;
+    const room = roomForSocket(socket);
+    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
     if (!petId) {
       if (typeof ack === 'function') ack([]);
       return;
@@ -230,42 +309,70 @@ io.on('connection', (socket) => {
   });
 
   socket.on('webrtc:signal', (payload) => {
-    const role = roleOf(socket);
-    const targetRole = otherRole(role);
-    if (!targetRole) return;
-    const targetId = room[targetRole];
+    const room = roomForSocket(socket);
+    if (!room) return;
+    if (payload?.callId && payload.callId !== room.callId) return;
+    const role = socket.data?.role;
+    const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
+    const targetId = targetRole && otherParticipant(room, socket.data.participantId)?.[targetRole];
     if (!targetId) return;
     io.to(targetId).emit('webrtc:signal', payload);
   });
 
+  socket.on('call:start', (ack) => {
+    const room = roomForSocket(socket);
+    if (!room || socket.data?.role !== 'controller') return;
+    const peer = otherParticipant(room, socket.data.participantId);
+    const ready = room.participants.size === 2
+      && [...room.participants.values()].every((p) => p.pet && p.controller);
+    if (!peer || !ready) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'peer_not_ready' });
+      return;
+    }
+    if (!room.callId) room.callId = randomUUID();
+    for (const participant of room.participants.values()) {
+      if (participant.controller) io.to(participant.controller).emit('call:start', { callId: room.callId });
+    }
+    if (typeof ack === 'function') ack({ ok: true, callId: room.callId });
+  });
+
+  socket.on('call:end', (payload) => {
+    const room = roomForSocket(socket);
+    if (!room || (payload?.callId && payload.callId !== room.callId)) return;
+    endRoomCall(room, 'ended');
+  });
+
   socket.on('webrtc:hangup', () => {
-    const role = roleOf(socket);
-    const targetRole = otherRole(role);
-    if (!targetRole) return;
-    const targetId = room[targetRole];
-    if (!targetId) return;
-    io.to(targetId).emit('webrtc:hangup');
+    const room = roomForSocket(socket);
+    if (room?.callId) endRoomCall(room, 'hangup');
   });
 
   socket.on('webrtc:error', (payload) => {
-    const role = roleOf(socket);
-    const targetRole = otherRole(role);
-    if (!targetRole) return;
-    const targetId = room[targetRole];
+    const room = roomForSocket(socket);
+    const role = socket.data?.role;
+    const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
+    const targetId = room && targetRole && otherParticipant(room, socket.data.participantId)?.[targetRole];
     if (!targetId) return;
     io.to(targetId).emit('webrtc:error', payload);
   });
 
   socket.on('disconnect', () => {
-    const role = roleOf(socket);
-    if (role && room[role] === socket.id) {
-      const targetRole = otherRole(role);
-      const targetId = targetRole ? room[targetRole] : null;
-      if (targetId) io.to(targetId).emit('webrtc:hangup');
-      room[role] = null;
-      io.to(ROOM_ID).emit('room:peers', peerSnapshot());
-      console.log(`[socket] ${role} left`);
+    const room = roomForSocket(socket);
+    const participant = participantForSocket(socket);
+    const role = socket.data?.role;
+    if (!room || !participant || !role || participant[role] !== socket.id) return;
+    participant[role] = null;
+    endRoomCall(room, 'peer_disconnected');
+    if (!participantOnline(participant)) {
+      participant.releaseTimer = setTimeout(() => {
+        if (participantOnline(participant)) return;
+        room.participants.delete(participant.id);
+        if (!room.participants.size) rooms.delete(room.hash);
+        else emitPeerSnapshots(room);
+      }, ROOM_GRACE_MS);
     }
+    emitPeerSnapshots(room);
+    console.log(`[socket] ${role} left participant=${participant.id}`);
   });
 });
 
@@ -273,6 +380,6 @@ httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);
   console.log(`  chat:   ${DEEPSEEK_KEY ? `deepseek (${DEEPSEEK_MODEL})` : 'MISSING (set DEEPSEEK_API_KEY)'}`);
   console.log(`  tts:    ${ELEVENLABS_KEY && VOICE_ID ? `elevenlabs ok (voice=${VOICE_ID})` : 'disabled (set ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID)'}`);
-  console.log(`  socket: ready @ /socket.io  (room=${ROOM_ID}, secret=${ROOM_SECRET === 'change-me' ? '!! DEFAULT — change me' : 'set'})`);
+  console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
   console.log(`  persona: ${PERSONA.id} (${PERSONA.name})`);
 });

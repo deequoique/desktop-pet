@@ -4,8 +4,9 @@ import {
   disconnect,
   listMotions,
   listVoices,
+  endCall,
+  requestCall,
   sendCommand,
-  sendHangup,
   sendSignal,
   setListeners,
   type Command,
@@ -27,6 +28,27 @@ type RtcRoute = {
 
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
+const LS_PARTICIPANT = 'pet.participantId';
+
+type PairingConfig = { serverUrl?: string; roomSecret?: string; participantId?: string };
+
+declare global {
+  interface Window {
+    desktopPetControl?: {
+      getPairingConfig: () => Promise<PairingConfig>;
+      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
+      onPairingChanged: (cb: (config: PairingConfig) => void) => void;
+    };
+  }
+}
+
+function localParticipantId() {
+  const saved = localStorage.getItem(LS_PARTICIPANT);
+  if (saved) return saved;
+  const id = crypto.randomUUID?.() || `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  localStorage.setItem(LS_PARTICIPANT, id);
+  return id;
+}
 
 const DEFAULT_SERVER = import.meta.env.VITE_PET_SERVER_URL || 'http://localhost:3030';
 const DEFAULT_SECRET = import.meta.env.VITE_PET_ROOM_SECRET || 'change-me';
@@ -130,7 +152,11 @@ export default function App() {
   const [serverUrl, setServerUrl] = useState(() => localStorage.getItem(LS_SERVER) || DEFAULT_SERVER);
   const [secret, setSecret] = useState(() => localStorage.getItem(LS_SECRET) || DEFAULT_SECRET);
   const [status, setStatus] = useState<Status>('idle');
-  const [peers, setPeers] = useState<Peers>({ controller: false, pet: false });
+  const [participantId, setParticipantId] = useState(localParticipantId);
+  const [peers, setPeers] = useState<Peers>({
+    selfReady: false, peerOnline: false, peerPetOnline: false, peerControllerOnline: false,
+    controller: false, pet: false,
+  });
   const [motions, setMotions] = useState<MotionMeta[]>([]);
   const [voices, setVoices] = useState<string[]>([]);
   const [tts, setTts] = useState('');
@@ -138,7 +164,7 @@ export default function App() {
   const [callState, setCallState] = useState<CallState>('idle');
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
   const [remoteSystemMuted, setRemoteSystemMuted] = useState(true);
-  const [pttPressed, setPttPressed] = useState(false);
+  const [micEnabled, setMicEnabledState] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
   const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
   const [rtcRoute, setRtcRoute] = useState<RtcRoute>(EMPTY_RTC_ROUTE);
@@ -153,6 +179,7 @@ export default function App() {
   const rtcPcRef = useRef<RTCPeerConnection | null>(null);
   const localAudioRef = useRef<MediaStream | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const currentCallIdRef = useRef<string | null>(null);
 
   const showToast = useCallback((msg: string, err = false) => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
@@ -169,11 +196,11 @@ export default function App() {
     for (const track of localAudioRef.current?.getAudioTracks() ?? []) {
       track.enabled = enabled;
     }
-    setPttPressed(enabled);
+    setMicEnabledState(enabled);
   }, []);
 
   const teardownCall = useCallback((opts?: { sendRemoteHangup?: boolean; nextState?: CallState }) => {
-    if (opts?.sendRemoteHangup) sendHangup();
+    if (opts?.sendRemoteHangup) endCall(currentCallIdRef.current || undefined);
     try { rtcPcRef.current?.close(); } catch {}
     rtcPcRef.current = null;
     pendingCandidatesRef.current = [];
@@ -186,10 +213,15 @@ export default function App() {
     remoteMicStreamRef.current = null;
     remoteSystemStreamRef.current = null;
     setCallState(opts?.nextState ?? 'idle');
+    currentCallIdRef.current = null;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     if (remoteMicAudioRef.current) remoteMicAudioRef.current.srcObject = null;
     if (remoteSystemAudioRef.current) remoteSystemAudioRef.current.srcObject = null;
   }, [setMicEnabled, stopLocalAudio]);
+
+  const sendRtcSignal = useCallback((signal: WebRtcSignal) => {
+    return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined });
+  }, []);
 
   const syncRemoteMediaState = useCallback(async () => {
     const videoTracks = remoteVideoStreamRef.current?.getVideoTracks() ?? [];
@@ -274,7 +306,7 @@ export default function App() {
     pc.addTransceiver('video', { direction: 'recvonly' });
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) sendSignal({ candidate: event.candidate.toJSON() });
+      if (event.candidate) sendRtcSignal({ candidate: event.candidate.toJSON() });
     };
     pc.ontrack = async (event) => {
       const streamRef = event.track.kind === 'video'
@@ -328,6 +360,7 @@ export default function App() {
       }
       if (state === 'failed' || state === 'disconnected') {
         showToast('通话断开了', true);
+        endCall(currentCallIdRef.current || undefined);
         teardownCall({ nextState: 'idle' });
         setRtcRoute({ candidateType: 'failed', relayed: false, detail: `连接状态：${state}` });
       }
@@ -343,10 +376,11 @@ export default function App() {
     };
 
     return pc;
-  }, [ensureLocalAudio, showToast, teardownCall]);
+  }, [ensureLocalAudio, sendRtcSignal, showToast, teardownCall]);
 
   const handleSignal = useCallback(async (signal: WebRtcSignal) => {
     if (!signal) return;
+    if (signal.callId && signal.callId !== currentCallIdRef.current) return;
     if (signal.description) {
       const desc = signal.description;
       console.log('[webrtc] controller got description:', desc.type);
@@ -364,7 +398,7 @@ export default function App() {
         await flushPendingCandidates();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        sendSignal({ description: pc.localDescription });
+        sendRtcSignal({ description: pc.localDescription });
         console.log('[webrtc] controller answered remote offer');
         return;
       }
@@ -379,7 +413,18 @@ export default function App() {
       }
       await pc.addIceCandidate(signal.candidate);
     }
-  }, [ensurePeerConnection, flushPendingCandidates]);
+  }, [ensurePeerConnection, flushPendingCandidates, sendRtcSignal]);
+
+  const beginMediaCall = useCallback(async (callId: string) => {
+    if (currentCallIdRef.current === callId && rtcPcRef.current) return;
+    teardownCall({ nextState: 'requesting-media' });
+    currentCallIdRef.current = callId;
+    const pc = await ensurePeerConnection();
+    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+    sendRtcSignal({ description: pc.localDescription });
+    setCallState('calling');
+  }, [ensurePeerConnection, sendRtcSignal, teardownCall]);
 
   useEffect(() => {
     setListeners({
@@ -394,6 +439,7 @@ export default function App() {
         });
       },
       onHangup: () => {
+        if (!currentCallIdRef.current) return;
         teardownCall({ nextState: 'idle' });
         showToast('通话结束了');
       },
@@ -401,18 +447,49 @@ export default function App() {
         showToast(msg, true);
         teardownCall({ nextState: 'error' });
       },
+      onCallStart: (callId) => {
+        beginMediaCall(callId).catch((e) => {
+          console.warn('[webrtc] start coordinated call failed:', e);
+          showToast(`通话失败：${e?.message || e}`, true);
+          teardownCall({ nextState: 'error' });
+        });
+      },
+      onCallEnd: (callId) => {
+        if (callId && currentCallIdRef.current && callId !== currentCallIdRef.current) return;
+        teardownCall({ nextState: 'idle' });
+        showToast('通话结束了');
+      },
     });
     return () => {
       setListeners({});
       teardownCall({ nextState: 'idle' });
     };
-  }, [handleSignal, showToast, teardownCall]);
+  }, [beginMediaCall, handleSignal, showToast, teardownCall]);
 
   useEffect(() => {
-    if (status !== 'connected' || !peers.pet) {
+    const bridge = window.desktopPetControl;
+    if (!bridge) return;
+    const applyConfig = (config: PairingConfig) => {
+      const nextServer = String(config.serverUrl || '').trim();
+      const nextSecret = String(config.roomSecret || '').trim();
+      const nextParticipant = String(config.participantId || '').trim();
+      setServerUrl(nextServer);
+      setSecret(nextSecret);
+      if (nextParticipant) setParticipantId(nextParticipant);
+      if (nextServer && nextSecret && nextParticipant) connect(nextServer, nextSecret, nextParticipant);
+      else disconnect();
+    };
+    bridge.getPairingConfig().then(applyConfig).catch((e) => {
+      showToast(`读取桌宠配置失败：${e?.message || e}`, true);
+    });
+    bridge.onPairingChanged(applyConfig);
+  }, [showToast]);
+
+  useEffect(() => {
+    if (status !== 'connected' || !peers.peerPetOnline) {
       setMotions([]);
       setVoices([]);
-      if (!peers.pet) teardownCall({ nextState: 'idle' });
+      if (!peers.peerPetOnline) teardownCall({ nextState: 'idle' });
       return;
     }
     listMotions().then((items) => {
@@ -422,7 +499,7 @@ export default function App() {
       setVoices(files);
       if (!files.length) showToast('桌宠端没有预录台词');
     });
-  }, [status, peers.pet, showToast, teardownCall]);
+  }, [status, peers.peerPetOnline, showToast, teardownCall]);
 
   const toggleRemoteAudio = useCallback(async (kind: 'mic' | 'system') => {
     const isMic = kind === 'mic';
@@ -466,23 +543,31 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [callState]);
 
-  const onConnect = useCallback(() => {
+  const onConnect = useCallback(async () => {
     if (!serverUrl.trim() || !secret.trim()) {
       showToast('填一下服务器和密钥', true);
       return;
     }
+    if (window.desktopPetControl) {
+      const result = await window.desktopPetControl.savePairingConfig({
+        serverUrl: serverUrl.trim(),
+        roomSecret: secret.trim(),
+      });
+      if (!result.ok) showToast(result.error || '保存配置失败', true);
+      return;
+    }
     localStorage.setItem(LS_SERVER, serverUrl);
     localStorage.setItem(LS_SECRET, secret);
-    connect(serverUrl.trim(), secret.trim());
-  }, [secret, serverUrl, showToast]);
+    connect(serverUrl.trim(), secret.trim(), participantId);
+  }, [participantId, secret, serverUrl, showToast]);
 
   const onDisconnect = useCallback(() => {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     disconnect();
   }, [teardownCall]);
 
-  const canSend = status === 'connected' && peers.pet;
-  const canCall = canSend;
+  const canSend = status === 'connected' && peers.peerPetOnline;
+  const canCall = canSend && peers.peerControllerOnline;
 
   const send = useCallback((cmd: Command, label: string) => {
     if (!canSend) {
@@ -511,30 +596,23 @@ export default function App() {
     }
     try {
       setCallState('requesting-media');
-      const pc = await ensurePeerConnection();
-      const offer = await pc.createOffer({
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: true,
-      });
-      await pc.setLocalDescription(offer);
-      sendSignal({ description: pc.localDescription });
-      console.log('[webrtc] controller sent offer');
-      setCallState('calling');
+      const result = await requestCall();
+      if (!result.ok) throw new Error(result.code === 'peer_not_ready' ? '对方二合一客户端尚未就绪' : '无法创建通话');
     } catch (e: any) {
       console.warn('[webrtc] startCall failed:', e);
       showToast(`开通话失败：${e?.message || e}`, true);
       teardownCall({ nextState: 'error' });
     }
-  }, [canCall, ensurePeerConnection, showToast, teardownCall]);
+  }, [canCall, showToast, teardownCall]);
 
   const onEndCall = useCallback(() => {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
   }, [teardownCall]);
 
-  const setTalkPressed = useCallback((pressed: boolean) => {
+  const toggleLocalMic = useCallback(() => {
     if (callState !== 'in-call' && callState !== 'calling') return;
-    setMicEnabled(pressed);
-  }, [callState, setMicEnabled]);
+    setMicEnabled(!micEnabled);
+  }, [callState, micEnabled, setMicEnabled]);
 
   const groupedVoices = useMemo(() => {
     const g: Record<string, string[]> = { head: [], body: [], tail: [], idle: [], other: [] };
@@ -551,8 +629,8 @@ export default function App() {
           <p className="hero-copy">黑白蓝主界面，优先把屏幕、通话和控制动作放到一屏内。</p>
         </div>
         <div className="hero-badge">
-          <span className={`signal ${peers.pet ? 'on' : ''}`} />
-          <span>{peers.pet ? '桌宠在线' : '等待桌宠'}</span>
+          <span className={`signal ${peers.peerOnline ? 'on' : ''}`} />
+          <span>{peers.peerOnline ? '对方在线' : '等待对方'}</span>
         </div>
       </header>
 
@@ -578,7 +656,8 @@ export default function App() {
         </div>
         <div className="status-row">
           <StatusPill status={status} />
-          <PeerPill role="pet" online={peers.pet} />
+          <PeerPill role="pet" online={peers.peerPetOnline} />
+          {!window.desktopPetControl && !peers.selfReady && <span className="hint">浏览器模式：仅控制端在线</span>}
           <div style={{ flex: 1 }} />
           {status === 'connected' || status === 'connecting' ? (
             <button className="btn" onClick={onDisconnect}>断开</button>
@@ -633,15 +712,10 @@ export default function App() {
             onClick={onEndCall}
           >结束通话</button>
           <button
-            className={`btn ${pttPressed ? 'accent' : ''}`}
+            className={`btn ${micEnabled ? 'accent' : ''}`}
             disabled={callState !== 'calling' && callState !== 'in-call'}
-            onMouseDown={() => setTalkPressed(true)}
-            onMouseUp={() => setTalkPressed(false)}
-            onMouseLeave={() => setTalkPressed(false)}
-            onTouchStart={() => setTalkPressed(true)}
-            onTouchEnd={() => setTalkPressed(false)}
-            onTouchCancel={() => setTalkPressed(false)}
-          >{pttPressed ? '正在说话...' : '按住说话'}</button>
+            onClick={toggleLocalMic}
+          >{micEnabled ? '关闭麦克风' : '打开麦克风'}</button>
           <button
             className="btn"
             disabled={callState !== 'calling' && callState !== 'in-call'}
