@@ -8,6 +8,7 @@
 - Windows、未签名 macOS x64/arm64、Linux server 发包。
 - v1.2.1 新增 ElevenLabs / CosyVoice 低延迟克隆语音消息。
 - 服务端声音白名单、ElevenLabs 可选 BYOK、目标桌宠 FIFO 播放、口型同步、限流和明确错误状态。
+- v1.2.2 修复移除旧聊天组件后桌宠无法拖动的问题，并将 pet TypeScript 检查加入发布构建。
 
 ## 后续方向
 
