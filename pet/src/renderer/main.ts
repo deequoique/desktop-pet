@@ -927,9 +927,7 @@ function updateDragPose(dt: number, t: number) {
 
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0 || !lastClickable) return;
-  // 输入框正在用，不当作戳模型
-  if (document.activeElement === chatInput) return;
-  if (sizeBox.contains(e.target as Node) || chatBox.contains(e.target as Node) || pairingForm.contains(e.target as Node)) return;
+  if (sizeBox.contains(e.target as Node) || pairingForm.contains(e.target as Node)) return;
   dragging = true;
   dragLastScreenX = e.screenX;
   dragDirection = 0;
