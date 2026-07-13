@@ -18,6 +18,13 @@
 - `tts_queue_full`：对方已有 3 条正在播放或等待的消息，稍后重试。
 - `tts_rate_limited`：默认每位参与者每分钟最多 10 次。
 - 401：API Key 无效；429：ElevenLabs 限流或额度不足；断流会显示播放失败。
+
+## CosyVoice
+
+- `/api/health` 显示 `tts: disabled`：检查 `TTS_PROVIDER=cosyvoice`、`DASHSCOPE_API_KEY`、`DASHSCOPE_WORKSPACE_ID` 和非空白名单。
+- 401/403：API Key 与 Workspace 地域或权限不匹配；3.5 Plus 应使用北京地域。
+- `tts_voice_not_allowed`：发送的 voice ID 不在 `COSYVOICE_VOICES_JSON`，或控制面板还保留着旧供应商的本地选择。
+- 上游生成失败：确认 voice ID 是用 `COSYVOICE_MODEL` 指定的同一模型创建的。
 - 白名单移除了已保存 voice：控制面板会清除旧选择并要求重选。
 
 TTS 故障是隔离的，不应影响动作控制、房间连接或 WebRTC 通话。浏览器刷新会清除 BYOK Key；Electron 可从系统安全存储恢复。

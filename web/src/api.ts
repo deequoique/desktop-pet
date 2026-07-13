@@ -17,7 +17,8 @@ export type Command =
 
 export type TtsVoice = { id: string; label: string; previewUrl?: string };
 export type TtsStatus = { jobId: string; state: 'dispatched' | 'generating' | 'playing' | 'completed' | 'error'; error?: string };
-export type TtsVoiceResponse = { ok: boolean; mode?: 'managed' | 'byok'; code?: string; voices: TtsVoice[] };
+export type TtsProvider = 'elevenlabs' | 'cosyvoice';
+export type TtsVoiceResponse = { ok: boolean; mode?: 'managed' | 'byok'; provider?: TtsProvider; code?: string; voices: TtsVoice[] };
 
 export type Peers = {
   selfReady: boolean;

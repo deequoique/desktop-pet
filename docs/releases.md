@@ -1,6 +1,6 @@
 # 发布与打包
 
-正式发布由 `v*` tag 触发 GitHub Actions。流程构建 Windows NSIS、macOS x64/arm64 包，以及带生产依赖的 Linux server 压缩包。`PET_SERVER_URL` 从 GitHub Secret 生成客户端生产配置，房间密钥和 ElevenLabs Key 不进入安装包。
+正式发布由 `v*` tag 触发 GitHub Actions。流程构建 Windows NSIS、macOS x64/arm64 包，以及带生产依赖的 Linux server 压缩包。`PET_SERVER_URL` 从 GitHub Secret 生成客户端生产配置，房间密钥、ElevenLabs Key 和 DashScope Key 不进入安装包。
 
 本地验证命令：
 

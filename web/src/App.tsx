@@ -3,6 +3,7 @@ import {
   connect,
   disconnect,
   listMotions,
+  listTtsVoices,
   listVoices,
   createTts,
   endCall,
@@ -16,6 +17,7 @@ import {
   type MotionMeta,
   type Peers,
   type TtsStatus,
+  type TtsProvider,
   type TtsVoice,
   type WebRtcSignal,
 } from './api';
@@ -159,7 +161,7 @@ function voiceLabel(url: string): string {
 function ttsErrorMessage(code?: string) {
   const messages: Record<string, string> = {
     disconnected: '尚未连接 server',
-    tts_not_configured: 'Server 尚未配置 ElevenLabs',
+    tts_not_configured: 'Server 尚未配置语音服务',
     tts_no_voices: '没有可用声音',
     tts_voice_not_allowed: '所选声音不可用，请重新选择',
     tts_queue_full: '对方语音队列已满，请稍后再发',
@@ -167,10 +169,11 @@ function ttsErrorMessage(code?: string) {
     peer_pet_offline: '对方桌宠不在线',
     tts_byok_unauthorized: 'ElevenLabs API Key 无效',
     tts_byok_unavailable: '无法读取 ElevenLabs 声音列表',
+    tts_byok_not_supported: '当前语音供应商不支持应用内 BYOK',
     tts_credentials_unavailable: '自定义 API Key 已断开，请重新连接',
-    tts_upstream_unauthorized: 'ElevenLabs 拒绝了 API Key',
-    tts_upstream_rate_limited: 'ElevenLabs 额度或频率已受限',
-    tts_upstream_error: 'ElevenLabs 生成失败',
+    tts_upstream_unauthorized: '语音供应商拒绝了 API Key',
+    tts_upstream_rate_limited: '语音供应商额度或频率已受限',
+    tts_upstream_error: '语音供应商生成失败',
     tts_stream_failed: '语音流中断',
     tts_job_expired: '语音任务已过期',
   };
@@ -190,6 +193,7 @@ export default function App() {
   const [voices, setVoices] = useState<string[]>([]);
   const [tts, setTts] = useState('');
   const [ttsMode, setTtsMode] = useState<'managed' | 'byok'>(() => localStorage.getItem(LS_TTS_MODE) === 'byok' ? 'byok' : 'managed');
+  const [ttsProvider, setTtsProvider] = useState<TtsProvider>('elevenlabs');
   const [ttsApiKey, setTtsApiKey] = useState('');
   const [ttsApiKeyInput, setTtsApiKeyInput] = useState('');
   const [ttsKeyConfigured, setTtsKeyConfigured] = useState(false);
@@ -547,14 +551,30 @@ export default function App() {
     let cancelled = false;
     const load = async () => {
       if (ttsMode === 'byok' && !ttsApiKey) {
-        setTtsVoices([]);
-        setTtsState('请配置 ElevenLabs API Key');
+        const discovery = await listTtsVoices();
+        if (cancelled) return;
+        if (discovery.provider) setTtsProvider(discovery.provider);
+        if (discovery.provider === 'cosyvoice') {
+          setTtsMode('managed');
+          localStorage.setItem(LS_TTS_MODE, 'managed');
+          setTtsVoices(discovery.voices || []);
+          setTtsState(discovery.ok ? '等待发送' : ttsErrorMessage(discovery.code));
+        } else {
+          setTtsVoices([]);
+          setTtsState('请配置 ElevenLabs API Key');
+        }
         return;
       }
       const response = ttsMode === 'byok'
         ? await setTtsCredentials(ttsApiKey)
         : await setTtsCredentials('');
       if (cancelled) return;
+      if (response.provider) setTtsProvider(response.provider);
+      if (response.provider === 'cosyvoice' && ttsMode === 'byok') {
+        setTtsMode('managed');
+        localStorage.setItem(LS_TTS_MODE, 'managed');
+        return;
+      }
       setTtsVoices(response.voices || []);
       if (!response.ok) {
         setTtsState(ttsErrorMessage(response.code));
@@ -944,11 +964,11 @@ export default function App() {
       </section>
 
       <section className="section">
-        <h2>语音消息 · ElevenLabs</h2>
+        <h2>语音消息 · {ttsProvider === 'cosyvoice' ? 'CosyVoice' : 'ElevenLabs'}</h2>
         <div className="tts-area">
           <div className="tts-mode-row">
             <button className={`btn ${ttsMode === 'managed' ? 'accent' : ''}`} onClick={() => selectTtsMode('managed')}>服务端声音</button>
-            <button className={`btn ${ttsMode === 'byok' ? 'accent' : ''}`} onClick={() => selectTtsMode('byok')}>使用我的 API Key</button>
+            {ttsProvider === 'elevenlabs' && <button className={`btn ${ttsMode === 'byok' ? 'accent' : ''}`} onClick={() => selectTtsMode('byok')}>使用我的 API Key</button>}
             <span className="tts-hint">发送后由对方桌宠用你的克隆声音播放</span>
           </div>
           {ttsMode === 'byok' && (

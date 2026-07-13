@@ -5,24 +5,40 @@ import { createServer } from 'http';
 import { createHash, randomUUID } from 'crypto';
 import { Readable } from 'stream';
 import { Server as SocketIOServer } from 'socket.io';
+import WebSocket from 'ws';
 
 const PORT = process.env.PORT || 3030;
 
-// === TTS（ElevenLabs）===
+// === TTS providers ===
+const TTS_PROVIDER = String(process.env.TTS_PROVIDER || 'elevenlabs').trim().toLowerCase();
+if (!['elevenlabs', 'cosyvoice'].includes(TTS_PROVIDER)) {
+  throw new Error(`Unsupported TTS_PROVIDER: ${TTS_PROVIDER}`);
+}
 const ELEVENLABS_KEY = process['env']['ELEVENLABS_API_KEY'];
 const ELEVENLABS_BASE_URL = String(process.env.ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io').replace(/\/+$/, '');
-const TTS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
+const COSYVOICE_KEY = process.env.DASHSCOPE_API_KEY;
+const COSYVOICE_WORKSPACE_ID = String(process.env.DASHSCOPE_WORKSPACE_ID || '').trim();
+const COSYVOICE_MODEL = process.env.COSYVOICE_MODEL || 'cosyvoice-v3.5-plus';
+const COSYVOICE_WS_URL = String(
+  process.env.COSYVOICE_WS_URL
+    || (COSYVOICE_WORKSPACE_ID
+      ? `wss://${COSYVOICE_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
+      : '')
+).trim();
 const TTS_JOB_TTL_MS = Math.max(5_000, Number(process.env.TTS_JOB_TTL_MS || 60_000));
 const TTS_RATE_LIMIT = Math.max(1, Number(process.env.TTS_RATE_LIMIT || 10));
 const TTS_QUEUE_LIMIT = 3;
 
 function loadAllowedVoices() {
-  const legacyId = String(process.env.ELEVENLABS_VOICE_ID || '').trim();
-  const raw = String(process.env.ELEVENLABS_VOICES_JSON || '').trim();
+  const isCosyVoice = TTS_PROVIDER === 'cosyvoice';
+  const legacyId = String(isCosyVoice ? '' : process.env.ELEVENLABS_VOICE_ID || '').trim();
+  const envName = isCosyVoice ? 'COSYVOICE_VOICES_JSON' : 'ELEVENLABS_VOICES_JSON';
+  const raw = String(process.env[envName] || '').trim();
   let parsed = [];
   if (raw) {
     try { parsed = JSON.parse(raw); }
-    catch (error) { console.warn('[tts] invalid ELEVENLABS_VOICES_JSON:', error?.message || error); }
+    catch (error) { console.warn(`[tts] invalid ${envName}:`, error?.message || error); }
   }
   const voices = Array.isArray(parsed) ? parsed : [];
   const normalized = voices
@@ -34,6 +50,16 @@ function loadAllowedVoices() {
 
 const ALLOWED_VOICES = loadAllowedVoices();
 const ALLOWED_VOICE_IDS = new Set(ALLOWED_VOICES.map((voice) => voice.id));
+
+function managedTtsReady() {
+  if (!ALLOWED_VOICES.length) return false;
+  if (TTS_PROVIDER === 'cosyvoice') return !!(COSYVOICE_KEY && COSYVOICE_WS_URL);
+  return !!ELEVENLABS_KEY;
+}
+
+function managedTtsModel() {
+  return TTS_PROVIDER === 'cosyvoice' ? COSYVOICE_MODEL : ELEVENLABS_MODEL;
+}
 
 // === Socket.IO 房间 / 鉴权 ===
 // 房间密钥由服务端预配置。ROOM_SECRETS 支持逗号分隔；ROOM_SECRET 保持 v1.1 兼容。
@@ -50,7 +76,8 @@ app.use(express.json({ limit: '2mb' }));
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    tts: ELEVENLABS_KEY && ALLOWED_VOICES.length ? 'ready' : 'disabled',
+    tts: managedTtsReady() ? 'ready' : 'disabled',
+    ttsProvider: TTS_PROVIDER,
     ttsVoices: ALLOWED_VOICES.length,
     socket: 'ready',
   });
@@ -129,7 +156,7 @@ function endRoomCall(room, reason = 'ended') {
   emitToRoomEndpoints(room, 'webrtc:hangup', { callId, reason });
 }
 
-// === ElevenLabs TTS jobs ===
+// === TTS jobs ===
 const ttsJobs = new Map();
 const ttsQueues = new Map();
 const ttsRateWindows = new Map();
@@ -220,6 +247,7 @@ function consumeTtsRate(roomHash, participantId) {
 
 async function allowedVoicesWithPreviews() {
   if (voiceMetadataCache.expiresAt > Date.now()) return voiceMetadataCache.voices;
+  if (TTS_PROVIDER === 'cosyvoice') return ALLOWED_VOICES;
   const voices = await Promise.all(ALLOWED_VOICES.map(async (voice) => {
     if (!ELEVENLABS_KEY) return voice;
     try {
@@ -262,6 +290,105 @@ function apiKeyForJob(job) {
   return controllerSocket?.data?.elevenlabsKey || '';
 }
 
+function streamCosyVoice(job, res) {
+  return new Promise((resolve, reject) => {
+    const taskId = randomUUID();
+    let settled = false;
+    let audioStarted = false;
+    const ws = new WebSocket(COSYVOICE_WS_URL, {
+      headers: {
+        Authorization: `Bearer ${COSYVOICE_KEY}`,
+        'User-Agent': 'desktop-pet-server/1.3',
+        ...(COSYVOICE_WORKSPACE_ID ? { 'X-DashScope-WorkSpace': COSYVOICE_WORKSPACE_ID } : {}),
+      },
+    });
+    let timeout;
+    const cleanup = () => clearTimeout(timeout);
+    const complete = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!res.writableEnded) res.end();
+      ws.close();
+      resolve();
+    };
+    const fail = (code, detail) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      ws.close();
+      reject(Object.assign(new Error(detail || code), { code }));
+    };
+    timeout = setTimeout(() => fail('tts_upstream_unavailable', 'CosyVoice timeout'), Math.max(TTS_JOB_TTL_MS, 30_000));
+    const send = (action, payload) => ws.send(JSON.stringify({
+      header: { action, task_id: taskId, streaming: 'duplex' },
+      payload,
+    }));
+
+    ws.on('open', () => send('run-task', {
+      task_group: 'audio',
+      task: 'tts',
+      function: 'SpeechSynthesizer',
+      model: COSYVOICE_MODEL,
+      parameters: {
+        text_type: 'PlainText',
+        voice: job.voiceId,
+        format: 'mp3',
+        sample_rate: 44100,
+        volume: 50,
+        rate: 1,
+        pitch: 1,
+        language_hints: ['zh'],
+        enable_ssml: false,
+      },
+      input: {},
+    }));
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) {
+        audioStarted = true;
+        if (!res.write(Buffer.from(data))) ws.pause();
+        return;
+      }
+      let message;
+      try { message = JSON.parse(data.toString()); }
+      catch { return; }
+      const event = message?.header?.event;
+      if (event === 'task-started') {
+        send('continue-task', { input: { text: job.text } });
+        send('finish-task', { input: {} });
+      } else if (event === 'task-finished') {
+        complete();
+      } else if (event === 'task-failed') {
+        const status = Number(message?.header?.status_code || message?.header?.status || 0);
+        const code = status === 401 || status === 403 ? 'tts_upstream_unauthorized'
+          : status === 429 ? 'tts_upstream_rate_limited' : 'tts_upstream_error';
+        fail(code, message?.header?.error_message || message?.header?.message);
+      }
+    });
+    res.on('drain', () => ws.resume());
+    res.on('close', () => {
+      if (!res.writableEnded && !settled) {
+        settled = true;
+        cleanup();
+        ws.close();
+        resolve();
+      }
+    });
+    ws.on('unexpected-response', (_request, response) => {
+      const code = response.statusCode === 401 || response.statusCode === 403
+        ? 'tts_upstream_unauthorized'
+        : response.statusCode === 429 ? 'tts_upstream_rate_limited' : 'tts_upstream_error';
+      fail(code, `CosyVoice HTTP ${response.statusCode}`);
+    });
+    ws.on('error', (error) => {
+      if (!settled) fail(audioStarted ? 'tts_stream_failed' : 'tts_upstream_unavailable', error.message);
+    });
+    ws.on('close', () => {
+      if (!settled) fail(audioStarted ? 'tts_stream_failed' : 'tts_upstream_unavailable', 'CosyVoice connection closed');
+    });
+  });
+}
+
 function failByokJobsForRequester(roomHash, participantId) {
   for (const job of [...ttsJobs.values()]) {
     if (job.roomHash === roomHash && job.requesterId === participantId && job.credentialMode === 'byok') {
@@ -278,8 +405,8 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
   if (job.consumed) return res.status(410).json({ error: 'tts_job_already_used' });
   job.consumed = true;
   emitTtsStatus(job, 'generating');
-  const apiKey = apiKeyForJob(job);
-  if (!apiKey) {
+  const apiKey = job.provider === 'elevenlabs' ? apiKeyForJob(job) : COSYVOICE_KEY;
+  if (!apiKey || (job.provider === 'cosyvoice' && !COSYVOICE_WS_URL)) {
     finishTtsJob(job, 'error', 'tts_credentials_unavailable');
     return res.status(503).json({ error: 'tts_credentials_unavailable' });
   }
@@ -289,6 +416,13 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
     if (!res.writableEnded) abortController.abort();
   });
   try {
+    if (job.provider === 'cosyvoice') {
+      res.status(200);
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'no-store, private');
+      await streamCosyVoice(job, res);
+      return;
+    }
     const upstream = await fetch(
       `${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(job.voiceId)}/stream?output_format=mp3_44100_128`,
       {
@@ -300,7 +434,7 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
         },
         body: JSON.stringify({
           text: job.text,
-          model_id: TTS_MODEL,
+          model_id: ELEVENLABS_MODEL,
           voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0, use_speaker_boost: true },
         }),
         signal: abortController.signal,
@@ -325,8 +459,10 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
     }).pipe(res);
   } catch (error) {
     if (error?.name !== 'AbortError') console.warn('[tts] request failed:', error?.message || error);
-    finishTtsJob(job, 'error', error?.name === 'AbortError' ? 'tts_stream_cancelled' : 'tts_upstream_unavailable');
-    if (!res.headersSent) res.status(502).json({ error: 'tts_upstream_unavailable' });
+    const code = error?.name === 'AbortError' ? 'tts_stream_cancelled' : error?.code || 'tts_upstream_unavailable';
+    finishTtsJob(job, 'error', code);
+    if (!res.headersSent) res.status(502).json({ error: code });
+    else if (!res.writableEnded) res.destroy(error);
   }
 });
 
@@ -443,14 +579,25 @@ io.on('connection', (socket) => {
     if (!apiKey) {
       delete socket.data.elevenlabsKey;
       delete socket.data.elevenlabsVoices;
-      if (typeof ack === 'function') ack({ ok: true, mode: 'managed', voices: await allowedVoicesWithPreviews() });
+      const voices = await allowedVoicesWithPreviews();
+      if (typeof ack === 'function') ack({
+        ok: managedTtsReady(), mode: 'managed', provider: TTS_PROVIDER, voices,
+        code: !managedTtsReady() ? 'tts_not_configured' : voices.length ? undefined : 'tts_no_voices',
+      });
+      return;
+    }
+    if (TTS_PROVIDER !== 'elevenlabs') {
+      if (typeof ack === 'function') ack({
+        ok: false, mode: 'managed', provider: TTS_PROVIDER,
+        code: 'tts_byok_not_supported', voices: [],
+      });
       return;
     }
     try {
       const voices = await fetchByokVoices(apiKey);
       socket.data.elevenlabsKey = apiKey;
       socket.data.elevenlabsVoices = voices;
-      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', voices });
+      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', provider: 'elevenlabs', voices });
     } catch (error) {
       delete socket.data.elevenlabsKey;
       delete socket.data.elevenlabsVoices;
@@ -464,14 +611,15 @@ io.on('connection', (socket) => {
       return;
     }
     if (socket.data.elevenlabsKey && Array.isArray(socket.data.elevenlabsVoices)) {
-      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', voices: socket.data.elevenlabsVoices });
+      if (typeof ack === 'function') ack({ ok: true, mode: 'byok', provider: 'elevenlabs', voices: socket.data.elevenlabsVoices });
       return;
     }
     const voices = await allowedVoicesWithPreviews();
     if (typeof ack === 'function') ack({
-      ok: !!(ELEVENLABS_KEY && voices.length),
+      ok: managedTtsReady(),
       mode: 'managed',
-      code: !ELEVENLABS_KEY ? 'tts_not_configured' : voices.length ? undefined : 'tts_no_voices',
+      provider: TTS_PROVIDER,
+      code: !managedTtsReady() ? 'tts_not_configured' : voices.length ? undefined : 'tts_no_voices',
       voices,
     });
   });
@@ -491,7 +639,7 @@ io.on('connection', (socket) => {
     const allowedIds = credentialMode === 'byok'
       ? new Set(byokVoices.map((voice) => voice.id))
       : ALLOWED_VOICE_IDS;
-    if (credentialMode === 'managed' && (!ELEVENLABS_KEY || !ALLOWED_VOICES.length)) {
+    if (credentialMode === 'managed' && !managedTtsReady()) {
       if (typeof ack === 'function') ack({ ok: false, code: 'tts_not_configured' });
       return;
     }
@@ -528,6 +676,7 @@ io.on('connection', (socket) => {
       id: randomUUID(), roomHash: room.hash,
       requesterId: socket.data.participantId, targetId: target.id,
       text, voiceId, credentialMode,
+      provider: credentialMode === 'byok' ? 'elevenlabs' : TTS_PROVIDER,
       state: 'queued', consumed: false, finished: false, expiresAt: 0, expiryTimer: null,
     };
     ttsJobs.set(job.id, job);
@@ -619,6 +768,6 @@ io.on('connection', (socket) => {
 
 httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);
-  console.log(`  tts:    ${ELEVENLABS_KEY && ALLOWED_VOICES.length ? `managed (${TTS_MODEL}, voices=${ALLOWED_VOICES.length})` : 'managed disabled; BYOK available'}`);
+  console.log(`  tts:    ${managedTtsReady() ? `${TTS_PROVIDER} managed (${managedTtsModel()}, voices=${ALLOWED_VOICES.length})` : `${TTS_PROVIDER} managed disabled`}${TTS_PROVIDER === 'elevenlabs' ? '; BYOK available' : ''}`);
   console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
 });
