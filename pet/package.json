@@ -23,7 +23,8 @@
     "appId": "com.deequoique.desktop-pet",
     "productName": "Desktop Pet",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
       "src/main/**/*",
@@ -40,6 +41,7 @@
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",
@@ -50,6 +52,7 @@
       ]
     },
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.entertainment",
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
       "target": [

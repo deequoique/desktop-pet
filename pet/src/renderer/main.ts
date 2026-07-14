@@ -9,6 +9,8 @@ declare global {
     pet?: {
       setClickable: (clickable: boolean) => void;
       drag: (dx: number, dy: number) => void;
+      startDrag: () => void;
+      stopDrag: () => void;
       relocate: (corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right') => void;
       resize: (scale: number) => void;
       getScale: () => Promise<number>;
@@ -29,6 +31,8 @@ type PetBridge = NonNullable<Window['pet']>;
 const browserPetBridge: PetBridge = {
   setClickable: () => {},
   drag: () => {},
+  startDrag: () => {},
+  stopDrag: () => {},
   relocate: () => {},
   resize: () => {},
   getScale: async () => 1,
@@ -57,8 +61,8 @@ const MOTION_BASE_URL = './motions/';
 const MOTION_FADE_SECONDS = 0.18;
 const DEBUG_UI = new URLSearchParams(window.location.search).has('debug-ui');
 const SIZE_STEP = 0.1;
-const MIN_SCALE = 0.5;
-const MAX_SCALE = 2.0;
+const MIN_SCALE = 0.3;
+const MAX_SCALE = 1.5;
 const DRAG_POSE_SPEED = 12;
 const EAR_RAISE_SECONDS = 1.2;
 const EAR_HIT_RADIUS = 0.14;
@@ -661,6 +665,7 @@ let dragPoseTarget = 0;
 let dragPoseBlend = 0;
 let dragSway = 0;
 let dragLastScreenX = 0;
+let dragLastScreenY = 0;
 let dragDirection: -1 | 0 | 1 = 0;
 const cooldownUntil: Record<'head' | 'body' | 'tail', number> = { head: 0, body: 0, tail: 0 };
 
@@ -926,10 +931,13 @@ function updateDragPose(dt: number, t: number) {
 }
 
 window.addEventListener('mousedown', (e) => {
-  if (e.button !== 0 || !lastClickable) return;
+  // 能收到事件就说明主进程已经把桌宠窗口切到可交互；不要再依赖异步
+  // hit-test 状态拦截，否则一次状态丢失会让点击和拖动同时失效。
+  if (e.button !== 0) return;
   if (sizeBox.contains(e.target as Node) || pairingForm.contains(e.target as Node)) return;
   dragging = true;
   dragLastScreenX = e.screenX;
+  dragLastScreenY = e.screenY;
   dragDirection = 0;
   rotatingModel = e.shiftKey;
   clickMotionCandidate = false;
@@ -941,6 +949,7 @@ window.addEventListener('mousedown', (e) => {
     lastHitPart = 'rotate';
     return;
   }
+  petBridge.startDrag();
   if (!vrm) {
     clickMotionCandidate = true;
     lastHitPart = 'sprite';
@@ -971,6 +980,16 @@ window.addEventListener('mouseup', () => {
   dragDirection = 0;
   rotatingModel = false;
   clickMotionCandidate = false;
+  petBridge.stopDrag();
+});
+window.addEventListener('blur', () => {
+  if (!dragging) return;
+  dragging = false;
+  dragDirection = 0;
+  rotatingModel = false;
+  clickMotionCandidate = false;
+  setDragPose(false);
+  petBridge.stopDrag();
 });
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
@@ -979,19 +998,22 @@ window.addEventListener('mousemove', (e) => {
     applyModelRotation();
     return;
   }
-  if (e.movementX || e.movementY) {
-    const screenDeltaX = e.screenX - dragLastScreenX;
-    dragLastScreenX = e.screenX;
-    if (Math.abs(screenDeltaX) >= 1) {
-      const nextDirection: -1 | 1 = screenDeltaX < 0 ? -1 : 1;
-      if (nextDirection !== dragDirection) {
-        dragDirection = nextDirection;
-        setSpriteState(nextDirection < 0 ? 'running-right' : 'running-left');
-      }
-      dragSway = Math.max(-1, Math.min(1, screenDeltaX / 18));
+  // movementX/Y 会受到透明窗口自身移动影响，在 Electron/macOS 上可能归零或跳变。
+  // 使用屏幕绝对坐标差值，窗口跟随光标移动时仍能得到稳定的拖动距离。
+  const screenDeltaX = Math.round(e.screenX - dragLastScreenX);
+  const screenDeltaY = Math.round(e.screenY - dragLastScreenY);
+  dragLastScreenX = e.screenX;
+  dragLastScreenY = e.screenY;
+  if (!screenDeltaX && !screenDeltaY) return;
+  if (Math.abs(screenDeltaX) >= 1) {
+    const nextDirection: -1 | 1 = screenDeltaX < 0 ? -1 : 1;
+    if (nextDirection !== dragDirection) {
+      dragDirection = nextDirection;
+      setSpriteState(nextDirection < 0 ? 'running-right' : 'running-left');
     }
-    petBridge.drag(e.movementX, e.movementY);
+    dragSway = Math.max(-1, Math.min(1, screenDeltaX / 18));
   }
+  // 窗口位置由主进程根据系统光标绝对坐标更新；renderer 只负责动画反馈。
 });
 
 // === Idle behaviors ===

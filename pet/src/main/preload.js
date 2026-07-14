@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('pet', {
   setClickable: (clickable) => ipcRenderer.send('pet:set-clickable', clickable),
   drag: (dx, dy) => ipcRenderer.send('pet:drag', { dx, dy }),
+  startDrag: () => ipcRenderer.send('pet:drag-start'),
+  stopDrag: () => ipcRenderer.send('pet:drag-end'),
   relocate: (corner) => ipcRenderer.send('pet:relocate', corner),
   resize: (scale) => ipcRenderer.send('pet:resize', scale),
   getScale: () => ipcRenderer.invoke('pet:get-scale'),

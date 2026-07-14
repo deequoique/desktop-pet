@@ -14,12 +14,15 @@ try {
 }
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+if (process.platform === 'win32') app.setAppUserModelId('com.deequoique.desktop-pet');
+
+const TASKBAR_ICON = path.join(__dirname, 'assets', process.platform === 'win32' ? 'taskbar.ico' : 'taskbar.png');
 
 // scale=1 的基准尺寸；实际窗口 = 基准 * scale。
 const PET_W = 360;
 const PET_H = 480;
-const MIN_SCALE = 0.5;
-const MAX_SCALE = 2.0;
+const MIN_SCALE = 0.3;
+const MAX_SCALE = 1.5;
 
 const clampScale = (s) => {
   const n = Number(s);
@@ -174,6 +177,8 @@ let win = null;
 let controlWin = null;
 let tray = null;
 let gameMode = false;
+let petDragging = false;
+let petDragOffset = { x: 0, y: 0 };
 let updateState = {
   checking: false,
   available: false,
@@ -246,6 +251,7 @@ function rebuildTrayMenu() {
 
 function setGameMode(enabled) {
   gameMode = !!enabled;
+  if (gameMode) petDragging = false;
   patchState({ gameMode });
   if (win && !win.isDestroyed()) {
     // Game mode is an unconditional lock: renderer hit-testing must not make
@@ -351,6 +357,7 @@ function createWindow() {
     skipTaskbar: true,
     focusable: true,
     backgroundColor: '#00000000',
+    icon: TASKBAR_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -399,6 +406,7 @@ function createControlWindow() {
     minHeight: 600,
     show: false,
     title: 'Desktop Pet Control Panel',
+    icon: TASKBAR_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'control-preload.js'),
       contextIsolation: true,
@@ -416,11 +424,8 @@ function createControlWindow() {
 }
 
 function createTray() {
-  // macOS 必须给空图标配 title，否则状态栏入口宽度为 0，菜单完全不可见。
-  // Windows 仍保留 Tray 对象；后续可替换为正式 .ico 品牌图标。
-  const img = nativeImage.createEmpty();
+  const img = nativeImage.createFromPath(TASKBAR_ICON);
   tray = new Tray(img);
-  if (process.platform === 'darwin') tray.setTitle('🐾');
   tray.setToolTip('Desktop Pet');
   tray.on('click', () => showControlWindow());
   rebuildTrayMenu();
@@ -443,7 +448,7 @@ ipcMain.on('pet:set-clickable', (_e, clickable) => {
     win.setIgnoreMouseEvents(true);
     return;
   }
-  if (clickable) {
+  if (clickable || cursorInsidePetWindow) {
     win.setIgnoreMouseEvents(false);
   } else {
     win.setIgnoreMouseEvents(true);
@@ -455,6 +460,19 @@ ipcMain.on('pet:drag', (_e, { dx, dy }) => {
   if (!win || win.isDestroyed()) return;
   const [x, y] = win.getPosition();
   win.setPosition(x + dx, y + dy);
+});
+
+// 拖动由主进程按系统光标绝对位置驱动，避免透明窗口移动后 renderer
+// 丢失 mousemove / movementX / movementY 导致拖动中断。
+ipcMain.on('pet:drag-start', () => {
+  if (!win || win.isDestroyed() || gameMode) return;
+  const p = screen.getCursorScreenPoint();
+  const [x, y] = win.getPosition();
+  petDragOffset = { x: p.x - x, y: p.y - y };
+  petDragging = true;
+});
+ipcMain.on('pet:drag-end', () => {
+  petDragging = false;
 });
 
 // 远程 relocate：A 端发 corner → 主进程贴到对应角
@@ -500,6 +518,7 @@ ipcMain.handle('pet:get-scale', () => currentScale());
 // 60Hz 轮询光标位置 → 推给渲染层做 hit-test
 // macOS 透明窗 + setIgnoreMouseEvents 不会把 mousemove 转发给 renderer，必须主进程主动喂
 let cursorTimer = null;
+let cursorInsidePetWindow = false;
 function startCursorPoll() {
   if (cursorTimer) return;
   cursorTimer = setInterval(() => {
@@ -508,6 +527,14 @@ function startCursorPoll() {
     const [wx, wy] = win.getPosition();
     const [ww, wh] = win.getSize();
     const inside = p.x >= wx && p.x < wx + ww && p.y >= wy && p.y < wy + wh;
+    cursorInsidePetWindow = inside;
+    if (petDragging && !gameMode) {
+      win.setPosition(Math.round(p.x - petDragOffset.x), Math.round(p.y - petDragOffset.y));
+    }
+    // PNG 动画桌宠不使用旧 VRM raycast。主进程以窗口范围作为可靠兜底，
+    // 避免 renderer 的首次 clickable IPC 丢失后窗口永久保持鼠标穿透。
+    // 游戏模式仍是无条件穿透锁，不受此处影响。
+    if (!gameMode) win.setIgnoreMouseEvents(!inside);
     win.webContents.send('pet:cursor', {
       cx: p.x - wx,
       cy: p.y - wy,
@@ -607,6 +634,7 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
+  petDragging = false;
   stopCursorPoll();
   globalShortcut.unregisterAll();
 });
