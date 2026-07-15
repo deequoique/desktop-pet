@@ -50,6 +50,7 @@ Electron IPC：renderer → preload bridge → Electron main → OS/文件系统
 ## WebRTC 变更清单
 
 - [ ] server 只转发信令，不承载媒体。
+- [ ] 同时核对 RTC config、临时凭据、relay时视频禁用，以及主机/云防火墙端口；详细契约见 `desktop-pet/shared/webrtc-networking-and-deployment.md`。
 - [ ] signal 带 call ID，并拒绝过期 call。
 - [ ] `remoteDescription` 之前收到的 ICE candidate 被暂存。
 - [ ] offer/answer 和 candidate 的处理在 controller/pet 两端保持兼容。

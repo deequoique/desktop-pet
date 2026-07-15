@@ -10,7 +10,7 @@
 
 - 麦克风无权限：使用 HTTPS 或 localhost，并在系统和浏览器设置中允许麦克风/屏幕录制。
 - 有连接但无画面：检查双方端点状态、屏幕录制权限及 ICE 类型。
-- ICE 为 `failed`：当前 NAT 无法点对点打洞；需要配置可用 TURN。`relay` 表示媒体正在消耗 TURN 带宽。
+- ICE 为 `failed`：当前 NAT 无法点对点打洞；需要配置可用 TURN。`relay` 时应用只保留音频并暂停屏幕视频；credential、端口和带宽诊断见 [Ubuntu 24.04 coturn 部署手册](./ubuntu-coturn-deployment.md)。
 
 ## ElevenLabs
 

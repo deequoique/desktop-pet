@@ -11,6 +11,8 @@ npm start --prefix server
 
 建议用 systemd 守护进程，并在 Caddy 或 Nginx 后提供 HTTPS。普通 HTTP 会导致浏览器麦克风权限和 WebRTC 受限。
 
+公网两端无法稳定 P2P 时，按 [Ubuntu 24.04 coturn 部署手册](./ubuntu-coturn-deployment.md) 配置自建 STUN 与 TURN 音频兜底。Release 的 `server/deploy/` 已包含幂等部署脚本和配置模板。
+
 ## 房间配置
 
 `ROOM_SECRETS` 使用英文逗号配置多个允许的密钥；未设置时使用 `ROOM_SECRET`。房间密钥只用于入房，不会以明文广播。每个密钥对应一个严格双人房间。

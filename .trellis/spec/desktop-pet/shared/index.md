@@ -18,3 +18,4 @@
 ## 规范索引
 
 - [系统架构与契约](./system-architecture-and-contracts.md)：运行时职责、端到端数据流、持久化边界和当前不支持的模式。
+- [WebRTC 网络与 TURN 部署契约](./webrtc-networking-and-deployment.md)：RTC配置、临时凭据、选路、音频兜底与Ubuntu部署不变量。
