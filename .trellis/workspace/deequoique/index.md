@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-07-14
+- **Total Sessions**: 2
+- **Last Active**: 2026-07-15
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~41 | Active |
+| `journal-1.md` | ~77 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-07-15 | 双栈 WebRTC 与 TURN 音频兜底 | `68c9d9f`, `cdb5870`, `0cf5c22` | `master` |
 | 1 | 2026-07-14 | Bootstrap Chinese Trellis specs | `32b9dbd` | `master` |
 <!-- @@@/auto:session-history -->
 
