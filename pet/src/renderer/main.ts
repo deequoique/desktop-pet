@@ -1319,9 +1319,58 @@ type WebRtcSignal = {
   candidate?: RTCIceCandidateInit | null;
 };
 
-const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+type RtcConfigResponse = {
+  ok?: boolean;
+  iceServers?: RTCIceServer[];
+  iceTransportPolicy?: RTCIceTransportPolicy;
 };
+
+function requestRtcConfig(): Promise<RTCConfiguration> {
+  return new Promise((resolve) => {
+    const fallback: RTCConfiguration = { iceServers: [], iceTransportPolicy: 'all' };
+    if (!remoteSocket?.connected) return resolve(fallback);
+    remoteSocket.timeout(4000).emit('webrtc:get-config', (error: Error | null, response: RtcConfigResponse) => {
+      if (error || !response?.ok) return resolve(fallback);
+      resolve({
+        iceServers: Array.isArray(response.iceServers) ? response.iceServers : [],
+        iceTransportPolicy: response.iceTransportPolicy === 'relay' ? 'relay' : 'all',
+      });
+    });
+  });
+}
+
+function emitMediaStatus(
+  media: 'screen' | 'microphone' | 'system-audio',
+  state: 'available' | 'paused' | 'unavailable',
+  reason?: 'relay_audio_only' | 'capture_failed' | 'track_ended',
+) {
+  if (!activeCallId) return;
+  remoteSocket?.emit('webrtc:media-status', { callId: activeCallId, media, state, ...(reason ? { reason } : {}) });
+}
+
+async function selectedPairUsesRelay(pc: RTCPeerConnection): Promise<boolean> {
+  const stats = await pc.getStats();
+  let pair: any;
+  stats.forEach((report: any) => {
+    if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId);
+  });
+  if (!pair) stats.forEach((report: any) => {
+    if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.selected || report.nominated)) pair = report;
+  });
+  return stats.get(pair?.localCandidateId)?.candidateType === 'relay'
+    || stats.get(pair?.remoteCandidateId)?.candidateType === 'relay';
+}
+
+async function capAudioSender(sender: RTCRtpSender) {
+  try {
+    const parameters = sender.getParameters();
+    if (!parameters.encodings?.length) return;
+    for (const encoding of parameters.encodings) encoding.maxBitrate = 64_000;
+    await sender.setParameters(parameters);
+  } catch (error) {
+    console.warn('[webrtc] audio bitrate cap unavailable:', error);
+  }
+}
 
 function noteRemote(msg: string) {
   lastRemoteMsg = msg;
@@ -1454,7 +1503,8 @@ async function ensurePetMedia(): Promise<MediaStream> {
       });
       console.log('[webrtc] captured screen via getDisplayMedia');
     } catch (error: any) {
-      throw new Error(`屏幕采集失败：${error?.message || error}`);
+      console.warn('[webrtc] screen capture unavailable; continuing audio-only:', error);
+      emitMediaStatus('screen', 'unavailable', 'capture_failed');
     }
   }
 
@@ -1468,23 +1518,27 @@ async function ensurePetMedia(): Promise<MediaStream> {
   });
   console.log('[webrtc] captured microphone');
 
-  const systemTracks = rtcScreenStream.getAudioTracks();
+  const systemTracks = rtcScreenStream?.getAudioTracks() ?? [];
   if (systemTracks.length) {
     console.log('[webrtc] captured separate microphone and system audio tracks');
   } else {
     console.warn('[webrtc] system audio unavailable; sending microphone only');
   }
 
-  const screenTrack = rtcScreenStream.getVideoTracks()[0];
+  const screenTrack = rtcScreenStream?.getVideoTracks()[0];
   if (screenTrack) {
+    screenTrack.enabled = false;
     screenTrack.addEventListener('ended', () => {
-      reportRtcError('屏幕共享结束了');
-      cleanupRtc(true);
+      emitMediaStatus('screen', 'unavailable', 'track_ended');
+      showReply('屏幕共享结束，音频继续', 3000);
     }, { once: true });
   }
 
+  emitMediaStatus('microphone', 'available');
+  emitMediaStatus('system-audio', systemTracks.length ? 'available' : 'unavailable');
+
   return new MediaStream([
-    ...rtcScreenStream.getVideoTracks(),
+    ...(rtcScreenStream?.getVideoTracks() ?? []),
     ...rtcMicStream.getAudioTracks(),
     ...systemTracks,
   ]);
@@ -1506,10 +1560,13 @@ async function flushRtcCandidates() {
 async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   if (rtcPc) return rtcPc;
   const media = await ensurePetMedia();
-  const pc = new RTCPeerConnection(RTC_CONFIG);
+  const pc = new RTCPeerConnection(await requestRtcConfig());
   rtcPc = pc;
 
-  for (const track of media.getTracks()) pc.addTrack(track, media);
+  for (const track of media.getTracks()) {
+    const sender = pc.addTrack(track, media);
+    if (track.kind === 'audio') void capAudioSender(sender);
+  }
   console.log('[webrtc] pet added local tracks', media.getTracks().map((t) => ({
     kind: t.kind,
     id: t.id,
@@ -1546,10 +1603,19 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState;
     console.log('[webrtc] pet connection state:', state);
-    if (state === 'connected') noteRemote('call on');
-    if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-      cleanupRtc(state !== 'closed');
-      if (state !== 'closed') showReply('通话断开了', 2500);
+    if (state === 'connected') {
+      noteRemote('call on');
+      selectedPairUsesRelay(pc).then((relayed) => {
+        const screenTrack = rtcScreenStream?.getVideoTracks()[0];
+        if (screenTrack) screenTrack.enabled = !relayed;
+        emitMediaStatus('screen', relayed ? 'paused' : screenTrack ? 'available' : 'unavailable', relayed ? 'relay_audio_only' : undefined);
+      }).catch((error) => console.warn('[webrtc] route inspection failed:', error));
+    }
+    if (state === 'failed' || state === 'disconnected') {
+      showReply('网络波动，等待通话恢复…', 2500);
+    }
+    if (state === 'closed') {
+      cleanupRtc(false);
     }
   };
 

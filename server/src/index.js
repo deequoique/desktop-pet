@@ -2,12 +2,41 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { Readable } from 'stream';
 import { Server as SocketIOServer } from 'socket.io';
 import WebSocket from 'ws';
 
 const PORT = process.env.PORT || 3030;
+
+function csvEnv(name) {
+  return String(process.env[name] || '').split(',').map((value) => value.trim()).filter(Boolean);
+}
+
+const RTC_STUN_URLS = csvEnv('RTC_STUN_URLS');
+const RTC_TURN_URLS = csvEnv('RTC_TURN_URLS');
+const RTC_TURN_SHARED_SECRET = String(process.env.RTC_TURN_SHARED_SECRET || '').trim();
+const RTC_TURN_REALM = String(process.env.RTC_TURN_REALM || '').trim();
+const RTC_TURN_CREDENTIAL_TTL_SEC = Math.max(300, Number(process.env.RTC_TURN_CREDENTIAL_TTL_SEC || 43_200));
+const RTC_ICE_TRANSPORT_POLICY = process.env.RTC_ICE_TRANSPORT_POLICY === 'relay' ? 'relay' : 'all';
+
+function rtcConfigFor(participantId) {
+  const iceServers = [];
+  if (RTC_STUN_URLS.length) iceServers.push({ urls: RTC_STUN_URLS });
+  let expiresAt;
+  if (RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET) {
+    const expiry = Math.floor(Date.now() / 1000) + RTC_TURN_CREDENTIAL_TTL_SEC;
+    const username = `${expiry}:${participantId}`;
+    const credential = createHmac('sha1', RTC_TURN_SHARED_SECRET).update(username).digest('base64');
+    expiresAt = expiry * 1000;
+    iceServers.push({ urls: RTC_TURN_URLS, username, credential });
+  }
+  return {
+    iceServers,
+    iceTransportPolicy: RTC_ICE_TRANSPORT_POLICY,
+    ...(expiresAt ? { expiresAt } : {}),
+  };
+}
 
 // === TTS providers ===
 const TTS_PROVIDER = String(process.env.TTS_PROVIDER || 'elevenlabs').trim().toLowerCase();
@@ -707,6 +736,31 @@ io.on('connection', (socket) => {
     io.to(targetId).emit('webrtc:signal', payload);
   });
 
+  socket.on('webrtc:get-config', (ack) => {
+    if (typeof ack !== 'function') return;
+    if (!roomForSocket(socket)) {
+      ack({ ok: false, code: 'not_joined' });
+      return;
+    }
+    ack({ ok: true, ...rtcConfigFor(socket.data.participantId) });
+  });
+
+  socket.on('webrtc:media-status', (payload) => {
+    const room = roomForSocket(socket);
+    if (!room || socket.data?.role !== 'pet' || payload?.callId !== room.callId) return;
+    const media = String(payload?.media || '');
+    const state = String(payload?.state || '');
+    if (!['screen', 'microphone', 'system-audio'].includes(media)) return;
+    if (!['available', 'paused', 'unavailable'].includes(state)) return;
+    const targetId = otherParticipant(room, socket.data.participantId)?.controller;
+    if (!targetId) return;
+    const allowedReasons = new Set(['relay_audio_only', 'capture_failed', 'track_ended']);
+    const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
+    io.to(targetId).emit('webrtc:media-status', {
+      callId: room.callId, media, state, ...(reason ? { reason } : {}),
+    });
+  });
+
   socket.on('call:start', (ack) => {
     const room = roomForSocket(socket);
     if (!room || socket.data?.role !== 'controller') return;
@@ -770,4 +824,5 @@ httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);
   console.log(`  tts:    ${managedTtsReady() ? `${TTS_PROVIDER} managed (${managedTtsModel()}, voices=${ALLOWED_VOICES.length})` : `${TTS_PROVIDER} managed disabled`}${TTS_PROVIDER === 'elevenlabs' ? '; BYOK available' : ''}`);
   console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
+  console.log(`  rtc:    stun=${RTC_STUN_URLS.length} turn=${RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET ? RTC_TURN_URLS.length : 0} policy=${RTC_ICE_TRANSPORT_POLICY}${RTC_TURN_REALM ? ` realm=${RTC_TURN_REALM}` : ''}`);
 });

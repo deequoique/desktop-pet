@@ -34,6 +34,13 @@ export type WebRtcSignal = {
   description?: RTCSessionDescriptionInit | null;
   candidate?: RTCIceCandidateInit | null;
 };
+export type RtcConfig = { iceServers: RTCIceServer[]; iceTransportPolicy: RTCIceTransportPolicy; expiresAt?: number };
+export type MediaStatus = {
+  callId: string;
+  media: 'screen' | 'microphone' | 'system-audio';
+  state: 'available' | 'paused' | 'unavailable';
+  reason?: 'relay_audio_only' | 'capture_failed' | 'track_ended';
+};
 
 export type Listeners = {
   onStatus?: (s: 'connecting' | 'connected' | 'disconnected' | 'rejected') => void;
@@ -42,6 +49,7 @@ export type Listeners = {
   onSignal?: (signal: WebRtcSignal) => void;
   onHangup?: () => void;
   onRtcError?: (msg: string) => void;
+  onMediaStatus?: (status: MediaStatus) => void;
   onCallStart?: (callId: string) => void;
   onCallEnd?: (callId?: string, reason?: string) => void;
   onTtsStatus?: (status: TtsStatus) => void;
@@ -99,6 +107,7 @@ export function connect(serverUrl: string, secret: string, participantId: string
   s.on('webrtc:error', (payload: { message?: string }) => {
     listeners.onRtcError?.(payload?.message || '通话出错');
   });
+  s.on('webrtc:media-status', (payload: MediaStatus) => listeners.onMediaStatus?.(payload));
   s.on('call:start', (payload: { callId?: string }) => {
     if (payload?.callId) listeners.onCallStart?.(payload.callId);
   });
@@ -156,6 +165,21 @@ export function sendSignal(signal: WebRtcSignal): boolean {
   if (!socket || !socket.connected) return false;
   socket.emit('webrtc:signal', signal);
   return true;
+}
+
+export function requestRtcConfig(): Promise<RtcConfig> {
+  return new Promise((resolve) => {
+    const fallback: RtcConfig = { iceServers: [], iceTransportPolicy: 'all' };
+    if (!socket?.connected) return resolve(fallback);
+    socket.timeout(4000).emit('webrtc:get-config', (err: Error | null, response: any) => {
+      if (err || !response?.ok) resolve(fallback);
+      else resolve({
+        iceServers: Array.isArray(response.iceServers) ? response.iceServers : [],
+        iceTransportPolicy: response.iceTransportPolicy === 'relay' ? 'relay' : 'all',
+        expiresAt: response.expiresAt,
+      });
+    });
+  });
 }
 
 export function sendHangup(): boolean {

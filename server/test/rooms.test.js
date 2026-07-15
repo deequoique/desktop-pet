@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import { io } from 'socket.io-client';
 
 const port = 31_000 + Math.floor(Math.random() * 2_000);
@@ -31,7 +32,13 @@ async function join({ secret = 'alpha', role, participantId }) {
 async function setup() {
   server = spawn(process.execPath, ['src/index.js'], {
     cwd: new URL('..', import.meta.url),
-    env: { ...process.env, PORT: String(port), ROOM_SECRETS: 'alpha,beta', ROOM_GRACE_MS: '80' },
+    env: {
+      ...process.env, PORT: String(port), ROOM_SECRETS: 'alpha,beta', ROOM_GRACE_MS: '80',
+      RTC_STUN_URLS: 'stun:rtc.example.test:3478',
+      RTC_TURN_URLS: 'turn:rtc.example.test:3478?transport=udp,turn:rtc.example.test:3478?transport=tcp',
+      RTC_TURN_SHARED_SECRET: 'test-turn-secret', RTC_TURN_REALM: 'rtc.example.test',
+      RTC_TURN_CREDENTIAL_TTL_SEC: '600', RTC_ICE_TRANSPORT_POLICY: 'relay',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve, reject) => {
@@ -92,6 +99,24 @@ test('participant endpoints share one slot; third participant is rejected', asyn
   const validSignal = once(bPetReplacement.socket, 'webrtc:signal');
   aController.socket.emit('webrtc:signal', { callId, candidate: { candidate: 'ok' } });
   assert.equal((await validSignal).callId, callId);
+
+  const rtcConfig = await new Promise((resolve) => aController.socket.emit('webrtc:get-config', resolve));
+  assert.equal(rtcConfig.ok, true);
+  assert.equal(rtcConfig.iceTransportPolicy, 'relay');
+  assert.deepEqual(rtcConfig.iceServers[0].urls, ['stun:rtc.example.test:3478']);
+  const turn = rtcConfig.iceServers[1];
+  assert.equal(turn.urls.length, 2);
+  assert.match(turn.username, /^\d+:a$/);
+  assert.equal(turn.credential, createHmac('sha1', 'test-turn-secret').update(turn.username).digest('base64'));
+  assert.ok(rtcConfig.expiresAt > Date.now());
+
+  const mediaStatus = once(bController.socket, 'webrtc:media-status');
+  aPet.socket.emit('webrtc:media-status', {
+    callId, media: 'screen', state: 'paused', reason: 'relay_audio_only',
+  });
+  assert.deepEqual(await mediaStatus, {
+    callId, media: 'screen', state: 'paused', reason: 'relay_audio_only',
+  });
 
   for (const item of [aPet, aController, bPet, bPetReplacement, bController, third]) item.socket.disconnect();
   await wait(120);

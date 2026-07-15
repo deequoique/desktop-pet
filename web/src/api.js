@@ -47,6 +47,7 @@ export function connect(serverUrl, secret, participantId) {
     s.on('webrtc:error', (payload) => {
         listeners.onRtcError?.(payload?.message || '通话出错');
     });
+    s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('call:start', (payload) => {
         if (payload?.callId)
             listeners.onCallStart?.(payload.callId);
@@ -112,6 +113,23 @@ export function sendSignal(signal) {
         return false;
     socket.emit('webrtc:signal', signal);
     return true;
+}
+export function requestRtcConfig() {
+    return new Promise((resolve) => {
+        const fallback = { iceServers: [], iceTransportPolicy: 'all' };
+        if (!socket?.connected)
+            return resolve(fallback);
+        socket.timeout(4000).emit('webrtc:get-config', (err, response) => {
+            if (err || !response?.ok)
+                resolve(fallback);
+            else
+                resolve({
+                    iceServers: Array.isArray(response.iceServers) ? response.iceServers : [],
+                    iceTransportPolicy: response.iceTransportPolicy === 'relay' ? 'relay' : 'all',
+                    expiresAt: response.expiresAt,
+                });
+        });
+    });
 }
 export function sendHangup() {
     if (!socket || !socket.connected)
