@@ -246,3 +246,38 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: Fix quick interactions and sprite motion mapping
+
+**Date**: 2026-07-17
+**Task**: Fix quick interactions and sprite motion mapping
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+快捷互动只展示远端真实动作；开心/委屈与 sprite 资源语义对齐；增加按压反馈，并让正式版可发现后续 Beta。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ae58d9d` | (see git log) |
+| `dae1532` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
