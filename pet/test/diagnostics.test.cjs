@@ -23,10 +23,10 @@ test('clampScale accepts finite values and rejects invalid input', () => {
 test('clampBoundsToWorkArea keeps a window visible', () => {
   assert.deepEqual(
     clampBoundsToWorkArea(
-      { x: 1900, y: 1000, width: 360, height: 480 },
+      { x: 1900, y: 1000, width: 180, height: 240 },
       { x: 0, y: 0, width: 1920, height: 1080 },
     ),
-    { x: 1560, y: 600, width: 360, height: 480 },
+    { x: 1740, y: 840, width: 180, height: 240 },
   );
 });
 

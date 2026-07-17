@@ -27,8 +27,9 @@ if (process.platform === 'win32') app.setAppUserModelId('com.deequoique.desktop-
 const TASKBAR_ICON = path.join(__dirname, 'assets', process.platform === 'win32' ? 'taskbar.ico' : 'taskbar.png');
 
 // scale=1 的基准尺寸；实际窗口 = 基准 * scale。
-const PET_W = 360;
-const PET_H = 480;
+// v1.4 起基准缩小为旧版的一半，保留已有 scale 档位与持久值语义。
+const PET_W = 180;
+const PET_H = 240;
 const MIN_SCALE = 0.3;
 const MAX_SCALE = 1.5;
 

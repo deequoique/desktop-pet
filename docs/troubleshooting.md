@@ -4,6 +4,7 @@
 
 - “房间已满”：该密钥已有两个不同 participant。关闭多余实例后等待 30 秒宽限期再试。
 - macOS 看不到控制面板：点击系统顶部菜单栏的桌宠托盘图标，选择“打开控制面板”；也可按 `Ctrl+Alt+P`。
+- macOS 提示“无法验证开发者”或“应用已损坏”：按[未签名 macOS 应用](./releases.md#未签名-macos-应用)中的 Terminal 脚本移除该应用的 quarantine 属性，不要全局关闭 Gatekeeper。
 - 修改服务器或密钥后，本机 pet 与 controller 会同时断开旧房间并重连。
 
 ## 窗口缩放与诊断

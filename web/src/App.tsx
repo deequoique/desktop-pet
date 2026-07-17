@@ -46,6 +46,7 @@ const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
 const LS_TARGET_DEVICE = 'pet.targetDeviceId';
 const LS_TARGET_DEVICES = 'pet.targetDeviceIds';
+const LS_MEMBER_NAMES = 'pet.memberNames';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
@@ -124,6 +125,15 @@ function normalizeTargets(devices: PeerDevice[], saved: string[]): string[] {
   if (retained.length) return retained;
   const newest = [...online].sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt))[0];
   return newest ? [newest.id] : [];
+}
+
+function readMemberNames(): Record<'a' | 'b', string> {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_MEMBER_NAMES) || '{}');
+    return { a: String(saved.a || '用户 A'), b: String(saved.b || '用户 B') };
+  } catch {
+    return { a: '用户 A', b: '用户 B' };
+  }
 }
 
 function explainMediaDevicesUnavailable(): string {
@@ -225,6 +235,7 @@ export default function App() {
   const [expandedMotions, setExpandedMotions] = useState(false);
   const [editingMemberId, setEditingMemberId] = useState<'a' | 'b' | null>(null);
   const [memberNameDraft, setMemberNameDraft] = useState('');
+  const [knownMemberNames, setKnownMemberNames] = useState(readMemberNames);
   const [editingAudioId, setEditingAudioId] = useState<string | null>(null);
   const [audioNameDraft, setAudioNameDraft] = useState('');
   const [deleteAudioId, setDeleteAudioId] = useState<string | null>(null);
@@ -541,6 +552,12 @@ export default function App() {
       onStatus: setStatus,
       onPeers: (next) => {
         setPeers(next);
+        const names = {
+          a: next.members.find((member) => member.id === 'a')?.displayName || '用户 A',
+          b: next.members.find((member) => member.id === 'b')?.displayName || '用户 B',
+        };
+        setKnownMemberNames(names);
+        localStorage.setItem(LS_MEMBER_NAMES, JSON.stringify(names));
         const peer = next.members.find((member) => member.id !== next.self.memberId);
         if (!peer) return;
         setTargetIds((current) => {
@@ -1149,7 +1166,7 @@ export default function App() {
         {activeView === 'settings' && (
           <main className="page settings-page">
             <div className="page-heading"><h1>设置</h1></div>
-            <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>我的身份<select value={memberId} onChange={(event) => setMemberId(event.target.value as 'a' | 'b')} disabled={status === 'connecting' || status === 'connected'}><option value="a">用户 A</option><option value="b">用户 B</option></select></label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div><div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" onClick={() => void onConnect()}>连接</button>}</div></section>
+            <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>我的身份<select value={memberId} onChange={(event) => setMemberId(event.target.value as 'a' | 'b')} disabled={status === 'connecting' || status === 'connected'}><option value="a">{knownMemberNames.a}</option><option value="b">{knownMemberNames.b}</option></select></label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div><div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" disabled={!serverUrl.trim() || !secret.trim() || !deviceName.trim()} onClick={() => void onConnect()}>连接</button>}</div></section>
             <section className="card settings-section"><h2>成员名称</h2>{peers.members.map((member) => <div className="member-row" key={member.id}><span>{member.id === peers.self.memberId ? '我' : '对方'}</span>{editingMemberId === member.id ? <><input value={memberNameDraft} onChange={(event) => setMemberNameDraft(event.target.value)} /><button onClick={async () => { if (memberNameDraft.trim()) await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }}>保存</button><button onClick={() => setEditingMemberId(null)}>取消</button></> : <><strong>{member.displayName}</strong><button onClick={() => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }}>修改</button></>}</div>)}</section>
             <section className="card settings-section"><h2>设备</h2>{peers.members.map((member) => <div className="device-group" key={member.id}><h3>{member.displayName}</h3>{member.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-signal ${device.petOnline ? 'online' : ''}`} /><div><strong>{device.name}{device.id === peers.self.deviceId ? ' · 本机' : ''}</strong><small>桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · {new Date(device.lastSeenAt).toLocaleString()}</small></div>{member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? <span className="inline-confirm"><button onClick={async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }}>确认认领</button><button onClick={() => setReclaimCandidate(null)}>取消</button></span> : <button onClick={() => setReclaimCandidate(device)}>认领为本机</button>)}</div>)}</div>)}</section>
             {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button><button onClick={() => void exportDiagnostics()}>导出诊断日志</button></div></section>}

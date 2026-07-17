@@ -61,7 +61,7 @@ webContents.send('pet:scale-changed', actualScale);
 ### 3. 契约
 
 - scale 输入转为有限数值并 clamp 到 0.3–1.5；非法值回退到 1。
-- 主进程以 360×480 DIP 为基准计算 bounds，底部中心锚定并 clamp 到匹配 display 的 workArea。
+- 主进程以 180×240 DIP 为基准计算 bounds（旧版 360×480 的一半），底部中心锚定并 clamp 到匹配 display 的 workArea；scale 百分比及其持久值语义保持不变。
 - `setBounds` 后读取实际 bounds，以实际宽度重新计算并持久化 scale，再广播给两个 renderer。
 - 诊断 JSONL 位于 Electron `userData/logs/`，有限轮转；只在用户调用导出时弹出保存对话框，不自动上传。
 - 日志/导出允许包含应用版本、OS/Electron 版本、display bounds/workArea/scaleFactor、窗口 bounds 和非敏感 pet-state；禁止包含 room secret、API key、credential、Socket.IO payload 或音频二进制。
