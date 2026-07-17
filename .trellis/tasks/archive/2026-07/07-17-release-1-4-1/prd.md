@@ -18,10 +18,10 @@
 
 - [x] AC1：版本文件、发布文档和 release notes 均标记 `1.4.1` / `v1.4.1`。
 - [x] AC2：所有发布质量门通过，工作区在创建 tag 前无未提交发布内容。
-- [ ] AC3：`master` 和 annotated tag `v1.4.1` 已推送到 origin。
-- [ ] AC4：GitHub Actions Windows、macOS、Linux server 三段成功完成。
-- [ ] AC5：GitHub Release `v1.4.1` 为正式发布，Windows、两种 Mac 架构和 Linux server 资产均可见。
-- [ ] AC6：最终发布说明已写入 Release 页面，下载文件名与实际资产一致。
+- [x] AC3：`master` 和 annotated tag `v1.4.1` 已推送到 origin。
+- [x] AC4：GitHub Actions Windows、macOS、Linux server 三段成功完成。
+- [x] AC5：GitHub Release `v1.4.1` 为正式发布，Windows、两种 Mac 架构和 Linux server 资产均可见。
+- [x] AC6：最终发布说明已写入 Release 页面，下载文件名与实际资产一致。
 
 ## Constraints
 
