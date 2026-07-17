@@ -43,6 +43,7 @@ type RtcRoute = {
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
+const LS_TARGET_DEVICE = 'pet.targetDeviceId';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
@@ -194,7 +195,7 @@ export default function App() {
   const [participantId, setParticipantId] = useState(localParticipantId);
   const [memberId, setMemberId] = useState<'a' | 'b'>('a');
   const [deviceName, setDeviceName] = useState('浏览器');
-  const [targetId, setTargetId] = useState('');
+  const [targetId, setTargetId] = useState(() => localStorage.getItem(LS_TARGET_DEVICE) || '');
   const [peers, setPeers] = useState<Peers>({
     protocolVersion: 2, self: { memberId: 'a', deviceId: '' }, members: [],
     selfReady: false, peerOnline: false, peerPetOnline: false, peerControllerOnline: false,
@@ -505,9 +506,11 @@ export default function App() {
       onStatus: setStatus,
       onPeers: (next) => {
         setPeers(next);
-        const devices = next.members.find((member) => member.id !== next.self.memberId)?.devices.filter((device) => device.petOnline) || [];
+        const devices = next.members.find((member) => member.id !== next.self.memberId)?.devices || [];
         setTargetId((current) => {
-          const selected = devices.some((device) => device.id === current) ? current : devices.length === 1 ? devices[0].id : current;
+          const onlineDevices = devices.filter((device) => device.petOnline);
+          const selected = current || (onlineDevices.length === 1 ? onlineDevices[0].id : '');
+          if (selected) localStorage.setItem(LS_TARGET_DEVICE, selected);
           setTargetDevice(selected);
           return selected;
         });
@@ -946,7 +949,13 @@ export default function App() {
       <div className="status-bar">
         <div className="status-row">
           <label>目标设备</label>
-          <select value={targetId} onChange={(event) => { setTargetId(event.target.value); setTargetDevice(event.target.value); }}>
+          <select value={targetId} onChange={(event) => {
+            const selected = event.target.value;
+            setTargetId(selected);
+            setTargetDevice(selected);
+            if (selected) localStorage.setItem(LS_TARGET_DEVICE, selected);
+            else localStorage.removeItem(LS_TARGET_DEVICE);
+          }}>
             <option value="">请选择对方设备</option>
             {peers.members.find((member) => member.id !== peers.self.memberId)?.devices.map((device) => (
               <option key={device.id} value={device.id}>{device.name} · 桌宠{device.petOnline ? '在线' : '离线'} / 控制端{device.controllerOnline ? '在线' : '离线'}</option>

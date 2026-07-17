@@ -3,7 +3,7 @@
   "name": "fix-room-presence-and-simplify-panel",
   "title": "修复房间在线状态并精简控制面板",
   "description": "",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": "desktop-pet",

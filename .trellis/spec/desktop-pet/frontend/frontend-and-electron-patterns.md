@@ -37,7 +37,7 @@ BrowserWindow 保持 `contextIsolation: true` 和 `nodeIntegration: false`。新
 
 cursor、drag 等高频事件式操作使用 `send`；pairing config、scale、声音发现、凭据和桌面 source 等需要结果的操作使用 `invoke`。
 
-Electron 负责持久化 pairing 和加密 BYOK 凭据。独立 web 模式只用 `localStorage` 保存非敏感偏好，不能持久化 API key；必须保留这一区别。
+Electron 负责持久化 pairing 和加密 BYOK 凭据。独立 web 入口已废弃，不是发布或验收目标；现有浏览器 fallback 仅可作为开发调试兼容层，不应为其新增产品功能或阻塞 Electron 交付。
 
 ## 场景：桌宠窗口缩放与本地诊断导出
 
@@ -80,7 +80,7 @@ webContents.send('pet:scale-changed', actualScale);
 ### 5. 正常、基准与错误案例
 
 - 正常：控制面板把 scale 改为 0.8，main 应用实际 bounds、保存 0.8，并让浮层与控制面板同时更新。
-- 基准：独立浏览器没有 Electron bridge，因此隐藏本机桌宠缩放/导出 UI，远程控制仍正常。
+- 基准：Electron bridge 不可用时隐藏本机桌宠缩放/导出 UI；该 fallback 只服务开发调试。
 - 错误：renderer 自己保存 currentScale 并直接假设 `setBounds` 成功，导致 Windows DPI/实际 bounds 与 UI 显示分叉。
 
 ### 6. 必需测试

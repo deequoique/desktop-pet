@@ -64,9 +64,10 @@ try {
 
   const audio = Buffer.from('test-audio');
   const added = await new Promise((resolve) => aController.socket.emit('audio:add', {
-    name: '问候', mime: 'audio/mpeg', durationMs: 1000, data: audio,
+    name: '问候', mime: 'audio/webm;codecs=opus', durationMs: 1000, data: audio,
   }, resolve));
   assert.equal(added.ok, true);
+  assert.equal(added.item.mime, 'audio/webm');
   const ownList = await new Promise((resolve) => aController.socket.emit('audio:list', resolve));
   const otherList = await new Promise((resolve) => bController1.socket.emit('audio:list', resolve));
   assert.equal(ownList.items.length, 1);

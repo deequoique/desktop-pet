@@ -22,7 +22,7 @@ Electron IPC：renderer → preload bridge → Electron main → OS/文件系统
 - server 如何从已认证状态推导目标？
 - 成功、拒绝、超时、断线分别如何反馈？
 - 哪些资源必须在结束时释放？
-- Electron 与独立浏览器模式是否有不同路径？
+- Electron main、preload 与两个 renderer 是否形成完整路径？
 
 ## 边界检查
 
@@ -83,14 +83,14 @@ Electron IPC：renderer → preload bridge → Electron main → OS/文件系统
 - 可视 UI 状态在 React `App`。
 - `RTCPeerConnection`、`MediaStream` 和 DOM media resource 保存在对应 renderer 的 ref/module state。
 - 配对与 secure credential 的持久化由 Electron main 负责。
-- 独立浏览器只保存非敏感本地偏好。
+- 独立浏览器 fallback 已废弃为产品入口，只能作为开发调试兼容层。
 
 ## 完成后验证
 
 - [ ] 正常路径和拒绝路径都有验证。
 - [ ] 不会向自己或其他房间泄漏事件。
 - [ ] 超时、断线和重连行为保持一致。
-- [ ] Electron 内置 controller 与独立浏览器差异已考虑。
+- [ ] Electron 内置 controller 与 pet renderer 的 main/preload/renderer 路径均已验证。
 - [ ] 所有 listener、timer、track、stream、audio 和 peer connection 都有清理路径。
 - [ ] 所有本地契约副本已同步。
 

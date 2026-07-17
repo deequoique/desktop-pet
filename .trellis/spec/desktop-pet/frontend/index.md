@@ -12,7 +12,7 @@
 
 - web 的 socket 操作必须经过 `web/src/api.ts`；OS 能力必须经过 preload bridge。
 - listener、timer、track、stream 和 peer connection 必须在创建它们的同一生命周期中清理。
-- 共享 renderer/control 代码要保留独立浏览器降级行为。
+- Electron 内置 controller 是产品目标；独立浏览器 fallback 只作开发调试兼容，不为其新增产品功能。
 - 运行 `npm run build:web` 和 `npm run build:pet`。
 
 ## 规范索引

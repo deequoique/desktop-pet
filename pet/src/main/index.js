@@ -789,7 +789,7 @@ function onUnhandledRejection(reason) {
 }
 
 app.whenReady().then(() => {
-  ensureParticipantId();
+  ensureDeviceId();
   ensureDefaultLaunchAtStartup();
   createWindow();
   createControlWindow();

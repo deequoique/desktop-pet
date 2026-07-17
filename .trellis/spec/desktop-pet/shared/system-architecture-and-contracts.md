@@ -13,24 +13,25 @@
 
 除非任务明确针对 Unity 方向，否则不要把普通产品功能写入 `Mate-Engine/`。
 
-## 参与者与房间模型
+## 成员、设备与房间模型
 
-每个已安装客户端使用同一个稳定 `participantId` 提供两个 Socket.IO endpoint：`pet/src/renderer/main.ts` 建立 `pet` endpoint，`web/src/api.ts` 建立 `controller` endpoint。Electron main process 把稳定 ID 写入 `userData` 下的 pairing 文件；独立浏览器模式则写入 `localStorage`。
+每个安装使用稳定 `deviceId`，并由用户选择固定 `memberId: 'a' | 'b'`。同一设备的 pet renderer 和 Electron 内置 controller 分别建立 `pet` / `controller` endpoint，server 按 member→device→endpoint 组织在线状态。Electron main 将身份写入 `userData/pairing.json`，首次升级把旧 `participantId` 原值迁移为 `deviceId`。
 
-server 对配置的房间密钥做 hash，并且只保存 hash。每个房间最多两个参与者，每个参与者的每种角色最多一个 socket。同一角色重连时，只替换该参与者之前的 socket。命令和查询通过 `otherParticipant(...)` 路由，不能回发给发送者。这些不变量实现在 `server/src/index.js`，并由 `server/test/rooms.test.js` 覆盖。
+server 对房间密钥做 hash，只保留 hash。一个房间固定两名成员，每名成员可以登记多台设备；同设备同 role 重连只替换自己的旧 socket。控制、TTS、个人音频和通话必须携带选定的 `targetDeviceId`，server 再从已认证 member 推导另一成员目标，不能广播或回发给自己。
 
 修改 pairing 或 presence 时：
 
-- pet 和内置 controller 必须使用同一个稳定 `participantId`。
-- `room:peers` 始终从当前参与者视角返回；兼容字段 `pet` 和 `controller` 表示远端 endpoint。
-- 完全断线的参与者仍应保留 grace period 后再释放位置。
-- 除非任务明确移除兼容性，否则保留未发送 `participantId` 的旧客户端行为。
+- pet 和内置 controller 必须使用相同 `memberId + deviceId`。
+- `room:peers` 返回 self、A/B member displayName、持久设备列表以及各设备 pet/controller 在线状态。
+- `peerOnline` 只表示另一成员至少一个 controller 在线；pet-only 不代表用户在线。
+- 目标设备选择保留并持久化；已有目标离线时保持选择并禁用发送，不静默切换。只有尚无选择且恰好一个目标 pet 在线时才自动选择。
+- v2 不兼容旧协议；缺少 v2 identity 的客户端必须收到 `upgrade_required`。
 
 ## 通信数据流
 
 ### 命令与 request/reply
 
-控制面板调用 `web/src/api.ts` 中的 typed 函数。fire-and-forget 命令使用 `pet:command`；`pet:list-motions`、`pet:list-voices` 等查询使用带明确超时的 acknowledgement callback。`server/src/index.js` 校验发送方角色，只转发给另一个参与者的 pet。`pet/src/renderer/main.ts` 把 discriminated `RemoteCommand` union 映射到现有 renderer action。
+控制面板调用 `web/src/api.ts` 中的 typed 函数。fire-and-forget 命令使用 `pet:command`；`pet:list-motions` 等查询使用带明确超时的 acknowledgement callback。`server/src/index.js` 校验发送方角色和目标设备，只转发给另一成员选定设备的 pet。`pet/src/renderer/main.ts` 把 discriminated `RemoteCommand` union 映射到现有 renderer action。
 
 需要成功或错误结果的操作使用 acknowledgement。payload 中保留稳定字符串错误码，由 UI 转换为面向用户的文本。
 
@@ -50,7 +51,7 @@ TTS 把控制通道与音频数据分开。controller 通过 Socket.IO 请求 jo
 
 OS 级能力留在 `pet/src/main/index.js`。两个 preload 文件通过 `contextBridge` 暴露窄 API；两个 BrowserWindow 都保持 `contextIsolation: true` 和 `nodeIntegration: false`。renderer 在 TypeScript 中声明 bridge shape，并通过 bridge 调用能力，不能直接导入 Node 或 Electron。
 
-`pet/src/renderer/main.ts` 还提供 `browserPetBridge` fallback。新增 bridge 时必须同步更新 main-process handler、对应 preload 暴露、renderer `Window` type；若独立浏览器运行仍有意义，还要更新 fallback。
+`pet/src/renderer/main.ts` 还保留 `browserPetBridge` 开发 fallback，但独立浏览器已不是产品或验收入口。新增 bridge 必须同步更新 main-process handler、对应 preload 暴露和 renderer `Window` type；只需保证 fallback 安全降级，不为其新增产品能力。
 
 ## 场景：扩展 Socket.IO 契约
 
@@ -64,23 +65,23 @@ OS 级能力留在 `pet/src/main/index.js`。两个 preload 文件通过 `contex
 
 ```ts
 // controller -> server，返回 acknowledgement 结果
-socket.emit('pet:join', { secret, role: 'controller', participantId }, ack);
+socket.emit('pet:join', { protocolVersion: 2, secret, role: 'controller', memberId, deviceId, deviceName }, ack);
 
 // controller -> 另一参与者的 pet
-socket.emit('pet:command', command);
+socket.emit('pet:command', { ...command, targetDeviceId });
 
 // 任一 WebRTC peer -> server -> 远端相反角色
-socket.emit('webrtc:signal', { callId, description?, candidate? });
+socket.emit('webrtc:signal', { callId, targetDeviceId, description?, candidate? });
 ```
 
 request/reply 事件的 server handler 接收 `(payload, ack)`；fire-and-forget 转发接收 `(payload)`。UI 需要结果时，`web/src/api.ts` 中的 client wrapper 把 acknowledgement 事件转换为 typed Promise。
 
 ### 3. 契约
 
-- `pet:join` request：`secret: string`、`role: 'controller' | 'pet'`，以及可选且兼容旧客户端的 `participantId: string`；后者最多 128 个字符。
+- `pet:join` request：`protocolVersion: 2`、`secret: string`、`role: 'controller' | 'pet'`、`memberId: 'a' | 'b'`、稳定 `deviceId` 和可编辑 `deviceName`。
 - `pet:join` acknowledgement：`{ ok: true, peers }` 或 `{ ok: false, code, error }`。
-- `pet:command`：`expression | animation | say_audio | relocate` discriminated union；定义在 `web/src/api.ts`，并在 `pet/src/renderer/main.ts` 镜像为 `RemoteCommand`。
-- `webrtc:signal`：可选 `callId`、`description`、`candidate`；只要提供 `callId`，就必须等于房间当前 call。
+- `pet:command`：`expression | animation | say_audio | relocate` discriminated union，controller payload 还必须携带 `targetDeviceId`；server 转发前移除目标字段。
+- `webrtc:signal`：可选 `callId`、`targetDeviceId`、`description`、`candidate`；call 存在时只能在绑定的两台设备间转发。
 - 房间环境变量：`ROOM_SECRETS` 是逗号分隔 allowlist；`ROOM_SECRET` 是单房间兼容 fallback；`ROOM_GRACE_MS` 控制参与者释放延迟。
 
 ### 4. 校验与错误矩阵
@@ -89,16 +90,17 @@ request/reply 事件的 server handler 接收 `(payload, ack)`；fire-and-forget
 | --- | --- |
 | secret hash 未配置 | `pet:join` ack 返回 `bad_secret` |
 | role 不是 `controller` 或 `pet` | `pet:join` ack 返回 `bad_role` |
-| 第三个参与者加入 | ack 返回 `room_full`，已有参与者保持连接 |
-| 同一参与者以相同 role 重连 | 新 socket 成功；旧 socket 收到带 `replaced` 的 `room:kicked` |
+| 非 v2、缺 member/device identity | `pet:join` ack 返回 `upgrade_required` |
+| memberId 不是 `a` / `b` | `pet:join` ack 返回 `upgrade_required` |
+| 同一设备以相同 role 重连 | 新 socket 成功；旧 socket 收到带 `replaced` 的 `room:kicked` |
 | controller 发命令时远端 pet 不在线 | 不转发，fire-and-forget handler 直接返回 |
 | WebRTC signal 带过期 `callId` | 不转发 |
 | request/reply 目标不存在或超时 | caller 收到该事件的中性结果，例如 `[]` |
 
 ### 5. 正常、基准与错误案例
 
-- 正常：两个 endpoint 复用同一个稳定参与者 ID，命令只到达另一参与者的 pet。
-- 基准：旧 controller 和 pet 不发送 `participantId`，仍通过兼容 role ID 配对。
+- 正常：同设备两个 endpoint 复用 `memberId + deviceId`，命令只到达所选另一成员设备的 pet。
+- 基准：当前没有目标且恰好一个对方 pet 在线时自动选择；已有离线目标不会切换。
 - 错误：客户端自行传入目标 socket 或 room 名，server 未从 `socket.data` 推导归属就直接转发。
 
 ### 6. 必需测试
@@ -113,7 +115,7 @@ io.to(payload.targetSocketId).emit('pet:command', payload.command);
 
 // 正确：从已认证的 socket 成员身份推导目标。
 const room = roomForSocket(socket);
-const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
+const petId = room && otherParticipant(room, socket.data.participantId, payload.targetDeviceId)?.pet;
 if (petId) io.to(petId).emit('pet:command', command);
 ```
 
@@ -137,4 +139,4 @@ npm run build:web
 npm run build:pet
 ```
 
-如果 bridge 或持久化路径在 Electron 内置 controller 与独立浏览器中行为不同，还要手动验证两种运行方式。
+涉及 bridge 或持久化时，手工验证 Electron 内置 controller 与 pet renderer；独立浏览器不纳入发布验收。
