@@ -143,3 +143,37 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 重构桌宠控制面板 UI 与交互
+
+**Date**: 2026-07-17
+**Task**: 重构桌宠控制面板 UI 与交互
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+重构 Electron 内置控制面板为控制、发送、通话、设置四区；加入多设备单选/多选发送和单设备通话目标；完成 Electron 视觉验收、server/pet 测试与 web/pet 构建。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `27fe72d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
