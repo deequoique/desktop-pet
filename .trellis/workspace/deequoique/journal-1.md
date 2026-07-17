@@ -177,3 +177,38 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: 发布 v1.4.1-beta.1
+
+**Date**: 2026-07-17
+**Task**: 发布 v1.4.1-beta.1
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+完成 1.4.1-beta.1 版本更新、全量本机验证、跨平台 GitHub Actions 发版与面向普通用户的活泼发布说明；Release 已作为 Pre-release 发布并包含 13 个资产。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `51508bb` | (see git log) |
+| `a1e5924` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
