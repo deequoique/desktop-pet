@@ -407,6 +407,7 @@ function checkForPetUpdates(manual = false) {
 function setupAutoUpdater() {
   if (!app.isPackaged || !autoUpdater) return;
 
+  autoUpdater.allowPrerelease = true;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
