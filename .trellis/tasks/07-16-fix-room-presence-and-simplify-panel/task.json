@@ -1,0 +1,29 @@
+{
+  "id": "fix-room-presence-and-simplify-panel",
+  "name": "fix-room-presence-and-simplify-panel",
+  "title": "修复房间在线状态并精简控制面板",
+  "description": "",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": "desktop-pet",
+  "priority": "P2",
+  "creator": "deequoique",
+  "assignee": "deequoique",
+  "createdAt": "2026-07-16",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "07-17-pet-scaling-and-diagnostics",
+    "07-17-multi-device-presence-and-personal-audio"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
