@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
+- **Total Sessions**: 7
 - **Last Active**: 2026-07-17
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~214 | Active |
+| `journal-1.md` | ~248 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-07-17 | Improve pairing onboarding | `c0ae3c1` | `master` |
 | 6 | 2026-07-17 | 发布 v1.4.1-beta.1 | `51508bb`, `a1e5924` | `master` |
 | 5 | 2026-07-17 | 重构桌宠控制面板 UI 与交互 | `27fe72d` | `master` |
 | 4 | 2026-07-17 | 父任务 Electron 集成验收 | `f85d691` | `master` |

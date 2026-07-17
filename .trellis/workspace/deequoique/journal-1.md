@@ -212,3 +212,37 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: Improve pairing onboarding
+
+**Date**: 2026-07-17
+**Task**: Improve pairing onboarding
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+设置成为控制面板默认首页；首次配对改为验证服务器后选择真实成员；新增可回滚的设备成员迁移并保持个人音频归属。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c0ae3c1` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
