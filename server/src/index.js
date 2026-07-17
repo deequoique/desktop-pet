@@ -525,6 +525,19 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
 });
 
 io.on('connection', (socket) => {
+  socket.on('pairing:discover', (data, ack) => {
+    if (data?.protocolVersion !== 2) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'upgrade_required' });
+      return;
+    }
+    const roomHash = hashSecret(String(data?.secret || ''));
+    if (!ROOM_SECRET_HASHES.has(roomHash)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'bad_secret' });
+      return;
+    }
+    if (typeof ack === 'function') ack({ ok: true, members: store.memberDisplayNames(roomHash) });
+  });
+
   socket.on('pet:join', (data, ack) => {
     const secret = String(data?.secret || '');
     const role = data?.role;
@@ -613,6 +626,45 @@ io.on('connection', (socket) => {
     room.participants.delete(oldDeviceId);
     emitPeerSnapshots(room);
     if (typeof ack === 'function') ack({ ok: true, device: item });
+  });
+
+  socket.on('device:change-member', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const participant = participantForSocket(socket);
+    const sourceMemberId = socket.data?.memberId;
+    const targetMemberId = payload?.targetMemberId;
+    if (!room || !participant || socket.data?.role !== 'controller' || !['a', 'b'].includes(sourceMemberId)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_joined' });
+      return;
+    }
+    if (!['a', 'b'].includes(targetMemberId)) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'invalid_member' });
+      return;
+    }
+    if (targetMemberId === sourceMemberId) {
+      if (typeof ack === 'function') ack({ ok: true, memberId: sourceMemberId });
+      return;
+    }
+    let moved;
+    try {
+      moved = store.moveDevice(room.hash, sourceMemberId, targetMemberId, participant.id);
+    } catch (error) {
+      console.warn('[socket] move device failed:', error?.message || error);
+      if (typeof ack === 'function') ack({ ok: false, code: 'device_move_failed' });
+      return;
+    }
+    if (!moved.ok) {
+      if (typeof ack === 'function') ack({ ok: false, code: moved.code });
+      return;
+    }
+    if (room.call && [room.call.initiatorDeviceId, room.call.targetDeviceId].includes(participant.id)) endRoomCall(room, 'identity_changed');
+    participant.memberId = targetMemberId;
+    for (const socketId of [participant.pet, participant.controller]) {
+      const endpoint = socketId && io.sockets.sockets.get(socketId);
+      if (endpoint) endpoint.data.memberId = targetMemberId;
+    }
+    emitPeerSnapshots(room);
+    if (typeof ack === 'function') ack({ ok: true, memberId: targetMemberId, device: moved.device });
   });
 
   socket.on('audio:list', (payload, ack) => {

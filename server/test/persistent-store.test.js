@@ -40,3 +40,40 @@ test('devices older than thirty days are pruned unless online', () => {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('moving a device preserves device history and keeps audio with its original member', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pet-store-'));
+  let now = Date.UTC(2026, 0, 1);
+  try {
+    const store = new PersistentStore(directory, () => now);
+    store.touchDevice('room', 'a', 'device-1', 'Laptop');
+    const audio = store.addAudio('room', 'a', {
+      name: 'Hello', mime: 'audio/mpeg', extension: 'mp3', durationMs: 1000, data: Buffer.from('audio'),
+    });
+    const firstSeenAt = store.devices('room', 'a')[0].firstSeenAt;
+    now += 1000;
+    const moved = store.moveDevice('room', 'a', 'b', 'device-1');
+    assert.equal(moved.ok, true);
+    assert.deepEqual(store.devices('room', 'a'), []);
+    assert.equal(store.devices('room', 'b')[0].name, 'Laptop');
+    assert.equal(store.devices('room', 'b')[0].firstSeenAt, firstSeenAt);
+    assert.equal(store.audio('room', 'a')[0].id, audio.id);
+    assert.equal(store.audio('room', 'b').length, 0);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('moving a device rejects an identity already owned by the target member', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pet-store-'));
+  try {
+    const store = new PersistentStore(directory);
+    store.touchDevice('room', 'a', 'device-1', 'A laptop');
+    store.touchDevice('room', 'b', 'device-1', 'B laptop');
+    assert.deepEqual(store.moveDevice('room', 'a', 'b', 'device-1'), { ok: false, code: 'device_identity_conflict' });
+    assert.equal(store.devices('room', 'a')[0].name, 'A laptop');
+    assert.equal(store.devices('room', 'b')[0].name, 'B laptop');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

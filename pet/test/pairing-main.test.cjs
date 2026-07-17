@@ -7,4 +7,5 @@ test('Electron startup initializes the migrated device identity', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf8');
   assert.doesNotMatch(source, /ensureParticipantId/);
   assert.match(source, /app\.whenReady\(\)\.then\(\(\) => \{\s*ensureDeviceId\(\);/);
+  assert.match(source, /shouldShowControlOnStartup\(pairingSnapshot\(\)\)/);
 });

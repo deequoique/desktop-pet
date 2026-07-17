@@ -74,6 +74,14 @@ export class PersistentStore {
     this.save();
   }
 
+  memberDisplayNames(roomHash) {
+    const members = this.data.rooms[roomHash]?.members;
+    return ['a', 'b'].map((id) => ({
+      id,
+      displayName: String(members?.[id]?.displayName || (id === 'a' ? '用户 A' : '用户 B')),
+    }));
+  }
+
   devices(roomHash, memberId) {
     return Object.entries(this.room(roomHash).members[memberId].devices).map(([id, device]) => ({ id, ...device }));
   }
@@ -87,6 +95,33 @@ export class PersistentStore {
     delete devices[oldDeviceId];
     this.save();
     return { id: newDeviceId, ...devices[newDeviceId] };
+  }
+
+  moveDevice(roomHash, sourceMemberId, targetMemberId, deviceId) {
+    const room = this.room(roomHash);
+    const source = room.members[sourceMemberId]?.devices;
+    const target = room.members[targetMemberId]?.devices;
+    const device = source?.[deviceId];
+    if (!device || !target) return { ok: false, code: 'device_not_found' };
+    if (target[deviceId]) return { ok: false, code: 'device_identity_conflict' };
+
+    const previousSource = source[deviceId];
+    const previousTarget = target[deviceId];
+    const moved = {
+      ...device,
+      lastSeenAt: new Date(this.now()).toISOString(),
+    };
+    delete source[deviceId];
+    target[deviceId] = moved;
+    try {
+      this.save();
+      return { ok: true, device: { id: deviceId, ...moved } };
+    } catch (error) {
+      source[deviceId] = previousSource;
+      if (previousTarget) target[deviceId] = previousTarget;
+      else delete target[deviceId];
+      throw error;
+    }
   }
 
   audio(roomHash, memberId) {

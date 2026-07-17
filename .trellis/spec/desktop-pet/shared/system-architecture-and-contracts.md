@@ -53,6 +53,72 @@ OS 级能力留在 `pet/src/main/index.js`。两个 preload 文件通过 `contex
 
 `pet/src/renderer/main.ts` 还保留 `browserPetBridge` 开发 fallback，但独立浏览器已不是产品或验收入口。新增 bridge 必须同步更新 main-process handler、对应 preload 暴露和 renderer `Window` type；只需保证 fallback 安全降级，不为其新增产品能力。
 
+## 场景：首次配对与设备身份变更
+
+### 1. 适用范围与触发条件
+
+首次配置、修改 `pairing.json`、成员身份切换，或新增配对 Socket.IO/IPC 事件时适用。控制面板每次启动都以“设置”为首页；未完成配对时在设置内执行两步流程，而不是预设 A/B 身份或把瞬时断线当作重新配置。
+
+### 2. 签名
+
+```ts
+// 未加入房间的临时 probe；不得创建房间或设备记录。
+socket.emit('pairing:discover', { protocolVersion: 2, secret }, ack);
+
+// 已加入的 controller 改变其稳定 deviceId 所属成员。
+socket.emit('device:change-member', { targetMemberId: 'a' | 'b' }, ack);
+
+// Electron control preload（已有 bridge）保存完整 snapshot，并广播更新。
+window.desktopPetControl.savePairingConfig(config);
+window.desktopPetControl.onPairingChanged(callback);
+```
+
+### 3. 契约
+
+- `pairing:discover` 成功返回 `{ ok:true, members:[{ id:'a'|'b', displayName:string }, ...] }`；只在 `protocolVersion === 2` 且 secret 在 allowlist 中时成功，不 join、不持久化。
+- 设置流程先验证服务器地址和密钥，再使用 discovery 返回的真实成员名称显式选择 `memberId`；完整 pairing 必须包含 `serverUrl`、`roomSecret`、`memberId`、稳定 `deviceId` 与 `deviceName`。
+- `device:change-member` 只能由已加入的 controller 调用。server 以同一 `deviceId` 原子地从原成员移至目标成员，保留设备名称与 `firstSeenAt`，更新在线 runtime/socket `memberId` 并发送 `room:peers`。当前通话若包含该设备，结束原通话。
+- 设备迁移不迁移个人音频：音频 metadata/file 仍属于原成员。Electron 本地配置只在 server 迁移成功后保存；保存失败要尝试恢复 server 身份，避免本地和服务端长期分叉。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 行为 |
+| --- | --- |
+| discovery 协议不是 v2 | `{ ok:false, code:'upgrade_required' }` |
+| discovery 密钥无效 | `{ ok:false, code:'bad_secret' }` |
+| 临时 probe 无法连接或超时 | client 返回 `unreachable` 或 `timeout`，不改变现有连接/UI 身份 |
+| 身份变更来自 pet、未 join 或没有 participant | `{ ok:false, code:'not_joined' }` |
+| `targetMemberId` 不是 `a` / `b` | `{ ok:false, code:'invalid_member' }` |
+| 目标成员已拥有同一 `deviceId` | `{ ok:false, code:'device_identity_conflict' }` |
+| 持久化写入失败 | `{ ok:false, code:'device_move_failed' }`，内存 registry 回滚 |
+
+### 5. 正常、基准与错误案例
+
+- 正常：新安装先验证密钥，看到“小明/小红”后选择小明；保存成功才以 A 身份连接。
+- 基准：已完整配对的安装重启后仍打开设置首页并显示当前身份；运行中网络断线只显示连接状态，不能清空配对或强制回到首配步骤。
+- 错误：A 的 controller 迁到 B 后仍能 `audio:list` 读取 A 的个人音频，或 UI 先写本地 B 再发现 server 拒绝迁移。
+
+### 6. 必需测试
+
+- store unit：迁移移除原成员设备、保留设备历史，并断言原成员音频仍在原处。
+- Socket.IO integration：正确密钥 discovery 返回成员名称；错误密钥被拒绝；controller 可迁移，pet 调用与非法成员均被拒绝。
+- Electron unit：缺少任一 pairing 字段时启动控制面板；完整 pairing 不被误判为未配置。
+- build/manual：运行两个前端构建；全新 Electron profile 打开设置首页且显示“第 1 步，共 2 步”。
+
+### 7. 错误与正确写法
+
+```ts
+// 错误：先假定 A，再让用户补填密钥；或在 server 拒绝前写入本地 B。
+setMemberId('a');
+await savePairingConfig({ ...config, memberId: 'b' });
+
+// 正确：先 discovery，再由用户选择；身份迁移成功后才持久化本地 snapshot。
+const discovered = await discoverPairing(serverUrl, secret);
+if (discovered.ok) setVerifiedMembers(discovered.members);
+const moved = await changeMember(targetMemberId);
+if (moved.ok) await savePairingConfig({ ...config, memberId: targetMemberId });
+```
+
 ## 场景：扩展 Socket.IO 契约
 
 ### 1. 适用范围与触发条件

@@ -66,6 +66,35 @@ export function disconnect() {
     socket = null;
     listeners.onStatus?.('disconnected');
 }
+export function discoverPairing(serverUrl, secret, timeoutMs = 5000) {
+    return new Promise((resolve) => {
+        const probe = io(serverUrl, {
+            transports: ['websocket', 'polling'],
+            reconnection: false,
+            forceNew: true,
+        });
+        let settled = false;
+        const finish = (result) => {
+            if (settled)
+                return;
+            settled = true;
+            window.clearTimeout(timer);
+            probe.removeAllListeners();
+            probe.disconnect();
+            resolve(result);
+        };
+        const timer = window.setTimeout(() => finish({ ok: false, code: 'timeout' }), timeoutMs);
+        probe.on('connect', () => {
+            probe.emit('pairing:discover', { protocolVersion: 2, secret }, (result) => {
+                const members = Array.isArray(result?.members)
+                    ? result.members.filter((member) => !!member && (member.id === 'a' || member.id === 'b') && !!member.displayName)
+                    : [];
+                finish(result?.ok && members.length === 2 ? { ok: true, members } : result || { ok: false, code: 'discovery_failed' });
+            });
+        });
+        probe.on('connect_error', () => finish({ ok: false, code: 'unreachable' }));
+    });
+}
 export function sendCommand(cmd, targetDeviceIds) {
     if (!socket || !socket.connected)
         return 0;
@@ -199,3 +228,10 @@ export const playPersonalAudio = async (audioId, targetDeviceIds = []) => (Promi
 export const getPersonalAudio = (audioId) => audioRequest('audio:get', { audioId });
 export const renameMember = (memberId, displayName) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId, deviceName) => audioRequest('device:reclaim', { deviceId, deviceName });
+export const changeMember = (targetMemberId) => new Promise((resolve) => {
+    if (!socket?.connected)
+        return resolve({ ok: false, code: 'disconnected' });
+    socket.timeout(5000).emit('device:change-member', { targetMemberId }, (err, response) => {
+        resolve(err ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'member_change_failed' });
+    });
+});

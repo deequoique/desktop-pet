@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { randomUUID } = require('crypto');
+const { shouldShowControlOnStartup } = require('./pairing-config');
 const {
   appendDiagnostic,
   clampBoundsToWorkArea,
@@ -536,8 +537,15 @@ function createWindow() {
 
 function showControlWindow() {
   if (!controlWin || controlWin.isDestroyed()) createControlWindow();
-  controlWin.show();
-  controlWin.focus();
+  if (controlWin.webContents.isLoading()) {
+    controlWin.once('ready-to-show', () => {
+      controlWin.show();
+      controlWin.focus();
+    });
+  } else {
+    controlWin.show();
+    controlWin.focus();
+  }
 }
 
 function createControlWindow() {
@@ -724,13 +732,18 @@ ipcMain.handle('pet:save-pairing-config', (_e, config) => {
   if (!next.serverUrl || !next.roomSecret || !['a', 'b'].includes(next.memberId) || !next.deviceName) {
     return { ok: false, error: 'serverUrl, roomSecret, memberId and deviceName required' };
   }
-  pairingConfig.serverUrl = next.serverUrl;
-  pairingConfig.roomSecret = next.roomSecret;
-  pairingConfig.memberId = next.memberId;
-  pairingConfig.deviceName = next.deviceName;
-  ensureDeviceId();
-  const ok = writeJson(pairingFile(), pairingConfig);
-  const snapshot = pairingSnapshot();
+  const nextConfig = {
+    ...pairingConfig,
+    serverUrl: next.serverUrl,
+    roomSecret: next.roomSecret,
+    memberId: next.memberId,
+    deviceName: next.deviceName,
+    deviceId: pairingConfig.deviceId || pairingConfig.participantId || randomUUID(),
+  };
+  delete nextConfig.participantId;
+  const ok = writeJson(pairingFile(), nextConfig);
+  if (ok) Object.assign(pairingConfig, nextConfig);
+  const snapshot = ok ? pairingSnapshot() : undefined;
   if (ok) {
     win?.webContents.send('pet:pairing-changed', snapshot);
     controlWin?.webContents.send('pet:pairing-changed', snapshot);
@@ -804,7 +817,7 @@ app.whenReady().then(() => {
   process.on('unhandledRejection', onUnhandledRejection);
   diagnostic('app-started', diagnosticSnapshot());
   setTimeout(() => checkForPetUpdates(false), 3000);
-  if (!configuredServerUrl() || !configuredRoomSecret()) showControlWindow();
+  if (shouldShowControlOnStartup(pairingSnapshot())) showControlWindow();
 
   globalShortcut.register('Control+Alt+G', () => {
     setGameMode(!gameMode);

@@ -66,6 +66,9 @@ export type ConnectionIdentity = { memberId: 'a' | 'b'; deviceId: string; device
 export type TargetResult<T = Record<string, unknown>> = { targetDeviceId: string; result: T };
 export type ActionResult = { ok: boolean; code?: string };
 export type TtsCreateResult = ActionResult & { jobId?: string; state?: string; position?: number };
+export type PairingMember = { id: 'a' | 'b'; displayName: string };
+export type PairingDiscovery = ActionResult & { members?: PairingMember[] };
+export type MemberChangeResult = ActionResult & { memberId?: 'a' | 'b' };
 
 export function setListeners(l: Listeners) {
   listeners = l;
@@ -133,6 +136,35 @@ export function disconnect() {
   socket.disconnect();
   socket = null;
   listeners.onStatus?.('disconnected');
+}
+
+export function discoverPairing(serverUrl: string, secret: string, timeoutMs = 5000): Promise<PairingDiscovery> {
+  return new Promise((resolve) => {
+    const probe = io(serverUrl, {
+      transports: ['websocket', 'polling'],
+      reconnection: false,
+      forceNew: true,
+    });
+    let settled = false;
+    const finish = (result: PairingDiscovery) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      probe.removeAllListeners();
+      probe.disconnect();
+      resolve(result);
+    };
+    const timer = window.setTimeout(() => finish({ ok: false, code: 'timeout' }), timeoutMs);
+    probe.on('connect', () => {
+      probe.emit('pairing:discover', { protocolVersion: 2, secret }, (result: PairingDiscovery) => {
+        const members = Array.isArray(result?.members)
+          ? result.members.filter((member): member is PairingMember => !!member && (member.id === 'a' || member.id === 'b') && !!member.displayName)
+          : [];
+        finish(result?.ok && members.length === 2 ? { ok: true, members } : result || { ok: false, code: 'discovery_failed' });
+      });
+    });
+    probe.on('connect_error', () => finish({ ok: false, code: 'unreachable' }));
+  });
 }
 
 export function sendCommand(cmd: Command, targetDeviceIds: string[]): number {
@@ -256,3 +288,9 @@ export const playPersonalAudio = async (audioId: string, targetDeviceIds: string
 export const getPersonalAudio = (audioId: string) => audioRequest('audio:get', { audioId });
 export const renameMember = (memberId: 'a' | 'b', displayName: string) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId: string, deviceName: string) => audioRequest('device:reclaim', { deviceId, deviceName });
+export const changeMember = (targetMemberId: 'a' | 'b'): Promise<MemberChangeResult> => new Promise((resolve) => {
+  if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+  socket.timeout(5000).emit('device:change-member', { targetMemberId }, (err: Error | null, response: MemberChangeResult) => {
+    resolve(err ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'member_change_failed' });
+  });
+});

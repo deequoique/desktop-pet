@@ -24,6 +24,14 @@ async function connect(payload) {
   return { socket, response };
 }
 
+async function discover(secret) {
+  const socket = io(url, { transports: ['websocket'], reconnection: false, forceNew: true });
+  sockets.add(socket);
+  await once(socket, 'connect');
+  const response = await new Promise((resolve) => socket.emit('pairing:discover', { protocolVersion: 2, secret }, resolve));
+  return { socket, response };
+}
+
 function join({ secret = 'alpha', role, memberId, deviceId, deviceName = deviceId }) {
   return connect({ protocolVersion: 2, secret, role, memberId, deviceId, deviceName });
 }
@@ -41,6 +49,12 @@ await new Promise((resolve, reject) => {
 });
 
 try {
+  const discovered = await discover('alpha');
+  assert.equal(discovered.response.ok, true);
+  assert.deepEqual(discovered.response.members.map((member) => member.displayName), ['用户 A', '用户 B']);
+  const rejectedDiscovery = await discover('wrong');
+  assert.equal(rejectedDiscovery.response.code, 'bad_secret');
+
   const legacy = await connect({ secret: 'alpha', role: 'pet', participantId: 'old' });
   assert.equal(legacy.response.code, 'upgrade_required');
 
@@ -87,6 +101,30 @@ try {
   });
   assert.equal(offlineState.peerOnline, false);
   assert.equal(offlineState.peerPetOnline, true); // b-tablet pet remains online
+
+  const movedPeers = once(aController.socket, 'room:peers');
+  const moved = await new Promise((resolve) => aController.socket.emit('device:change-member', { targetMemberId: 'b' }, resolve));
+  assert.equal(moved.ok, true);
+  const movedState = await movedPeers;
+  assert.equal(movedState.self.memberId, 'b');
+  assert.equal(movedState.members.find((member) => member.id === 'a').devices.some((device) => device.id === 'a-laptop'), false);
+  assert.equal(movedState.members.find((member) => member.id === 'b').devices.some((device) => device.id === 'a-laptop'), true);
+  const movedAudio = await new Promise((resolve) => aController.socket.emit('audio:list', resolve));
+  const originalMemberAudio = await new Promise((resolve) => aController2.socket.emit('audio:list', resolve));
+  assert.equal(movedAudio.items.length, 0);
+  assert.equal(originalMemberAudio.items.length, 1);
+
+  const movedPetAudio = await new Promise((resolve) => aPet.socket.emit('audio:list', resolve));
+  assert.equal(movedPetAudio.items.length, 0);
+
+  const rejectedPetMove = await new Promise((resolve) => aPet.socket.emit('device:change-member', { targetMemberId: 'b' }, resolve));
+  assert.equal(rejectedPetMove.code, 'not_joined');
+  const rejectedMember = await new Promise((resolve) => aController.socket.emit('device:change-member', { targetMemberId: 'invalid' }, resolve));
+  assert.equal(rejectedMember.code, 'invalid_member');
+  const movedBack = await new Promise((resolve) => aController.socket.emit('device:change-member', { targetMemberId: 'a' }, resolve));
+  assert.equal(movedBack.ok, true);
+  const restoredAudio = await new Promise((resolve) => aController.socket.emit('audio:list', resolve));
+  assert.equal(restoredAudio.items.length, 1);
 
   console.log('ok - protocol v2 multi-device presence, routing, names, and private audio');
 } finally {

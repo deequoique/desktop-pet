@@ -14,7 +14,7 @@ import {
   setTtsCredentials,
   addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
   getPersonalAudio,
-  renameMember,
+  renameMember, discoverPairing, changeMember,
   reclaimDevice,
   type Command,
   type ExpressionName,
@@ -25,7 +25,7 @@ import {
   type TtsVoice,
   type WebRtcSignal,
   type MediaStatus,
-  type PersonalAudio,
+  type PersonalAudio, type PairingMember,
 } from './api';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
@@ -33,6 +33,8 @@ type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
 type ActiveView = 'control' | 'send' | 'call' | 'settings';
 type SendView = 'tts' | 'audio';
 type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown' | 'failed';
+type MemberId = 'a' | 'b';
+type SetupStage = 'server' | 'identity' | 'complete';
 
 type RtcRoute = {
   candidateType: CandidateType;
@@ -136,6 +138,28 @@ function readMemberNames(): Record<'a' | 'b', string> {
   }
 }
 
+function hasCompletePairing(config: PairingConfig) {
+  return !!String(config.serverUrl || '').trim()
+    && !!String(config.roomSecret || '').trim()
+    && (config.memberId === 'a' || config.memberId === 'b')
+    && !!String(config.deviceId || '').trim()
+    && !!String(config.deviceName || '').trim();
+}
+
+function pairingErrorMessage(code?: string) {
+  const messages: Record<string, string> = {
+    bad_secret: '服务器密钥不正确',
+    upgrade_required: '服务器版本过旧，请先更新服务器',
+    timeout: '连接服务器超时，请检查地址和网络',
+    unreachable: '无法连接服务器，请检查地址和网络',
+    invalid_member: '请选择有效身份',
+    device_identity_conflict: '该设备身份与服务器记录冲突，请重试',
+    device_move_failed: '服务器无法迁移设备身份，请稍后重试',
+    disconnected: '当前未连接服务器',
+  };
+  return messages[code || ''] || '操作失败，请重试';
+}
+
 function explainMediaDevicesUnavailable(): string {
   const protocol = window.location.protocol;
   const host = window.location.hostname;
@@ -225,9 +249,9 @@ export default function App() {
   const [secret, setSecret] = useState(() => localStorage.getItem(LS_SECRET) || DEFAULT_SECRET);
   const [status, setStatus] = useState<Status>('idle');
   const [participantId, setParticipantId] = useState(localParticipantId);
-  const [memberId, setMemberId] = useState<'a' | 'b'>('a');
+  const [memberId, setMemberId] = useState<MemberId | ''>('');
   const [deviceName, setDeviceName] = useState('浏览器');
-  const [activeView, setActiveView] = useState<ActiveView>('control');
+  const [activeView, setActiveView] = useState<ActiveView>('settings');
   const [sendView, setSendView] = useState<SendView>('tts');
   const [targetIds, setTargetIds] = useState<string[]>([]);
   const [callTargetId, setCallTargetId] = useState('');
@@ -236,6 +260,12 @@ export default function App() {
   const [editingMemberId, setEditingMemberId] = useState<'a' | 'b' | null>(null);
   const [memberNameDraft, setMemberNameDraft] = useState('');
   const [knownMemberNames, setKnownMemberNames] = useState(readMemberNames);
+  const [setupStage, setSetupStage] = useState<SetupStage>(() => window.desktopPetControl ? 'server' : 'complete');
+  const [verifiedMembers, setVerifiedMembers] = useState<PairingMember[] | null>(null);
+  const [verifyingPairing, setVerifyingPairing] = useState(false);
+  const [identityChangeOpen, setIdentityChangeOpen] = useState(false);
+  const [identityChangeTarget, setIdentityChangeTarget] = useState<MemberId>('a');
+  const [identityChanging, setIdentityChanging] = useState(false);
   const [editingAudioId, setEditingAudioId] = useState<string | null>(null);
   const [audioNameDraft, setAudioNameDraft] = useState('');
   const [deleteAudioId, setDeleteAudioId] = useState<string | null>(null);
@@ -641,8 +671,19 @@ export default function App() {
       if (nextParticipant) setParticipantId(nextParticipant);
       if (config.memberId) setMemberId(config.memberId);
       if (config.deviceName) setDeviceName(config.deviceName);
-      if (nextServer && nextSecret && nextParticipant && config.memberId && config.deviceName) connect(nextServer, nextSecret, { memberId: config.memberId, deviceId: nextParticipant, deviceName: config.deviceName });
-      else disconnect();
+      if (!hasCompletePairing(config)) {
+        setMemberId('');
+        setSetupStage('server');
+        setVerifiedMembers(null);
+        setActiveView('settings');
+        disconnect();
+        return;
+      }
+      setSetupStage('complete');
+      const configuredMemberId = config.memberId;
+      const configuredDeviceName = String(config.deviceName || '').trim();
+      if (configuredMemberId !== 'a' && configuredMemberId !== 'b') return;
+      connect(nextServer, nextSecret, { memberId: configuredMemberId, deviceId: nextParticipant, deviceName: configuredDeviceName });
     };
     bridge.getPairingConfig().then(applyConfig).catch((e) => {
       showToast(`读取桌宠配置失败：${e?.message || e}`, true);
@@ -780,6 +821,10 @@ export default function App() {
       showToast('填一下服务器和密钥', true);
       return;
     }
+    if (!memberId) {
+      showToast('请选择我的身份', true);
+      return;
+    }
     if (window.desktopPetControl) {
       const result = await window.desktopPetControl.savePairingConfig({
         serverUrl: serverUrl.trim(),
@@ -793,12 +838,65 @@ export default function App() {
     localStorage.setItem(LS_SERVER, serverUrl);
     localStorage.setItem(LS_SECRET, secret);
     connect(serverUrl.trim(), secret.trim(), { memberId, deviceId: participantId, deviceName });
+    setSetupStage('complete');
   }, [deviceName, memberId, participantId, secret, serverUrl, showToast]);
 
   const onDisconnect = useCallback(() => {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     disconnect();
   }, [teardownCall]);
+
+  const verifyPairing = useCallback(async () => {
+    if (!serverUrl.trim() || !secret.trim()) {
+      showToast('填一下服务器和密钥', true);
+      return;
+    }
+    setVerifyingPairing(true);
+    const result = await discoverPairing(serverUrl.trim(), secret.trim());
+    setVerifyingPairing(false);
+    if (!result.ok || !result.members) {
+      showToast(pairingErrorMessage(result.code), true);
+      return;
+    }
+    const names = {
+      a: result.members.find((member) => member.id === 'a')?.displayName || '用户 A',
+      b: result.members.find((member) => member.id === 'b')?.displayName || '用户 B',
+    };
+    setKnownMemberNames(names);
+    localStorage.setItem(LS_MEMBER_NAMES, JSON.stringify(names));
+    setVerifiedMembers(result.members);
+    setMemberId('');
+    setSetupStage('identity');
+  }, [secret, serverUrl, showToast]);
+
+  const resetPairingVerification = useCallback(() => {
+    if (setupStage === 'complete') return;
+    setVerifiedMembers(null);
+    setMemberId('');
+    setSetupStage('server');
+  }, [setupStage]);
+
+  const confirmIdentityChange = useCallback(async () => {
+    const bridge = window.desktopPetControl;
+    if (!bridge || !memberId || identityChangeTarget === memberId) return;
+    setIdentityChanging(true);
+    const moved = await changeMember(identityChangeTarget);
+    if (!moved.ok) {
+      setIdentityChanging(false);
+      showToast(pairingErrorMessage(moved.code), true);
+      return;
+    }
+    const saved = await bridge.savePairingConfig({ serverUrl, roomSecret: secret, memberId: identityChangeTarget, deviceName });
+    if (!saved.ok) {
+      const restored = await changeMember(memberId);
+      setIdentityChanging(false);
+      showToast(restored.ok ? '本地保存失败，身份已恢复' : '本地保存失败，服务器身份需要重试恢复', true);
+      return;
+    }
+    setIdentityChanging(false);
+    setIdentityChangeOpen(false);
+    showToast('身份已更改，正在重新连接');
+  }, [deviceName, identityChangeTarget, memberId, secret, serverUrl, showToast]);
 
   const refreshPersonalAudio = useCallback(async () => {
     const result = await listPersonalAudio();
@@ -877,6 +975,9 @@ export default function App() {
   const selectedDevices = onlineDevices.filter((device) => targetIds.includes(device.id));
   const canSend = status === 'connected' && selectedDevices.length > 0;
   const canCall = status === 'connected' && callableDevices.some((device) => device.id === callTargetId);
+  const pairingIncomplete = !!window.desktopPetControl && (!serverUrl.trim() || !secret.trim() || !memberId || !participantId || !deviceName.trim());
+  const setupRequired = setupStage !== 'complete' || pairingIncomplete;
+  const setupStep: Exclude<SetupStage, 'complete'> = setupStage === 'identity' && verifiedMembers ? 'identity' : 'server';
 
   useEffect(() => {
     callTargetIdRef.current = callTargetId;
@@ -1166,11 +1267,18 @@ export default function App() {
         {activeView === 'settings' && (
           <main className="page settings-page">
             <div className="page-heading"><h1>设置</h1></div>
-            <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>我的身份<select value={memberId} onChange={(event) => setMemberId(event.target.value as 'a' | 'b')} disabled={status === 'connecting' || status === 'connected'}><option value="a">{knownMemberNames.a}</option><option value="b">{knownMemberNames.b}</option></select></label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div><div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" disabled={!serverUrl.trim() || !secret.trim() || !deviceName.trim()} onClick={() => void onConnect()}>连接</button>}</div></section>
-            <section className="card settings-section"><h2>成员名称</h2>{peers.members.map((member) => <div className="member-row" key={member.id}><span>{member.id === peers.self.memberId ? '我' : '对方'}</span>{editingMemberId === member.id ? <><input value={memberNameDraft} onChange={(event) => setMemberNameDraft(event.target.value)} /><button onClick={async () => { if (memberNameDraft.trim()) await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }}>保存</button><button onClick={() => setEditingMemberId(null)}>取消</button></> : <><strong>{member.displayName}</strong><button onClick={() => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }}>修改</button></>}</div>)}</section>
-            <section className="card settings-section"><h2>设备</h2>{peers.members.map((member) => <div className="device-group" key={member.id}><h3>{member.displayName}</h3>{member.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-signal ${device.petOnline ? 'online' : ''}`} /><div><strong>{device.name}{device.id === peers.self.deviceId ? ' · 本机' : ''}</strong><small>桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · {new Date(device.lastSeenAt).toLocaleString()}</small></div>{member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? <span className="inline-confirm"><button onClick={async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }}>确认认领</button><button onClick={() => setReclaimCandidate(null)}>取消</button></span> : <button onClick={() => setReclaimCandidate(device)}>认领为本机</button>)}</div>)}</div>)}</section>
-            {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button><button onClick={() => void exportDiagnostics()}>导出诊断日志</button></div></section>}
-            <section className="card settings-section"><h2>语音服务</h2><div className="button-row"><button className={ttsMode === 'managed' ? 'selected' : ''} onClick={() => selectTtsMode('managed')}>服务端声音</button>{ttsProvider === 'elevenlabs' && <button className={ttsMode === 'byok' ? 'selected' : ''} onClick={() => selectTtsMode('byok')}>我的 API Key</button>}</div>{ttsMode === 'byok' && <div className="key-row"><input type="password" value={ttsApiKeyInput} onChange={(event) => setTtsApiKeyInput(event.target.value)} placeholder={ttsKeyConfigured ? '已配置，输入新 Key 可替换' : 'ElevenLabs API Key'} /><button onClick={() => void saveByokKey()}>保存</button>{ttsKeyConfigured && <button className="danger" onClick={() => void clearByokKey()}>删除 Key</button>}</div>}</section>
+            {setupRequired ? (
+              <section className="card settings-section setup-card">
+                <p className="setup-step">{setupStep === 'server' ? '第 1 步，共 2 步' : '第 2 步，共 2 步'}</p>
+                <h2>{setupStep === 'server' ? '连接你的服务器' : '选择你的身份'}</h2>
+                {setupStep === 'server' ? <><p className="settings-hint">先验证服务器地址和密钥，再选择身份。</p><div className="form-grid"><label>服务器地址<input value={serverUrl} onChange={(event) => { setServerUrl(event.target.value); resetPairingVerification(); }} placeholder="https://pet.example.com" /></label><label>服务器密钥<input type="password" value={secret} onChange={(event) => { setSecret(event.target.value); resetPairingVerification(); }} placeholder="输入服务器密钥" /></label></div><div className="settings-actions"><button className="primary-button" disabled={verifyingPairing || !serverUrl.trim() || !secret.trim()} onClick={() => void verifyPairing()}>{verifyingPairing ? '验证中…' : '验证并继续'}</button></div></> : <><p className="settings-hint">请选择这台设备属于谁；切换身份后仍可在设置中更改。</p><div className="form-grid"><label>我的身份<select value={memberId} onChange={(event) => setMemberId(event.target.value as MemberId | '')}><option value="">请选择身份</option>{verifiedMembers?.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} /></label></div><div className="settings-actions"><button onClick={() => { setSetupStage('server'); setMemberId(''); }}>上一步</button><button className="primary-button" disabled={!memberId || !deviceName.trim()} onClick={() => void onConnect()}>保存并连接</button></div></>}</section>
+            ) : <>
+              <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>当前身份<strong className="identity-summary">{memberId ? knownMemberNames[memberId] : '未选择'}</strong>{window.desktopPetControl && <button disabled={status !== 'connected'} onClick={() => { if (memberId) { setIdentityChangeTarget(memberId === 'a' ? 'b' : 'a'); setIdentityChangeOpen(true); } }}>更改身份</button>}</label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div>{identityChangeOpen && <div className="identity-change"><strong>更改身份会让桌宠和控制端短暂重新连接。</strong><select value={identityChangeTarget} onChange={(event) => setIdentityChangeTarget(event.target.value as MemberId)}><option value="a">{knownMemberNames.a}</option><option value="b">{knownMemberNames.b}</option></select><button className="primary-button" disabled={identityChanging || identityChangeTarget === memberId} onClick={() => void confirmIdentityChange()}>{identityChanging ? '正在更改…' : '确认并重新连接'}</button><button disabled={identityChanging} onClick={() => setIdentityChangeOpen(false)}>取消</button></div>}<div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" disabled={!serverUrl.trim() || !secret.trim() || !memberId || !deviceName.trim()} onClick={() => void onConnect()}>连接</button>}</div></section>
+              <section className="card settings-section"><h2>成员名称</h2>{peers.members.map((member) => <div className="member-row" key={member.id}><span>{member.id === peers.self.memberId ? '我' : '对方'}</span>{editingMemberId === member.id ? <><input value={memberNameDraft} onChange={(event) => setMemberNameDraft(event.target.value)} /><button onClick={async () => { if (memberNameDraft.trim()) await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }}>保存</button><button onClick={() => setEditingMemberId(null)}>取消</button></> : <><strong>{member.displayName}</strong><button onClick={() => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }}>修改</button></>}</div>)}</section>
+              <section className="card settings-section"><h2>设备</h2>{peers.members.map((member) => <div className="device-group" key={member.id}><h3>{member.displayName}</h3>{member.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-signal ${device.petOnline ? 'online' : ''}`} /><div><strong>{device.name}{device.id === peers.self.deviceId ? ' · 本机' : ''}</strong><small>桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · {new Date(device.lastSeenAt).toLocaleString()}</small></div>{member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? <span className="inline-confirm"><button onClick={async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }}>确认认领</button><button onClick={() => setReclaimCandidate(null)}>取消</button></span> : <button onClick={() => setReclaimCandidate(device)}>认领为本机</button>)}</div>)}</div>)}</section>
+              {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button><button onClick={() => void exportDiagnostics()}>导出诊断日志</button></div></section>}
+              <section className="card settings-section"><h2>语音服务</h2><div className="button-row"><button className={ttsMode === 'managed' ? 'selected' : ''} onClick={() => selectTtsMode('managed')}>服务端声音</button>{ttsProvider === 'elevenlabs' && <button className={ttsMode === 'byok' ? 'selected' : ''} onClick={() => selectTtsMode('byok')}>我的 API Key</button>}</div>{ttsMode === 'byok' && <div className="key-row"><input type="password" value={ttsApiKeyInput} onChange={(event) => setTtsApiKeyInput(event.target.value)} placeholder={ttsKeyConfigured ? '已配置，输入新 Key 可替换' : 'ElevenLabs API Key'} /><button onClick={() => void saveByokKey()}>保存</button>{ttsKeyConfigured && <button className="danger" onClick={() => void clearByokKey()}>删除 Key</button>}</div>}</section>
+            </>}
           </main>
         )}
       </div>
