@@ -54,7 +54,7 @@ export type Listeners = {
   onHangup?: () => void;
   onRtcError?: (msg: string) => void;
   onMediaStatus?: (status: MediaStatus) => void;
-  onCallStart?: (callId: string) => void;
+  onCallStart?: (callId: string, peerDeviceId?: string) => void;
   onCallEnd?: (callId?: string, reason?: string) => void;
   onTtsStatus?: (status: TtsStatus) => void;
 };
@@ -62,9 +62,10 @@ export type Listeners = {
 let socket: Socket | null = null;
 let listeners: Listeners = {};
 let ttsApiKey = '';
-let targetDeviceId = '';
 export type ConnectionIdentity = { memberId: 'a' | 'b'; deviceId: string; deviceName: string };
-export function setTargetDevice(deviceId: string) { targetDeviceId = deviceId; }
+export type TargetResult<T = Record<string, unknown>> = { targetDeviceId: string; result: T };
+export type ActionResult = { ok: boolean; code?: string };
+export type TtsCreateResult = ActionResult & { jobId?: string; state?: string; position?: number };
 
 export function setListeners(l: Listeners) {
   listeners = l;
@@ -115,8 +116,8 @@ export function connect(serverUrl: string, secret: string, identity: ConnectionI
     listeners.onRtcError?.(payload?.message || '通话出错');
   });
   s.on('webrtc:media-status', (payload: MediaStatus) => listeners.onMediaStatus?.(payload));
-  s.on('call:start', (payload: { callId?: string }) => {
-    if (payload?.callId) listeners.onCallStart?.(payload.callId);
+  s.on('call:start', (payload: { callId?: string; peerDeviceId?: string }) => {
+    if (payload?.callId) listeners.onCallStart?.(payload.callId, payload.peerDeviceId);
   });
   s.on('call:end', (payload: { callId?: string; reason?: string }) => {
     listeners.onCallEnd?.(payload?.callId, payload?.reason);
@@ -134,14 +135,14 @@ export function disconnect() {
   listeners.onStatus?.('disconnected');
 }
 
-export function sendCommand(cmd: Command): boolean {
-  if (!socket || !socket.connected) return false;
-  if (!targetDeviceId) return false;
-  socket.emit('pet:command', { ...cmd, targetDeviceId });
-  return true;
+export function sendCommand(cmd: Command, targetDeviceIds: string[]): number {
+  if (!socket || !socket.connected) return 0;
+  const targets = [...new Set(targetDeviceIds.filter(Boolean))];
+  for (const targetDeviceId of targets) socket.emit('pet:command', { ...cmd, targetDeviceId });
+  return targets.length;
 }
 
-export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
+export function listMotions(targetDeviceId: string, timeoutMs = 4000): Promise<MotionMeta[]> {
   return new Promise((resolve) => {
     if (!socket || !socket.connected) return resolve([]);
     let done = false;
@@ -155,7 +156,7 @@ export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
   });
 }
 
-export function sendSignal(signal: WebRtcSignal): boolean {
+export function sendSignal(signal: WebRtcSignal, targetDeviceId?: string): boolean {
   if (!socket || !socket.connected) return false;
   socket.emit('webrtc:signal', { ...signal, targetDeviceId });
   return true;
@@ -182,7 +183,7 @@ export function sendHangup(): boolean {
   return true;
 }
 
-export function requestCall(): Promise<{ ok: boolean; callId?: string; code?: string }> {
+export function requestCall(targetDeviceId: string): Promise<{ ok: boolean; callId?: string; code?: string }> {
   return new Promise((resolve) => {
     if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
     socket.timeout(4000).emit('call:start', { targetDeviceId }, (err: Error | null, response: any) => {
@@ -223,14 +224,16 @@ export function listTtsVoices(): Promise<TtsVoiceResponse> {
   });
 }
 
-export function createTts(text: string, voiceId: string): Promise<{ ok: boolean; jobId?: string; state?: string; position?: number; code?: string }> {
-  return new Promise((resolve) => {
-    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
-    socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err: Error | null, response: any) => {
-      if (err) resolve({ ok: false, code: 'timeout' });
-      else resolve(response || { ok: false, code: 'tts_create_failed' });
-    });
-  });
+export async function createTts(text: string, voiceId: string, targetDeviceIds: string[]): Promise<TargetResult<TtsCreateResult>[]> {
+  return Promise.all([...new Set(targetDeviceIds.filter(Boolean))].map(async (targetDeviceId) => ({
+    targetDeviceId,
+    result: await new Promise<TtsCreateResult>((resolve) => {
+      if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+      socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err: Error | null, response: any) => {
+        resolve(err ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'tts_create_failed' });
+      });
+    }),
+  })));
 }
 
 function audioRequest(event: string, payload?: unknown): Promise<any> {
@@ -244,7 +247,12 @@ export const listPersonalAudio = () => audioRequest('audio:list');
 export const addPersonalAudio = (payload: { name: string; mime: string; durationMs: number; data: ArrayBuffer }) => audioRequest('audio:add', payload);
 export const renamePersonalAudio = (audioId: string, name: string) => audioRequest('audio:rename', { audioId, name });
 export const deletePersonalAudio = (audioId: string) => audioRequest('audio:delete', { audioId });
-export const playPersonalAudio = (audioId: string) => audioRequest('audio:play', { audioId, targetDeviceId });
+export const playPersonalAudio = async (audioId: string, targetDeviceIds: string[] = []): Promise<TargetResult<ActionResult>[]> => (
+  Promise.all([...new Set(targetDeviceIds.filter(Boolean))].map(async (targetDeviceId) => ({
+    targetDeviceId,
+    result: await audioRequest('audio:play', { audioId, targetDeviceId }),
+  })))
+);
 export const getPersonalAudio = (audioId: string) => audioRequest('audio:get', { audioId });
 export const renameMember = (memberId: 'a' | 'b', displayName: string) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId: string, deviceName: string) => audioRequest('device:reclaim', { deviceId, deviceName });

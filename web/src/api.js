@@ -2,8 +2,6 @@ import { io } from 'socket.io-client';
 let socket = null;
 let listeners = {};
 let ttsApiKey = '';
-let targetDeviceId = '';
-export function setTargetDevice(deviceId) { targetDeviceId = deviceId; }
 export function setListeners(l) {
     listeners = l;
 }
@@ -52,7 +50,7 @@ export function connect(serverUrl, secret, identity) {
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('call:start', (payload) => {
         if (payload?.callId)
-            listeners.onCallStart?.(payload.callId);
+            listeners.onCallStart?.(payload.callId, payload.peerDeviceId);
     });
     s.on('call:end', (payload) => {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);
@@ -68,15 +66,15 @@ export function disconnect() {
     socket = null;
     listeners.onStatus?.('disconnected');
 }
-export function sendCommand(cmd) {
+export function sendCommand(cmd, targetDeviceIds) {
     if (!socket || !socket.connected)
-        return false;
-    if (!targetDeviceId)
-        return false;
-    socket.emit('pet:command', { ...cmd, targetDeviceId });
-    return true;
+        return 0;
+    const targets = [...new Set(targetDeviceIds.filter(Boolean))];
+    for (const targetDeviceId of targets)
+        socket.emit('pet:command', { ...cmd, targetDeviceId });
+    return targets.length;
 }
-export function listMotions(timeoutMs = 4000) {
+export function listMotions(targetDeviceId, timeoutMs = 4000) {
     return new Promise((resolve) => {
         if (!socket || !socket.connected)
             return resolve([]);
@@ -94,7 +92,7 @@ export function listMotions(timeoutMs = 4000) {
         });
     });
 }
-export function sendSignal(signal) {
+export function sendSignal(signal, targetDeviceId) {
     if (!socket || !socket.connected)
         return false;
     socket.emit('webrtc:signal', { ...signal, targetDeviceId });
@@ -123,7 +121,7 @@ export function sendHangup() {
     socket.emit('webrtc:hangup');
     return true;
 }
-export function requestCall() {
+export function requestCall(targetDeviceId) {
     return new Promise((resolve) => {
         if (!socket?.connected)
             return resolve({ ok: false, code: 'disconnected' });
@@ -171,17 +169,17 @@ export function listTtsVoices() {
         });
     });
 }
-export function createTts(text, voiceId) {
-    return new Promise((resolve) => {
-        if (!socket?.connected)
-            return resolve({ ok: false, code: 'disconnected' });
-        socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err, response) => {
-            if (err)
-                resolve({ ok: false, code: 'timeout' });
-            else
-                resolve(response || { ok: false, code: 'tts_create_failed' });
-        });
-    });
+export async function createTts(text, voiceId, targetDeviceIds) {
+    return Promise.all([...new Set(targetDeviceIds.filter(Boolean))].map(async (targetDeviceId) => ({
+        targetDeviceId,
+        result: await new Promise((resolve) => {
+            if (!socket?.connected)
+                return resolve({ ok: false, code: 'disconnected' });
+            socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err, response) => {
+                resolve(err ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'tts_create_failed' });
+            });
+        }),
+    })));
 }
 function audioRequest(event, payload) {
     return new Promise((resolve) => {
@@ -194,7 +192,10 @@ export const listPersonalAudio = () => audioRequest('audio:list');
 export const addPersonalAudio = (payload) => audioRequest('audio:add', payload);
 export const renamePersonalAudio = (audioId, name) => audioRequest('audio:rename', { audioId, name });
 export const deletePersonalAudio = (audioId) => audioRequest('audio:delete', { audioId });
-export const playPersonalAudio = (audioId) => audioRequest('audio:play', { audioId, targetDeviceId });
+export const playPersonalAudio = async (audioId, targetDeviceIds = []) => (Promise.all([...new Set(targetDeviceIds.filter(Boolean))].map(async (targetDeviceId) => ({
+    targetDeviceId,
+    result: await audioRequest('audio:play', { audioId, targetDeviceId }),
+}))));
 export const getPersonalAudio = (audioId) => audioRequest('audio:get', { audioId });
 export const renameMember = (memberId, displayName) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId, deviceName) => audioRequest('device:reclaim', { deviceId, deviceName });

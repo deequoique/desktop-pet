@@ -1,10 +1,11 @@
-import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { connect, disconnect, listMotions, listTtsVoices, createTts, endCall, requestCall, requestRtcConfig, sendCommand, sendSignal, setListeners, setTargetDevice, setTtsCredentials, addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio, getPersonalAudio, renameMember, reclaimDevice, } from './api';
+import { connect, disconnect, listMotions, listTtsVoices, createTts, endCall, requestCall, requestRtcConfig, sendCommand, sendSignal, setListeners, setTtsCredentials, addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio, getPersonalAudio, renameMember, reclaimDevice, } from './api';
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
 const LS_TARGET_DEVICE = 'pet.targetDeviceId';
+const LS_TARGET_DEVICES = 'pet.targetDeviceIds';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 function localParticipantId() {
@@ -37,6 +38,25 @@ const EMPTY_RTC_ROUTE = {
     path: '选路中',
     detail: '等待 ICE 选路',
 };
+function readSavedTargets(memberId, devices) {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(`${LS_TARGET_DEVICES}.${memberId}`) || '[]');
+        if (Array.isArray(parsed))
+            return parsed.filter((id) => typeof id === 'string');
+    }
+    catch { }
+    const legacy = localStorage.getItem(LS_TARGET_DEVICE);
+    return legacy && devices.some((device) => device.id === legacy) ? [legacy] : [];
+}
+function normalizeTargets(devices, saved) {
+    const online = devices.filter((device) => device.petOnline);
+    const onlineIds = new Set(online.map((device) => device.id));
+    const retained = saved.filter((id, index) => onlineIds.has(id) && saved.indexOf(id) === index);
+    if (retained.length)
+        return retained;
+    const newest = [...online].sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt))[0];
+    return newest ? [newest.id] : [];
+}
 function explainMediaDevicesUnavailable() {
     const protocol = window.location.protocol;
     const host = window.location.hostname;
@@ -119,7 +139,18 @@ export default function App() {
     const [participantId, setParticipantId] = useState(localParticipantId);
     const [memberId, setMemberId] = useState('a');
     const [deviceName, setDeviceName] = useState('浏览器');
-    const [targetId, setTargetId] = useState(() => localStorage.getItem(LS_TARGET_DEVICE) || '');
+    const [activeView, setActiveView] = useState('control');
+    const [sendView, setSendView] = useState('tts');
+    const [targetIds, setTargetIds] = useState([]);
+    const [callTargetId, setCallTargetId] = useState('');
+    const [targetMenuOpen, setTargetMenuOpen] = useState(false);
+    const [expandedMotions, setExpandedMotions] = useState(false);
+    const [editingMemberId, setEditingMemberId] = useState(null);
+    const [memberNameDraft, setMemberNameDraft] = useState('');
+    const [editingAudioId, setEditingAudioId] = useState(null);
+    const [audioNameDraft, setAudioNameDraft] = useState('');
+    const [deleteAudioId, setDeleteAudioId] = useState(null);
+    const [reclaimCandidate, setReclaimCandidate] = useState(null);
     const [peers, setPeers] = useState({
         protocolVersion: 2, self: { memberId: 'a', deviceId: '' }, members: [],
         selfReady: false, peerOnline: false, peerPetOnline: false, peerControllerOnline: false,
@@ -148,6 +179,7 @@ export default function App() {
     const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
     const [rtcRoute, setRtcRoute] = useState(EMPTY_RTC_ROUTE);
     const toastTimer = useRef(null);
+    const personalAudioRecorderRef = useRef(null);
     const remoteVideoRef = useRef(null);
     const remoteMicAudioRef = useRef(null);
     const remoteSystemAudioRef = useRef(null);
@@ -159,6 +191,7 @@ export default function App() {
     const localAudioRef = useRef(null);
     const pendingCandidatesRef = useRef([]);
     const currentCallIdRef = useRef(null);
+    const callTargetIdRef = useRef('');
     const recoveryTimerRef = useRef(null);
     const iceRestartedRef = useRef(false);
     const showToast = useCallback((msg, err = false) => {
@@ -212,7 +245,7 @@ export default function App() {
             remoteSystemAudioRef.current.srcObject = null;
     }, [setMicEnabled, stopLocalAudio]);
     const sendRtcSignal = useCallback((signal) => {
-        return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined });
+        return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined }, callTargetIdRef.current || undefined);
     }, []);
     const syncRemoteMediaState = useCallback(async () => {
         const videoTracks = remoteVideoStreamRef.current?.getVideoTracks() ?? [];
@@ -438,14 +471,20 @@ export default function App() {
             onStatus: setStatus,
             onPeers: (next) => {
                 setPeers(next);
-                const devices = next.members.find((member) => member.id !== next.self.memberId)?.devices || [];
-                setTargetId((current) => {
-                    const onlineDevices = devices.filter((device) => device.petOnline);
-                    const selected = current || (onlineDevices.length === 1 ? onlineDevices[0].id : '');
-                    if (selected)
-                        localStorage.setItem(LS_TARGET_DEVICE, selected);
-                    setTargetDevice(selected);
+                const peer = next.members.find((member) => member.id !== next.self.memberId);
+                if (!peer)
+                    return;
+                setTargetIds((current) => {
+                    const saved = current.length ? current : readSavedTargets(peer.id, peer.devices);
+                    const selected = normalizeTargets(peer.devices, saved);
+                    localStorage.setItem(`${LS_TARGET_DEVICES}.${peer.id}`, JSON.stringify(selected));
                     return selected;
+                });
+                const callable = peer.devices.filter((device) => device.petOnline && device.controllerOnline);
+                setCallTargetId((current) => {
+                    if (callable.some((device) => device.id === current))
+                        return current;
+                    return callable.length === 1 ? callable[0].id : '';
                 });
             },
             onError: (m) => showToast(m, true),
@@ -480,7 +519,9 @@ export default function App() {
                         showToast('对方已停止屏幕共享，音频仍可继续');
                 }
             },
-            onCallStart: (callId) => {
+            onCallStart: (callId, peerDeviceId) => {
+                callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
+                setActiveView('call');
                 beginMediaCall(callId).catch((e) => {
                     console.warn('[webrtc] start coordinated call failed:', e);
                     showToast(`通话失败：${e?.message || e}`, true);
@@ -620,10 +661,13 @@ export default function App() {
                 teardownCall({ nextState: 'idle' });
             return;
         }
-        listMotions().then((items) => {
+        const primaryTargetId = targetIds[0];
+        if (!primaryTargetId)
+            return;
+        listMotions(primaryTargetId).then((items) => {
             setMotions(items);
         });
-    }, [status, peers.peerPetOnline, showToast, teardownCall]);
+    }, [status, peers.peerPetOnline, targetIds, teardownCall]);
     const toggleRemoteAudio = useCallback(async (kind) => {
         const isMic = kind === 'mic';
         const audio = isMic ? remoteMicAudioRef.current : remoteSystemAudioRef.current;
@@ -700,6 +744,12 @@ export default function App() {
         if (result?.ok)
             setPersonalAudio(result.items || []);
     }, []);
+    useEffect(() => {
+        if (status === 'connected')
+            void refreshPersonalAudio();
+        else
+            setPersonalAudio([]);
+    }, [refreshPersonalAudio, status]);
     const uploadAudioBlob = useCallback(async (blob, name, durationMs) => {
         const result = await addPersonalAudio({ name, mime: blob.type, durationMs, data: await blob.arrayBuffer() });
         if (!result?.ok)
@@ -725,6 +775,7 @@ export default function App() {
         recorder.ondataavailable = (event) => chunks.push(event.data);
         recorder.onstop = async () => {
             stream.getTracks().forEach((track) => track.stop());
+            personalAudioRecorderRef.current = null;
             setRecording(false);
             await uploadAudioBlob(new Blob(chunks, { type: recorder.mimeType }), `录音 ${new Date().toLocaleString()}`, Math.min(60000, Date.now() - started));
         };
@@ -732,7 +783,7 @@ export default function App() {
         setRecording(true);
         window.setTimeout(() => { if (recorder.state === 'recording')
             recorder.stop(); }, 60000);
-        window.__personalAudioRecorder = recorder;
+        personalAudioRecorderRef.current = recorder;
     }, [uploadAudioBlob]);
     const changePetScale = useCallback(async (scale) => {
         const result = await window.desktopPetControl?.setPetScale(scale);
@@ -761,17 +812,53 @@ export default function App() {
             return;
         showToast(result.ok ? '诊断日志已导出' : `导出失败：${result.error || 'unknown'}`, !result.ok);
     }, [showToast]);
-    const selectedDevice = peers.members.flatMap((member) => member.devices).find((device) => device.id === targetId);
-    const canSend = status === 'connected' && !!selectedDevice?.petOnline;
-    const canCall = canSend && !!selectedDevice?.controllerOnline;
+    const peerMember = peers.members.find((member) => member.id !== peers.self.memberId);
+    const selfMember = peers.members.find((member) => member.id === peers.self.memberId);
+    const onlineDevices = peerMember?.devices.filter((device) => device.petOnline) || [];
+    const callableDevices = peerMember?.devices.filter((device) => device.petOnline && device.controllerOnline) || [];
+    const selectedDevices = onlineDevices.filter((device) => targetIds.includes(device.id));
+    const canSend = status === 'connected' && selectedDevices.length > 0;
+    const canCall = status === 'connected' && callableDevices.some((device) => device.id === callTargetId);
+    useEffect(() => {
+        callTargetIdRef.current = callTargetId;
+    }, [callTargetId]);
+    useEffect(() => {
+        if (callableDevices.some((device) => device.id === callTargetId))
+            return;
+        const preferred = targetIds.find((id) => callableDevices.some((device) => device.id === id));
+        setCallTargetId(preferred || (callableDevices.length === 1 ? callableDevices[0].id : ''));
+    }, [callTargetId, callableDevices, targetIds]);
+    useEffect(() => {
+        if (activeView === 'call')
+            syncRemoteMediaState().catch(() => { });
+    }, [activeView, syncRemoteMediaState]);
+    const toggleTarget = useCallback((deviceId) => {
+        if (!peerMember)
+            return;
+        setTargetIds((current) => {
+            const selected = current.includes(deviceId)
+                ? current.filter((id) => id !== deviceId)
+                : [...current, deviceId];
+            localStorage.setItem(`${LS_TARGET_DEVICES}.${peerMember.id}`, JSON.stringify(selected));
+            return selected;
+        });
+    }, [peerMember]);
+    const onPlayPersonalAudio = useCallback(async (audioId) => {
+        const results = await playPersonalAudio(audioId, targetIds);
+        const succeeded = results.filter(({ result }) => result?.ok).length;
+        const failed = results.length - succeeded;
+        if (!succeeded)
+            return showToast(results[0]?.result?.code || '发送音频失败', true);
+        showToast(failed ? `已发送 ${succeeded} 台，${failed} 台失败` : `已发送到 ${succeeded} 台设备`, failed > 0);
+    }, [showToast, targetIds]);
     const send = useCallback((cmd, label) => {
         if (!canSend) {
             showToast(status === 'connected' ? '桌宠端未上线' : '未连接', true);
             return;
         }
-        const ok = sendCommand(cmd);
-        showToast(ok ? `✔ ${label}` : '发送失败', !ok);
-    }, [canSend, showToast, status]);
+        const sent = sendCommand(cmd, targetIds);
+        showToast(sent ? `${label} · 已发送到 ${sent} 台设备` : '发送失败', !sent);
+    }, [canSend, showToast, status, targetIds]);
     const selectTtsMode = useCallback((mode) => {
         setTtsMode(mode);
         localStorage.setItem(LS_TTS_MODE, mode);
@@ -834,16 +921,20 @@ export default function App() {
             return;
         }
         setTtsState('正在提交…');
-        const result = await createTts(text, ttsVoiceId);
-        if (!result.ok) {
-            const message = ttsErrorMessage(result.code);
+        const results = await createTts(text, ttsVoiceId, targetIds);
+        const succeeded = results.filter(({ result }) => result?.ok);
+        if (!succeeded.length) {
+            const message = ttsErrorMessage(results[0]?.result?.code);
             setTtsState(message);
             showToast(message, true);
             return;
         }
         setTts('');
-        setTtsState(result.position ? `排队中（前面 ${result.position} 条）` : '已发送到对方桌宠');
-    }, [showToast, tts, ttsVoiceId]);
+        const failed = results.length - succeeded.length;
+        const message = failed ? `已发送 ${succeeded.length} 台，${failed} 台失败` : `已发送到 ${succeeded.length} 台设备`;
+        setTtsState(message);
+        showToast(message, failed > 0);
+    }, [showToast, targetIds, tts, ttsVoiceId]);
     const onStartCall = useCallback(async () => {
         if (!canCall) {
             showToast('先连上桌宠', true);
@@ -851,7 +942,9 @@ export default function App() {
         }
         try {
             setCallState('requesting-media');
-            const result = await requestCall();
+            callTargetIdRef.current = callTargetId;
+            setActiveView('call');
+            const result = await requestCall(callTargetId);
             if (!result.ok)
                 throw new Error(result.code === 'peer_not_ready' ? '对方二合一客户端尚未就绪' : '无法创建通话');
         }
@@ -860,7 +953,7 @@ export default function App() {
             showToast(`开通话失败：${e?.message || e}`, true);
             teardownCall({ nextState: 'error' });
         }
-    }, [canCall, showToast, teardownCall]);
+    }, [callTargetId, canCall, showToast, teardownCall]);
     const onEndCall = useCallback(() => {
         teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     }, [teardownCall]);
@@ -869,35 +962,24 @@ export default function App() {
             return;
         setMicEnabled(!micEnabled);
     }, [callState, micEnabled, setMicEnabled]);
-    return (_jsxs("div", { className: "app", children: [_jsxs("header", { className: "hero", children: [_jsxs("div", { children: [_jsx("p", { className: "eyebrow", children: "REMOTE CONSOLE" }), _jsx("h1", { children: "\u684C\u5BA0\u8FDC\u7A0B\u63A7\u5236\u53F0" }), _jsx("p", { className: "hero-copy", children: "\u9ED1\u767D\u84DD\u4E3B\u754C\u9762\uFF0C\u4F18\u5148\u628A\u5C4F\u5E55\u3001\u901A\u8BDD\u548C\u63A7\u5236\u52A8\u4F5C\u653E\u5230\u4E00\u5C4F\u5185\u3002" })] }), _jsxs("div", { className: "hero-badge", children: [_jsx("span", { className: `signal ${peers.peerOnline ? 'on' : ''}` }), _jsx("span", { children: peers.peerOnline ? '对方在线' : '等待对方' })] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u6210\u5458\u4E0E\u8BBE\u5907" }), peers.members.map((member) => (_jsxs("div", { children: [_jsxs("div", { className: "status-row", children: [_jsxs("strong", { children: [member.displayName, member.id === peers.self.memberId ? '（我）' : ''] }), _jsx("button", { className: "btn", onClick: async () => { const name = prompt('成员名称', member.displayName); if (name)
-                                            await renameMember(member.id, name); }, children: "\u4FEE\u6539\u540D\u79F0" })] }), member.devices.map((device) => _jsxs("div", { className: "empty", children: [device.name, " \u00B7 \u684C\u5BA0", device.petOnline ? '在线' : '离线', " \u00B7 \u63A7\u5236\u7AEF", device.controllerOnline ? '在线' : '离线', " \u00B7 \u6700\u8FD1\u8FDE\u63A5 ", new Date(device.lastSeenAt).toLocaleString(), member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && _jsx("button", { className: "btn", onClick: async () => { if (confirm(`将当前设备认领为“${device.name}”？`))
-                                            await reclaimDevice(device.id, device.name); }, children: "\u8BA4\u9886\u4E3A\u5F53\u524D\u8BBE\u5907" })] }, device.id))] }, member.id)))] }), _jsxs("div", { className: "status-bar", children: [_jsxs("div", { className: "status-row", children: [_jsx("label", { children: "\u76EE\u6807\u8BBE\u5907" }), _jsxs("select", { value: targetId, onChange: (event) => {
-                                    const selected = event.target.value;
-                                    setTargetId(selected);
-                                    setTargetDevice(selected);
-                                    if (selected)
-                                        localStorage.setItem(LS_TARGET_DEVICE, selected);
-                                    else
-                                        localStorage.removeItem(LS_TARGET_DEVICE);
-                                }, children: [_jsx("option", { value: "", children: "\u8BF7\u9009\u62E9\u5BF9\u65B9\u8BBE\u5907" }), peers.members.find((member) => member.id !== peers.self.memberId)?.devices.map((device) => (_jsxs("option", { value: device.id, children: [device.name, " \u00B7 \u684C\u5BA0", device.petOnline ? '在线' : '离线', " / \u63A7\u5236\u7AEF", device.controllerOnline ? '在线' : '离线'] }, device.id)))] })] }), _jsxs("div", { className: "status-row", children: [_jsx("label", { children: "\u670D\u52A1\u5668" }), _jsx("input", { value: serverUrl, onChange: (e) => setServerUrl(e.target.value), placeholder: "http://localhost:3030", disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("div", { className: "status-row", children: [_jsx("label", { children: "\u623F\u95F4\u5BC6\u94A5" }), _jsx("input", { type: "password", value: secret, onChange: (e) => setSecret(e.target.value), placeholder: "ROOM_SECRET", disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("div", { className: "status-row", children: [_jsx(StatusPill, { status: status }), _jsx(PeerPill, { role: "pet", online: peers.peerPetOnline }), !window.desktopPetControl && !peers.selfReady && _jsx("span", { className: "hint", children: "\u6D4F\u89C8\u5668\u6A21\u5F0F\uFF1A\u4EC5\u63A7\u5236\u7AEF\u5728\u7EBF" }), _jsx("div", { style: { flex: 1 } }), status === 'connected' || status === 'connecting' ? (_jsx("button", { className: "btn", onClick: onDisconnect, children: "\u65AD\u5F00" })) : (_jsx("button", { className: "btn accent", onClick: onConnect, children: "\u8FDE\u63A5" }))] }), window.desktopPetControl && (_jsxs("div", { className: "pet-settings", children: [_jsxs("div", { className: "pet-settings-head", children: [_jsx("span", { children: "\u672C\u673A\u684C\u5BA0\u5927\u5C0F" }), _jsxs("strong", { children: [Math.round(petScale * 100), "%"] })] }), _jsx("input", { className: "pet-scale-range", type: "range", min: "30", max: "150", step: "10", value: Math.round(petScale * 100), onChange: (event) => void changePetScale(Number(event.target.value) / 100), "aria-label": "\u8C03\u6574\u672C\u673A\u684C\u5BA0\u5927\u5C0F" }), _jsxs("div", { className: "pet-settings-actions", children: [_jsx("button", { className: "btn", onClick: () => void resetPetScale(), children: "\u6062\u590D\u9ED8\u8BA4\u5927\u5C0F" }), _jsx("button", { className: "btn", onClick: () => void exportDiagnostics(), children: "\u5BFC\u51FA\u8BCA\u65AD\u65E5\u5FD7" })] }), _jsx("span", { className: "hint", children: "\u7F29\u653E\u5F02\u5E38\u65F6\u5BFC\u51FA\u65E5\u5FD7\uFF1B\u4E0D\u4F1A\u5305\u542B\u623F\u95F4\u5BC6\u94A5\u3001API Key \u6216\u97F3\u9891\u3002" })] }))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u901A\u8BDD" }), _jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), _jsxs("div", { className: "video-stage", ref: videoStageRef, children: [_jsx("video", { ref: remoteVideoRef, className: `video-frame ${remoteReady ? 'ready' : ''}`, playsInline: true, autoPlay: true }), !remoteReady && (_jsx("div", { className: "video-empty", children: screenStatus === 'paused' ? '当前网络通过 TURN 中继，仅保留音频。' : callState === 'calling' || callState === 'requesting-media'
-                                    ? '正在等桌宠把屏幕推过来。\n如果一直没画面，先去 B 端确认屏幕录制权限。'
-                                    : '点“开始通话”后，这里会显示她的屏幕。' })), _jsx("button", { type: "button", className: "video-fullscreen", disabled: !remoteReady, onClick: toggleFullscreen, "aria-label": "\u5207\u6362\u89C6\u9891\u5168\u5C4F", children: "\u5168\u5C4F" })] }), _jsxs("div", { className: "video-meta", children: [_jsx("span", { children: remoteReady ? '已收到桌面视频流' : '尚未收到视频流' }), _jsxs("span", { children: ["\u8FDC\u7AEF\u8F68\u9053\uFF1A", remoteTrackSummary] }), _jsxs("span", { children: ["\u9EA6\u514B\u98CE\uFF1A", remoteMicMuted ? '静音' : '播放'] }), _jsxs("span", { children: ["\u7CFB\u7EDF\u58F0\u97F3\uFF1A", remoteSystemMuted ? '静音' : '播放'] })] }), _jsxs("div", { className: `rtc-route ${rtcRoute.candidateType}`, children: [_jsxs("span", { children: ["\u8DEF\u5F84\uFF1A", rtcRoute.path, "\uFF08ICE ", rtcRoute.candidateType, "\uFF09"] }), _jsx("span", { children: rtcRoute.relayed ? '正在走 TURN 中继：仅音频，屏幕视频已暂停' : '点对点连接，不走本项目服务器媒体带宽' }), _jsx("span", { children: rtcRoute.detail })] }), _jsxs("div", { className: "call-row", children: [_jsx(CallPill, { state: callState }), _jsx("button", { className: "btn accent", disabled: !canCall || callState === 'calling' || callState === 'requesting-media' || callState === 'in-call', onClick: onStartCall, children: "\u5F00\u59CB\u901A\u8BDD" }), _jsx("button", { className: "btn", disabled: callState !== 'calling' && callState !== 'in-call', onClick: onEndCall, children: "\u7ED3\u675F\u901A\u8BDD" }), _jsx("button", { className: `btn ${micEnabled ? 'accent' : ''}`, disabled: callState !== 'calling' && callState !== 'in-call', onClick: toggleLocalMic, children: micEnabled ? '关闭麦克风' : '打开麦克风' }), _jsx("button", { className: "btn", disabled: callState !== 'calling' && callState !== 'in-call', onClick: () => toggleRemoteAudio('mic'), children: remoteMicMuted ? '播放麦克风' : '静音麦克风' }), _jsx("button", { className: "btn", disabled: callState !== 'calling' && callState !== 'in-call', onClick: () => toggleRemoteAudio('system'), children: remoteSystemMuted ? '播放系统声音' : '静音系统声音' })] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u8868\u60C5" }), _jsx("div", { className: "grid tight", children: EXPRESSIONS.map((e) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'expression', name: e.name }, e.label), children: e.label }, e.name))) }), _jsx("h3", { children: "\u52A8\u4F5C" }), _jsxs("div", { className: "grid tight", children: [_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'animation', name: 'idle' }, '默认动作'), children: "\u9ED8\u8BA4\u52A8\u4F5C" }), motions.filter((m) => m.id !== 'idle').map((m) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'animation', name: m.id }, m.label), children: m.label }, m.id)))] }), motions.length === 0 && (_jsx("div", { className: "empty", children: canSend ? '当前模型还没配置额外动作；默认动作仍可使用' : '连上后会显示额外动作' }))] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u6211\u7684\u97F3\u9891" }), _jsxs("div", { className: "grid tight", children: [_jsxs("label", { className: "btn", children: ["\u5BFC\u5165\u97F3\u9891", _jsx("input", { hidden: true, type: "file", accept: "audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm", onChange: (event) => void importAudio(event.target.files?.[0]) })] }), _jsx("button", { className: "btn", onClick: () => recording ? window.__personalAudioRecorder?.stop() : void recordAudio(), children: recording ? '停止录音' : '开始录音' }), _jsx("button", { className: "btn", onClick: () => void refreshPersonalAudio(), children: "\u5237\u65B0" })] }), personalAudio.length === 0 ? _jsx("div", { className: "empty", children: "\u8FD9\u91CC\u53EA\u663E\u793A\u4F60\u81EA\u5DF1\u5F55\u5236\u6216\u5BFC\u5165\u7684\u97F3\u9891" }) : personalAudio.map((clip) => (_jsxs("div", { className: "status-row", children: [_jsxs("span", { children: [clip.name, " \u00B7 ", Math.round(clip.durationMs / 1000), " \u79D2"] }), _jsx("button", { className: "btn", onClick: async () => { const result = await getPersonalAudio(clip.id); if (result?.ok) {
-                                    const url = URL.createObjectURL(new Blob([result.data], { type: result.mime }));
-                                    const audio = new Audio(url);
-                                    audio.onended = () => URL.revokeObjectURL(url);
-                                    void audio.play();
-                                } }, children: "\u8BD5\u542C" }), _jsx("button", { className: "btn", disabled: !canSend, onClick: () => void playPersonalAudio(clip.id), children: "\u53D1\u9001" }), _jsx("button", { className: "btn", onClick: async () => { const name = prompt('新名称', clip.name); if (name) {
-                                    await renamePersonalAudio(clip.id, name);
-                                    await refreshPersonalAudio();
-                                } }, children: "\u91CD\u547D\u540D" }), _jsx("button", { className: "btn", onClick: async () => { await deletePersonalAudio(clip.id); await refreshPersonalAudio(); }, children: "\u5220\u9664" })] }, clip.id)))] }), _jsxs("section", { className: "section", children: [_jsxs("h2", { children: ["\u8BED\u97F3\u6D88\u606F \u00B7 ", ttsProvider === 'cosyvoice' ? 'CosyVoice' : 'ElevenLabs'] }), _jsxs("div", { className: "tts-area", children: [_jsxs("div", { className: "tts-mode-row", children: [_jsx("button", { className: `btn ${ttsMode === 'managed' ? 'accent' : ''}`, onClick: () => selectTtsMode('managed'), children: "\u670D\u52A1\u7AEF\u58F0\u97F3" }), ttsProvider === 'elevenlabs' && _jsx("button", { className: `btn ${ttsMode === 'byok' ? 'accent' : ''}`, onClick: () => selectTtsMode('byok'), children: "\u4F7F\u7528\u6211\u7684 API Key" }), _jsx("span", { className: "tts-hint", children: "\u53D1\u9001\u540E\u7531\u5BF9\u65B9\u684C\u5BA0\u7528\u4F60\u7684\u514B\u9686\u58F0\u97F3\u64AD\u653E" })] }), ttsMode === 'byok' && (_jsxs("div", { className: "tts-key-row", children: [_jsx("input", { type: "password", value: ttsApiKeyInput, onChange: (event) => setTtsApiKeyInput(event.target.value), placeholder: ttsKeyConfigured ? 'API Key 已安全保存，输入新 Key 可替换' : 'ElevenLabs API Key', autoComplete: "off" }), _jsx("button", { className: "btn", disabled: !ttsApiKeyInput.trim(), onClick: saveByokKey, children: "\u9A8C\u8BC1\u5E76\u4FDD\u5B58" }), ttsKeyConfigured && _jsx("button", { className: "btn danger", onClick: clearByokKey, children: "\u5220\u9664 Key" })] })), _jsxs("div", { className: "tts-voice-row", children: [_jsx("label", { htmlFor: "tts-voice", children: "\u6211\u7684\u58F0\u97F3" }), _jsxs("select", { id: "tts-voice", value: ttsVoiceId, disabled: status !== 'connected' || !ttsVoices.length, onChange: (event) => {
-                                            setTtsVoiceId(event.target.value);
-                                            localStorage.setItem(LS_TTS_VOICE, event.target.value);
-                                        }, children: [!ttsVoices.length && _jsx("option", { value: "", children: "\u6682\u65E0\u53EF\u7528\u58F0\u97F3" }), ttsVoices.map((voice) => _jsx("option", { value: voice.id, children: voice.label }, voice.id))] }), _jsx("button", { className: "btn", disabled: !ttsVoices.find((voice) => voice.id === ttsVoiceId)?.previewUrl, onClick: previewTtsVoice, children: "\u8BD5\u542C" }), _jsx("span", { className: "tts-status", children: ttsState })] }), _jsx("textarea", { value: tts, onChange: (e) => setTts(e.target.value), placeholder: "\u60F3\u4F60\u4E86\u2026 (Ctrl/Cmd + Enter \u53D1\u9001)", maxLength: 200, onKeyDown: (e) => {
-                                    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                                        e.preventDefault();
-                                        onSendTts();
-                                    }
-                                } }), _jsxs("div", { className: "tts-row", children: [_jsx("button", { className: "btn accent", disabled: !canSend || !tts.trim() || !ttsVoiceId, onClick: onSendTts, children: "\u8BA9\u5979\u542C\u5230 \u25B6" }), _jsx("span", { className: "tts-hint", children: "\u53EA\u4F7F\u7528\u672C\u4EBA\u6240\u6709\u6216\u5DF2\u83B7\u6388\u6743\u7684\u514B\u9686\u58F0\u97F3" }), _jsx("div", { style: { flex: 1 } }), _jsxs("span", { className: "tts-hint", children: [tts.length, "/200"] })] })] })] }), _jsxs("section", { className: "section", children: [_jsx("h2", { children: "\u4F4D\u7F6E" }), _jsx("div", { className: "grid tight", children: CORNERS.map((c) => (_jsx("button", { className: "btn", disabled: !canSend, onClick: () => send({ type: 'relocate', corner: c.corner }, `贴 ${c.label}`), children: c.label }, c.corner))) })] }), _jsx("div", { className: `toast ${toast ? 'on' : ''} ${toast?.err ? 'err' : ''}`, children: toast?.msg })] }));
+    const peerName = peerMember?.displayName || '对方';
+    const selfName = selfMember?.displayName || '我';
+    const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
+    return (_jsxs("div", { className: "control-app", children: [_jsxs("aside", { className: "app-rail", "aria-label": "\u4E3B\u5BFC\u822A", children: [_jsx("div", { className: "brand-mark", "aria-hidden": "true", children: "\uD83D\uDC3E" }), [
+                        ['control', '⌁', '控制'],
+                        ['send', '✦', '发送'],
+                        ['call', '◉', '通话'],
+                    ].map(([view, icon, label]) => (_jsxs("button", { className: `rail-item ${activeView === view ? 'active' : ''}`, onClick: () => setActiveView(view), children: [_jsx("span", { "aria-hidden": "true", children: icon }), _jsx("b", { children: label }), view === 'call' && callActive && _jsx("i", {})] }, view))), _jsxs("button", { className: `rail-item settings ${activeView === 'settings' ? 'active' : ''}`, onClick: () => setActiveView('settings'), children: [_jsx("span", { "aria-hidden": "true", children: "\u2699" }), _jsx("b", { children: "\u8BBE\u7F6E" })] })] }), _jsxs("div", { className: "app-workspace", children: [_jsxs("header", { className: "app-topbar", children: [_jsxs("div", { className: "room-identity", children: [_jsx("div", { className: "room-avatar", children: "\u6211" }), _jsxs("div", { children: [_jsxs("strong", { children: [selfName, "\u548C", peerName] }), _jsx("small", { children: "\u684C\u5BA0\u8FDE\u63A5\u7A7A\u95F4" })] })] }), _jsxs("div", { className: "peer-target", children: [_jsxs("button", { className: `online-chip ${onlineDevices.length ? '' : 'offline'}`, disabled: onlineDevices.length < 2, "aria-expanded": targetMenuOpen, onClick: () => setTargetMenuOpen((open) => !open), children: [_jsx("span", { className: "status-dot" }), peerName, onlineDevices.length ? '在线' : '离线', onlineDevices.length > 1 && _jsxs("em", { children: ["\u00B7 ", onlineDevices.length, " \u53F0\u2304"] })] }), targetMenuOpen && onlineDevices.length > 1 && (_jsx("div", { className: "target-popover", children: onlineDevices.map((device) => (_jsxs("label", { className: "target-option", children: [_jsx("input", { type: "checkbox", checked: targetIds.includes(device.id), onChange: () => toggleTarget(device.id) }), _jsxs("span", { children: [_jsx("strong", { children: device.name }), _jsx("small", { children: targetIds.includes(device.id) ? '发送目标' : '在线' })] }), _jsx("i", {})] }, device.id))) }))] })] }), activeView === 'control' && (_jsxs("main", { className: "page control-page", children: [_jsxs("section", { className: "pet-hero card", children: [_jsx("div", { className: "pet-face", "aria-hidden": "true", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u60F3\u8BA9", peerName, "\u7684\u684C\u5BA0\u505A\u4EC0\u4E48\uFF1F"] })] }), _jsxs("section", { className: "card action-panel", children: [_jsx("div", { className: "section-title", children: _jsx("h2", { children: "\u5FEB\u6377\u4E92\u52A8" }) }), _jsxs("div", { className: "action-grid", children: [EXPRESSIONS.map((item, index) => (_jsxs("button", { className: `action-tile ${index === 0 ? 'primary' : ''}`, disabled: !canSend, onClick: () => send({ type: 'expression', name: item.name }, item.label), children: [_jsx("span", { children: ['♡', '!', '☁', '⌁', '✦', '·'][index] }), _jsx("b", { children: item.label }), _jsx("small", { children: "\u8868\u60C5" })] }, item.name))), (expandedMotions ? motions : motions.slice(0, 3)).filter((motion) => motion.id !== 'idle').map((motion) => (_jsxs("button", { className: "action-tile", disabled: !canSend, onClick: () => send({ type: 'animation', name: motion.id }, motion.label), children: [_jsx("span", { children: "\u219D" }), _jsx("b", { children: motion.label }), _jsx("small", { children: "\u52A8\u4F5C" })] }, motion.id)))] }), motions.length > 4 && _jsx("button", { className: "text-button", onClick: () => setExpandedMotions((value) => !value), children: expandedMotions ? '收起动作' : '全部动作' })] }), _jsxs("aside", { className: "control-side", children: [_jsxs("section", { className: "card compact-card", children: [_jsx("h2", { children: "\u79FB\u52A8\u4F4D\u7F6E" }), _jsx("div", { className: "corner-grid", children: CORNERS.map((item) => _jsx("button", { disabled: !canSend, onClick: () => send({ type: 'relocate', corner: item.corner }, `移动到${item.label}`), children: item.label }, item.corner)) })] }), _jsxs("section", { className: "card compact-card", children: [_jsxs("h2", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), _jsx("button", { className: "dark-button", onClick: () => setActiveView('call'), children: "\u6253\u5F00\u901A\u8BDD" })] }), window.desktopPetControl && _jsxs("section", { className: "card compact-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u684C\u5BA0" }), _jsxs("b", { children: [Math.round(petScale * 100), "%"] })] }), _jsx("input", { className: "scale-range", type: "range", min: "30", max: "150", step: "10", value: Math.round(petScale * 100), onChange: (event) => void changePetScale(Number(event.target.value) / 100), "aria-label": "\u8C03\u6574\u672C\u673A\u684C\u5BA0\u5927\u5C0F" })] })] })] })), activeView === 'send' && (_jsxs("main", { className: "page send-page", children: [_jsxs("div", { className: "page-heading", children: [_jsxs("h1", { children: ["\u53D1\u9001\u7ED9", peerName] }), _jsxs("div", { className: "segmented", children: [_jsx("button", { className: sendView === 'tts' ? 'active' : '', onClick: () => setSendView('tts'), children: "\u8BF4\u53E5\u8BDD" }), _jsx("button", { className: sendView === 'audio' ? 'active' : '', onClick: () => setSendView('audio'), children: "\u6211\u7684\u97F3\u9891" })] })] }), sendView === 'tts' ? (_jsx("section", { className: "card tts-compose", children: _jsxs("div", { className: "compose-main", children: [_jsx("textarea", { value: tts, maxLength: 200, onChange: (event) => setTts(event.target.value), placeholder: "\u8F93\u5165\u60F3\u8BA9\u684C\u5BA0\u8BF4\u7684\u8BDD\u2026", onKeyDown: (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                                                event.preventDefault();
+                                                void onSendTts();
+                                            } } }), _jsxs("div", { className: "compose-actions", children: [_jsxs("label", { children: ["\u58F0\u97F3", _jsxs("select", { value: ttsVoiceId, disabled: !ttsVoices.length, onChange: (event) => { setTtsVoiceId(event.target.value); localStorage.setItem(LS_TTS_VOICE, event.target.value); }, children: [!ttsVoices.length && _jsx("option", { value: "", children: "\u6682\u65E0\u53EF\u7528\u58F0\u97F3" }), ttsVoices.map((voice) => _jsx("option", { value: voice.id, children: voice.label }, voice.id))] })] }), _jsx("button", { className: "text-button", disabled: !ttsVoices.find((voice) => voice.id === ttsVoiceId)?.previewUrl, onClick: previewTtsVoice, children: "\u8BD5\u542C" }), _jsx("span", { className: "compose-state", children: ttsState }), _jsx("button", { className: "primary-button", disabled: !canSend || !tts.trim() || !ttsVoiceId, onClick: () => void onSendTts(), children: "\u53D1\u9001" })] })] }) })) : (_jsxs("section", { className: "card audio-library", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u97F3\u9891" }), _jsxs("div", { className: "button-row", children: [_jsx("button", { onClick: () => recording ? personalAudioRecorderRef.current?.stop() : void recordAudio(), children: recording ? '停止录制' : '● 录制' }), _jsxs("label", { className: "button-like", children: ["\uFF0B \u5BFC\u5165", _jsx("input", { hidden: true, type: "file", accept: "audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm", onChange: (event) => void importAudio(event.target.files?.[0]) })] })] })] }), _jsxs("div", { className: "audio-grid", children: [personalAudio.map((clip) => (_jsxs("article", { className: "audio-card", children: [_jsx("button", { className: "play-button", "aria-label": `试听 ${clip.name}`, onClick: async () => { const result = await getPersonalAudio(clip.id); if (result?.ok) {
+                                                            const url = URL.createObjectURL(new Blob([result.data], { type: result.mime }));
+                                                            const audio = new Audio(url);
+                                                            audio.onended = () => URL.revokeObjectURL(url);
+                                                            void audio.play();
+                                                        } }, children: "\u25B6" }), editingAudioId === clip.id ? _jsx("input", { value: audioNameDraft, onChange: (event) => setAudioNameDraft(event.target.value) }) : _jsxs("div", { children: [_jsx("strong", { children: clip.name }), _jsxs("small", { children: [Math.round(clip.durationMs / 1000), " \u79D2"] })] }), _jsxs("div", { className: "audio-actions", children: [editingAudioId === clip.id ? _jsx("button", { onClick: async () => { if (audioNameDraft.trim())
+                                                                    await renamePersonalAudio(clip.id, audioNameDraft.trim()); setEditingAudioId(null); await refreshPersonalAudio(); }, children: "\u4FDD\u5B58" }) : _jsx("button", { onClick: () => { setEditingAudioId(clip.id); setAudioNameDraft(clip.name); }, children: "\u91CD\u547D\u540D" }), _jsx("button", { disabled: !canSend, onClick: () => void onPlayPersonalAudio(clip.id), children: "\u53D1\u9001" }), deleteAudioId === clip.id ? _jsxs(_Fragment, { children: [_jsx("button", { className: "danger", onClick: async () => { await deletePersonalAudio(clip.id); setDeleteAudioId(null); await refreshPersonalAudio(); }, children: "\u786E\u8BA4\u5220\u9664" }), _jsx("button", { onClick: () => setDeleteAudioId(null), children: "\u53D6\u6D88" })] }) : _jsx("button", { onClick: () => setDeleteAudioId(clip.id), children: "\u5220\u9664" })] })] }, clip.id))), !personalAudio.length && _jsx("button", { className: "audio-empty", onClick: () => void recordAudio(), children: "\uFF0B \u6DFB\u52A0\u7B2C\u4E00\u6BB5\u97F3\u9891" })] })] }))] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [_jsxs("section", { className: "video-stage-new", ref: videoStageRef, children: [_jsx("video", { ref: remoteVideoRef, className: remoteReady ? 'ready' : '', playsInline: true, autoPlay: true }), !remoteReady && _jsxs("div", { className: "call-placeholder", children: [_jsx("div", { className: "pet-face small", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsx("strong", { children: screenStatus === 'paused' ? '仅音频通话' : '正在连接画面…' })] }), _jsxs("div", { className: "call-controls", children: [_jsx("button", { onClick: toggleLocalMic, children: micEnabled ? '关闭麦克风' : '打开麦克风' }), _jsx("button", { onClick: () => void toggleRemoteAudio('system'), children: remoteSystemMuted ? '打开对方声音' : '静音对方声音' }), _jsx("button", { disabled: !remoteReady, onClick: () => void toggleFullscreen(), children: "\u5168\u5C4F" }), _jsx("button", { className: "hangup", onClick: onEndCall, children: "\u7ED3\u675F" })] })] }), _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] }), _jsxs("section", { className: "card connection-quality", children: [_jsx("span", { className: "status-dot" }), rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'] })] })] })) : (_jsxs("section", { className: "card call-idle", children: [_jsx("div", { className: "pet-face", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), callableDevices.length > 1 && _jsx("div", { className: "call-device-list", children: callableDevices.map((device) => _jsxs("label", { children: [_jsx("input", { type: "radio", name: "call-target", checked: callTargetId === device.id, onChange: () => setCallTargetId(device.id) }), device.name] }, device.id)) }), _jsx("button", { className: "primary-button large", disabled: !canCall, onClick: () => void onStartCall(), children: "\u5F00\u59CB\u901A\u8BDD" })] }))] })), activeView === 'settings' && (_jsxs("main", { className: "page settings-page", children: [_jsx("div", { className: "page-heading", children: _jsx("h1", { children: "\u8BBE\u7F6E" }) }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8FDE\u63A5" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668", _jsx("input", { value: serverUrl, onChange: (event) => setServerUrl(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u623F\u95F4\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => setSecret(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u6211\u7684\u8EAB\u4EFD", _jsxs("select", { value: memberId, onChange: (event) => setMemberId(event.target.value), disabled: status === 'connecting' || status === 'connected', children: [_jsx("option", { value: "a", children: "\u7528\u6237 A" }), _jsx("option", { value: "b", children: "\u7528\u6237 B" })] })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value), disabled: status === 'connecting' || status === 'connected' })] })] }), _jsxs("div", { className: "settings-actions", children: [_jsx(StatusPill, { status: status }), status === 'connected' || status === 'connecting' ? _jsx("button", { onClick: onDisconnect, children: "\u65AD\u5F00" }) : _jsx("button", { className: "primary-button", onClick: () => void onConnect(), children: "\u8FDE\u63A5" })] })] }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u6210\u5458\u540D\u79F0" }), peers.members.map((member) => _jsxs("div", { className: "member-row", children: [_jsx("span", { children: member.id === peers.self.memberId ? '我' : '对方' }), editingMemberId === member.id ? _jsxs(_Fragment, { children: [_jsx("input", { value: memberNameDraft, onChange: (event) => setMemberNameDraft(event.target.value) }), _jsx("button", { onClick: async () => { if (memberNameDraft.trim())
+                                                            await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }, children: "\u4FDD\u5B58" }), _jsx("button", { onClick: () => setEditingMemberId(null), children: "\u53D6\u6D88" })] }) : _jsxs(_Fragment, { children: [_jsx("strong", { children: member.displayName }), _jsx("button", { onClick: () => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }, children: "\u4FEE\u6539" })] })] }, member.id))] }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8BBE\u5907" }), peers.members.map((member) => _jsxs("div", { className: "device-group", children: [_jsx("h3", { children: member.displayName }), member.devices.map((device) => _jsxs("div", { className: "device-row", children: [_jsx("span", { className: `device-signal ${device.petOnline ? 'online' : ''}` }), _jsxs("div", { children: [_jsxs("strong", { children: [device.name, device.id === peers.self.deviceId ? ' · 本机' : ''] }), _jsxs("small", { children: ["\u684C\u5BA0", device.petOnline ? '在线' : '离线', " \u00B7 \u63A7\u5236\u7AEF", device.controllerOnline ? '在线' : '离线', " \u00B7 ", new Date(device.lastSeenAt).toLocaleString()] })] }), member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? _jsxs("span", { className: "inline-confirm", children: [_jsx("button", { onClick: async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }, children: "\u786E\u8BA4\u8BA4\u9886" }), _jsx("button", { onClick: () => setReclaimCandidate(null), children: "\u53D6\u6D88" })] }) : _jsx("button", { onClick: () => setReclaimCandidate(device), children: "\u8BA4\u9886\u4E3A\u672C\u673A" }))] }, device.id))] }, member.id))] }), window.desktopPetControl && _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u672C\u673A\u684C\u5BA0" }), _jsxs("div", { className: "scale-settings", children: [_jsx("input", { className: "scale-range", type: "range", min: "30", max: "150", step: "10", value: Math.round(petScale * 100), onChange: (event) => void changePetScale(Number(event.target.value) / 100) }), _jsxs("strong", { children: [Math.round(petScale * 100), "%"] })] }), _jsxs("div", { className: "button-row", children: [_jsx("button", { onClick: () => void resetPetScale(), children: "\u6062\u590D\u9ED8\u8BA4" }), _jsx("button", { onClick: () => void exportDiagnostics(), children: "\u5BFC\u51FA\u8BCA\u65AD\u65E5\u5FD7" })] })] }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8BED\u97F3\u670D\u52A1" }), _jsxs("div", { className: "button-row", children: [_jsx("button", { className: ttsMode === 'managed' ? 'selected' : '', onClick: () => selectTtsMode('managed'), children: "\u670D\u52A1\u7AEF\u58F0\u97F3" }), ttsProvider === 'elevenlabs' && _jsx("button", { className: ttsMode === 'byok' ? 'selected' : '', onClick: () => selectTtsMode('byok'), children: "\u6211\u7684 API Key" })] }), ttsMode === 'byok' && _jsxs("div", { className: "key-row", children: [_jsx("input", { type: "password", value: ttsApiKeyInput, onChange: (event) => setTtsApiKeyInput(event.target.value), placeholder: ttsKeyConfigured ? '已配置，输入新 Key 可替换' : 'ElevenLabs API Key' }), _jsx("button", { onClick: () => void saveByokKey(), children: "\u4FDD\u5B58" }), ttsKeyConfigured && _jsx("button", { className: "danger", onClick: () => void clearByokKey(), children: "\u5220\u9664 Key" })] })] })] }))] }), _jsx("div", { className: `toast-new ${toast ? 'show' : ''} ${toast?.err ? 'error' : ''}`, children: toast?.msg })] }));
 }
 function StatusPill({ status }) {
     const map = {
@@ -908,20 +990,5 @@ function StatusPill({ status }) {
         rejected: { cls: 'bad', text: '被拒绝' },
     };
     const m = map[status];
-    return _jsxs("span", { className: `pill ${m.cls}`, children: [_jsx("span", { className: "dot" }), " ", m.text] });
-}
-function PeerPill({ role, online }) {
-    const text = role === 'pet' ? '桌宠端' : '控制端';
-    return (_jsxs("span", { className: `pill ${online ? 'ok' : ''}`, children: [_jsx("span", { className: "dot" }), " ", text, "\uFF1A", online ? '在线' : '离线'] }));
-}
-function CallPill({ state }) {
-    const map = {
-        idle: { cls: '', text: '未通话' },
-        'requesting-media': { cls: 'warn', text: '拿麦克风中…' },
-        calling: { cls: 'warn', text: '呼叫中…' },
-        'in-call': { cls: 'ok', text: '通话中' },
-        error: { cls: 'bad', text: '通话失败' },
-    };
-    const m = map[state];
     return _jsxs("span", { className: `pill ${m.cls}`, children: [_jsx("span", { className: "dot" }), " ", m.text] });
 }

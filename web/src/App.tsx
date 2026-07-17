@@ -11,7 +11,6 @@ import {
   sendCommand,
   sendSignal,
   setListeners,
-  setTargetDevice,
   setTtsCredentials,
   addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
   getPersonalAudio,
@@ -31,6 +30,8 @@ import {
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
 type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
+type ActiveView = 'control' | 'send' | 'call' | 'settings';
+type SendView = 'tts' | 'audio';
 type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown' | 'failed';
 
 type RtcRoute = {
@@ -44,6 +45,7 @@ const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
 const LS_TARGET_DEVICE = 'pet.targetDeviceId';
+const LS_TARGET_DEVICES = 'pet.targetDeviceIds';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
@@ -103,6 +105,26 @@ const EMPTY_RTC_ROUTE: RtcRoute = {
   path: '选路中',
   detail: '等待 ICE 选路',
 };
+
+type PeerDevice = Peers['members'][number]['devices'][number];
+
+function readSavedTargets(memberId: string, devices: PeerDevice[]): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(`${LS_TARGET_DEVICES}.${memberId}`) || '[]');
+    if (Array.isArray(parsed)) return parsed.filter((id): id is string => typeof id === 'string');
+  } catch {}
+  const legacy = localStorage.getItem(LS_TARGET_DEVICE);
+  return legacy && devices.some((device) => device.id === legacy) ? [legacy] : [];
+}
+
+function normalizeTargets(devices: PeerDevice[], saved: string[]): string[] {
+  const online = devices.filter((device) => device.petOnline);
+  const onlineIds = new Set(online.map((device) => device.id));
+  const retained = saved.filter((id, index) => onlineIds.has(id) && saved.indexOf(id) === index);
+  if (retained.length) return retained;
+  const newest = [...online].sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt))[0];
+  return newest ? [newest.id] : [];
+}
 
 function explainMediaDevicesUnavailable(): string {
   const protocol = window.location.protocol;
@@ -195,7 +217,18 @@ export default function App() {
   const [participantId, setParticipantId] = useState(localParticipantId);
   const [memberId, setMemberId] = useState<'a' | 'b'>('a');
   const [deviceName, setDeviceName] = useState('浏览器');
-  const [targetId, setTargetId] = useState(() => localStorage.getItem(LS_TARGET_DEVICE) || '');
+  const [activeView, setActiveView] = useState<ActiveView>('control');
+  const [sendView, setSendView] = useState<SendView>('tts');
+  const [targetIds, setTargetIds] = useState<string[]>([]);
+  const [callTargetId, setCallTargetId] = useState('');
+  const [targetMenuOpen, setTargetMenuOpen] = useState(false);
+  const [expandedMotions, setExpandedMotions] = useState(false);
+  const [editingMemberId, setEditingMemberId] = useState<'a' | 'b' | null>(null);
+  const [memberNameDraft, setMemberNameDraft] = useState('');
+  const [editingAudioId, setEditingAudioId] = useState<string | null>(null);
+  const [audioNameDraft, setAudioNameDraft] = useState('');
+  const [deleteAudioId, setDeleteAudioId] = useState<string | null>(null);
+  const [reclaimCandidate, setReclaimCandidate] = useState<PeerDevice | null>(null);
   const [peers, setPeers] = useState<Peers>({
     protocolVersion: 2, self: { memberId: 'a', deviceId: '' }, members: [],
     selfReady: false, peerOnline: false, peerPetOnline: false, peerControllerOnline: false,
@@ -224,6 +257,7 @@ export default function App() {
   const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
   const [rtcRoute, setRtcRoute] = useState<RtcRoute>(EMPTY_RTC_ROUTE);
   const toastTimer = useRef<number | null>(null);
+  const personalAudioRecorderRef = useRef<MediaRecorder | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteMicAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteSystemAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -235,6 +269,7 @@ export default function App() {
   const localAudioRef = useRef<MediaStream | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const currentCallIdRef = useRef<string | null>(null);
+  const callTargetIdRef = useRef('');
   const recoveryTimerRef = useRef<number | null>(null);
   const iceRestartedRef = useRef(false);
 
@@ -281,7 +316,7 @@ export default function App() {
   }, [setMicEnabled, stopLocalAudio]);
 
   const sendRtcSignal = useCallback((signal: WebRtcSignal) => {
-    return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined });
+    return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined }, callTargetIdRef.current || undefined);
   }, []);
 
   const syncRemoteMediaState = useCallback(async () => {
@@ -506,13 +541,18 @@ export default function App() {
       onStatus: setStatus,
       onPeers: (next) => {
         setPeers(next);
-        const devices = next.members.find((member) => member.id !== next.self.memberId)?.devices || [];
-        setTargetId((current) => {
-          const onlineDevices = devices.filter((device) => device.petOnline);
-          const selected = current || (onlineDevices.length === 1 ? onlineDevices[0].id : '');
-          if (selected) localStorage.setItem(LS_TARGET_DEVICE, selected);
-          setTargetDevice(selected);
+        const peer = next.members.find((member) => member.id !== next.self.memberId);
+        if (!peer) return;
+        setTargetIds((current) => {
+          const saved = current.length ? current : readSavedTargets(peer.id, peer.devices);
+          const selected = normalizeTargets(peer.devices, saved);
+          localStorage.setItem(`${LS_TARGET_DEVICES}.${peer.id}`, JSON.stringify(selected));
           return selected;
+        });
+        const callable = peer.devices.filter((device) => device.petOnline && device.controllerOnline);
+        setCallTargetId((current) => {
+          if (callable.some((device) => device.id === current)) return current;
+          return callable.length === 1 ? callable[0].id : '';
         });
       },
       onError: (m) => showToast(m, true),
@@ -542,7 +582,9 @@ export default function App() {
           if (payload.reason === 'track_ended') showToast('对方已停止屏幕共享，音频仍可继续');
         }
       },
-      onCallStart: (callId) => {
+      onCallStart: (callId, peerDeviceId) => {
+        callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
+        setActiveView('call');
         beginMediaCall(callId).catch((e) => {
           console.warn('[webrtc] start coordinated call failed:', e);
           showToast(`通话失败：${e?.message || e}`, true);
@@ -667,10 +709,12 @@ export default function App() {
       if (!peers.peerPetOnline) teardownCall({ nextState: 'idle' });
       return;
     }
-    listMotions().then((items) => {
+    const primaryTargetId = targetIds[0];
+    if (!primaryTargetId) return;
+    listMotions(primaryTargetId).then((items) => {
       setMotions(items);
     });
-  }, [status, peers.peerPetOnline, showToast, teardownCall]);
+  }, [status, peers.peerPetOnline, targetIds, teardownCall]);
 
   const toggleRemoteAudio = useCallback(async (kind: 'mic' | 'system') => {
     const isMic = kind === 'mic';
@@ -744,6 +788,11 @@ export default function App() {
     if (result?.ok) setPersonalAudio(result.items || []);
   }, []);
 
+  useEffect(() => {
+    if (status === 'connected') void refreshPersonalAudio();
+    else setPersonalAudio([]);
+  }, [refreshPersonalAudio, status]);
+
   const uploadAudioBlob = useCallback(async (blob: Blob, name: string, durationMs: number) => {
     const result = await addPersonalAudio({ name, mime: blob.type, durationMs, data: await blob.arrayBuffer() });
     if (!result?.ok) return showToast(`添加音频失败：${result?.code || 'unknown'}`, true);
@@ -769,12 +818,13 @@ export default function App() {
     recorder.ondataavailable = (event) => chunks.push(event.data);
     recorder.onstop = async () => {
       stream.getTracks().forEach((track) => track.stop());
+      personalAudioRecorderRef.current = null;
       setRecording(false);
       await uploadAudioBlob(new Blob(chunks, { type: recorder.mimeType }), `录音 ${new Date().toLocaleString()}`, Math.min(60_000, Date.now() - started));
     };
     recorder.start(); setRecording(true);
     window.setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, 60_000);
-    (window as any).__personalAudioRecorder = recorder;
+    personalAudioRecorderRef.current = recorder;
   }, [uploadAudioBlob]);
 
   const changePetScale = useCallback(async (scale: number) => {
@@ -803,18 +853,55 @@ export default function App() {
     showToast(result.ok ? '诊断日志已导出' : `导出失败：${result.error || 'unknown'}`, !result.ok);
   }, [showToast]);
 
-  const selectedDevice = peers.members.flatMap((member) => member.devices).find((device) => device.id === targetId);
-  const canSend = status === 'connected' && !!selectedDevice?.petOnline;
-  const canCall = canSend && !!selectedDevice?.controllerOnline;
+  const peerMember = peers.members.find((member) => member.id !== peers.self.memberId);
+  const selfMember = peers.members.find((member) => member.id === peers.self.memberId);
+  const onlineDevices = peerMember?.devices.filter((device) => device.petOnline) || [];
+  const callableDevices = peerMember?.devices.filter((device) => device.petOnline && device.controllerOnline) || [];
+  const selectedDevices = onlineDevices.filter((device) => targetIds.includes(device.id));
+  const canSend = status === 'connected' && selectedDevices.length > 0;
+  const canCall = status === 'connected' && callableDevices.some((device) => device.id === callTargetId);
+
+  useEffect(() => {
+    callTargetIdRef.current = callTargetId;
+  }, [callTargetId]);
+
+  useEffect(() => {
+    if (callableDevices.some((device) => device.id === callTargetId)) return;
+    const preferred = targetIds.find((id) => callableDevices.some((device) => device.id === id));
+    setCallTargetId(preferred || (callableDevices.length === 1 ? callableDevices[0].id : ''));
+  }, [callTargetId, callableDevices, targetIds]);
+
+  useEffect(() => {
+    if (activeView === 'call') syncRemoteMediaState().catch(() => {});
+  }, [activeView, syncRemoteMediaState]);
+
+  const toggleTarget = useCallback((deviceId: string) => {
+    if (!peerMember) return;
+    setTargetIds((current) => {
+      const selected = current.includes(deviceId)
+        ? current.filter((id) => id !== deviceId)
+        : [...current, deviceId];
+      localStorage.setItem(`${LS_TARGET_DEVICES}.${peerMember.id}`, JSON.stringify(selected));
+      return selected;
+    });
+  }, [peerMember]);
+
+  const onPlayPersonalAudio = useCallback(async (audioId: string) => {
+    const results = await playPersonalAudio(audioId, targetIds);
+    const succeeded = results.filter(({ result }) => result?.ok).length;
+    const failed = results.length - succeeded;
+    if (!succeeded) return showToast(results[0]?.result?.code || '发送音频失败', true);
+    showToast(failed ? `已发送 ${succeeded} 台，${failed} 台失败` : `已发送到 ${succeeded} 台设备`, failed > 0);
+  }, [showToast, targetIds]);
 
   const send = useCallback((cmd: Command, label: string) => {
     if (!canSend) {
       showToast(status === 'connected' ? '桌宠端未上线' : '未连接', true);
       return;
     }
-    const ok = sendCommand(cmd);
-    showToast(ok ? `✔ ${label}` : '发送失败', !ok);
-  }, [canSend, showToast, status]);
+    const sent = sendCommand(cmd, targetIds);
+    showToast(sent ? `${label} · 已发送到 ${sent} 台设备` : '发送失败', !sent);
+  }, [canSend, showToast, status, targetIds]);
 
   const selectTtsMode = useCallback((mode: 'managed' | 'byok') => {
     setTtsMode(mode);
@@ -880,16 +967,20 @@ export default function App() {
       return;
     }
     setTtsState('正在提交…');
-    const result = await createTts(text, ttsVoiceId);
-    if (!result.ok) {
-      const message = ttsErrorMessage(result.code);
+    const results = await createTts(text, ttsVoiceId, targetIds);
+    const succeeded = results.filter(({ result }) => result?.ok);
+    if (!succeeded.length) {
+      const message = ttsErrorMessage(results[0]?.result?.code);
       setTtsState(message);
       showToast(message, true);
       return;
     }
     setTts('');
-    setTtsState(result.position ? `排队中（前面 ${result.position} 条）` : '已发送到对方桌宠');
-  }, [showToast, tts, ttsVoiceId]);
+    const failed = results.length - succeeded.length;
+    const message = failed ? `已发送 ${succeeded.length} 台，${failed} 台失败` : `已发送到 ${succeeded.length} 台设备`;
+    setTtsState(message);
+    showToast(message, failed > 0);
+  }, [showToast, targetIds, tts, ttsVoiceId]);
 
   const onStartCall = useCallback(async () => {
     if (!canCall) {
@@ -898,14 +989,16 @@ export default function App() {
     }
     try {
       setCallState('requesting-media');
-      const result = await requestCall();
+      callTargetIdRef.current = callTargetId;
+      setActiveView('call');
+      const result = await requestCall(callTargetId);
       if (!result.ok) throw new Error(result.code === 'peer_not_ready' ? '对方二合一客户端尚未就绪' : '无法创建通话');
     } catch (e: any) {
       console.warn('[webrtc] startCall failed:', e);
       showToast(`开通话失败：${e?.message || e}`, true);
       teardownCall({ nextState: 'error' });
     }
-  }, [canCall, showToast, teardownCall]);
+  }, [callTargetId, canCall, showToast, teardownCall]);
 
   const onEndCall = useCallback(() => {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
@@ -916,302 +1009,155 @@ export default function App() {
     setMicEnabled(!micEnabled);
   }, [callState, micEnabled, setMicEnabled]);
 
+  const peerName = peerMember?.displayName || '对方';
+  const selfName = selfMember?.displayName || '我';
+  const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
+
   return (
-    <div className="app">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">REMOTE CONSOLE</p>
-          <h1>桌宠远程控制台</h1>
-          <p className="hero-copy">黑白蓝主界面，优先把屏幕、通话和控制动作放到一屏内。</p>
-        </div>
-        <div className="hero-badge">
-          <span className={`signal ${peers.peerOnline ? 'on' : ''}`} />
-          <span>{peers.peerOnline ? '对方在线' : '等待对方'}</span>
-        </div>
-      </header>
-
-      <section className="section">
-        <h2>成员与设备</h2>
-        {peers.members.map((member) => (
-          <div key={member.id}>
-            <div className="status-row">
-              <strong>{member.displayName}{member.id === peers.self.memberId ? '（我）' : ''}</strong>
-              <button className="btn" onClick={async () => { const name = prompt('成员名称', member.displayName); if (name) await renameMember(member.id, name); }}>修改名称</button>
-            </div>
-            {member.devices.map((device) => <div className="empty" key={device.id}>
-              {device.name} · 桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · 最近连接 {new Date(device.lastSeenAt).toLocaleString()}
-              {member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && <button className="btn" onClick={async () => { if (confirm(`将当前设备认领为“${device.name}”？`)) await reclaimDevice(device.id, device.name); }}>认领为当前设备</button>}
-            </div>)}
-          </div>
+    <div className="control-app">
+      <aside className="app-rail" aria-label="主导航">
+        <div className="brand-mark" aria-hidden="true">🐾</div>
+        {([
+          ['control', '⌁', '控制'],
+          ['send', '✦', '发送'],
+          ['call', '◉', '通话'],
+        ] as const).map(([view, icon, label]) => (
+          <button key={view} className={`rail-item ${activeView === view ? 'active' : ''}`} onClick={() => setActiveView(view)}>
+            <span aria-hidden="true">{icon}</span><b>{label}</b>{view === 'call' && callActive && <i />}
+          </button>
         ))}
-      </section>
+        <button className={`rail-item settings ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')}>
+          <span aria-hidden="true">⚙</span><b>设置</b>
+        </button>
+      </aside>
 
-      <div className="status-bar">
-        <div className="status-row">
-          <label>目标设备</label>
-          <select value={targetId} onChange={(event) => {
-            const selected = event.target.value;
-            setTargetId(selected);
-            setTargetDevice(selected);
-            if (selected) localStorage.setItem(LS_TARGET_DEVICE, selected);
-            else localStorage.removeItem(LS_TARGET_DEVICE);
-          }}>
-            <option value="">请选择对方设备</option>
-            {peers.members.find((member) => member.id !== peers.self.memberId)?.devices.map((device) => (
-              <option key={device.id} value={device.id}>{device.name} · 桌宠{device.petOnline ? '在线' : '离线'} / 控制端{device.controllerOnline ? '在线' : '离线'}</option>
-            ))}
-          </select>
-        </div>
-        <div className="status-row">
-          <label>服务器</label>
-          <input
-            value={serverUrl}
-            onChange={(e) => setServerUrl(e.target.value)}
-            placeholder="http://localhost:3030"
-            disabled={status === 'connecting' || status === 'connected'}
-          />
-        </div>
-        <div className="status-row">
-          <label>房间密钥</label>
-          <input
-            type="password"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            placeholder="ROOM_SECRET"
-            disabled={status === 'connecting' || status === 'connected'}
-          />
-        </div>
-        <div className="status-row">
-          <StatusPill status={status} />
-          <PeerPill role="pet" online={peers.peerPetOnline} />
-          {!window.desktopPetControl && !peers.selfReady && <span className="hint">浏览器模式：仅控制端在线</span>}
-          <div style={{ flex: 1 }} />
-          {status === 'connected' || status === 'connecting' ? (
-            <button className="btn" onClick={onDisconnect}>断开</button>
-          ) : (
-            <button className="btn accent" onClick={onConnect}>连接</button>
-          )}
-        </div>
-        {window.desktopPetControl && (
-          <div className="pet-settings">
-            <div className="pet-settings-head">
-              <span>本机桌宠大小</span>
-              <strong>{Math.round(petScale * 100)}%</strong>
-            </div>
-            <input
-              className="pet-scale-range"
-              type="range"
-              min="30"
-              max="150"
-              step="10"
-              value={Math.round(petScale * 100)}
-              onChange={(event) => void changePetScale(Number(event.target.value) / 100)}
-              aria-label="调整本机桌宠大小"
-            />
-            <div className="pet-settings-actions">
-              <button className="btn" onClick={() => void resetPetScale()}>恢复默认大小</button>
-              <button className="btn" onClick={() => void exportDiagnostics()}>导出诊断日志</button>
-            </div>
-            <span className="hint">缩放异常时导出日志；不会包含房间密钥、API Key 或音频。</span>
+      <div className="app-workspace">
+        <header className="app-topbar">
+          <div className="room-identity">
+            <div className="room-avatar">我</div>
+            <div><strong>{selfName}和{peerName}</strong><small>桌宠连接空间</small></div>
           </div>
-        )}
-      </div>
-
-      <section className="section">
-        <h2>通话</h2>
-        <audio ref={remoteMicAudioRef} autoPlay muted={remoteMicMuted} />
-        <audio ref={remoteSystemAudioRef} autoPlay muted={remoteSystemMuted} />
-        <div className="video-stage" ref={videoStageRef}>
-          <video ref={remoteVideoRef} className={`video-frame ${remoteReady ? 'ready' : ''}`} playsInline autoPlay />
-          {!remoteReady && (
-            <div className="video-empty">
-              {screenStatus === 'paused' ? '当前网络通过 TURN 中继，仅保留音频。' : callState === 'calling' || callState === 'requesting-media'
-                ? '正在等桌宠把屏幕推过来。\n如果一直没画面，先去 B 端确认屏幕录制权限。'
-                : '点“开始通话”后，这里会显示她的屏幕。'}
-            </div>
-          )}
-          <button
-            type="button"
-            className="video-fullscreen"
-            disabled={!remoteReady}
-            onClick={toggleFullscreen}
-            aria-label="切换视频全屏"
-          >全屏</button>
-        </div>
-        <div className="video-meta">
-          <span>{remoteReady ? '已收到桌面视频流' : '尚未收到视频流'}</span>
-          <span>远端轨道：{remoteTrackSummary}</span>
-          <span>麦克风：{remoteMicMuted ? '静音' : '播放'}</span>
-          <span>系统声音：{remoteSystemMuted ? '静音' : '播放'}</span>
-        </div>
-        <div className={`rtc-route ${rtcRoute.candidateType}`}>
-          <span>路径：{rtcRoute.path}（ICE {rtcRoute.candidateType}）</span>
-          <span>{rtcRoute.relayed ? '正在走 TURN 中继：仅音频，屏幕视频已暂停' : '点对点连接，不走本项目服务器媒体带宽'}</span>
-          <span>{rtcRoute.detail}</span>
-        </div>
-        <div className="call-row">
-          <CallPill state={callState} />
-          <button
-            className="btn accent"
-            disabled={!canCall || callState === 'calling' || callState === 'requesting-media' || callState === 'in-call'}
-            onClick={onStartCall}
-          >开始通话</button>
-          <button
-            className="btn"
-            disabled={callState !== 'calling' && callState !== 'in-call'}
-            onClick={onEndCall}
-          >结束通话</button>
-          <button
-            className={`btn ${micEnabled ? 'accent' : ''}`}
-            disabled={callState !== 'calling' && callState !== 'in-call'}
-            onClick={toggleLocalMic}
-          >{micEnabled ? '关闭麦克风' : '打开麦克风'}</button>
-          <button
-            className="btn"
-            disabled={callState !== 'calling' && callState !== 'in-call'}
-            onClick={() => toggleRemoteAudio('mic')}
-          >{remoteMicMuted ? '播放麦克风' : '静音麦克风'}</button>
-          <button
-            className="btn"
-            disabled={callState !== 'calling' && callState !== 'in-call'}
-            onClick={() => toggleRemoteAudio('system')}
-          >{remoteSystemMuted ? '播放系统声音' : '静音系统声音'}</button>
-        </div>
-      </section>
-
-      <section className="section">
-        <h2>表情</h2>
-        <div className="grid tight">
-          {EXPRESSIONS.map((e) => (
+          <div className="peer-target">
             <button
-              key={e.name}
-              className="btn"
-              disabled={!canSend}
-              onClick={() => send({ type: 'expression', name: e.name }, e.label)}
-            >{e.label}</button>
-          ))}
-        </div>
-        <h3>动作</h3>
-        <div className="grid tight">
-          <button
-            className="btn"
-            disabled={!canSend}
-            onClick={() => send({ type: 'animation', name: 'idle' }, '默认动作')}
-          >默认动作</button>
-          {motions.filter((m) => m.id !== 'idle').map((m) => (
-            <button
-              key={m.id}
-              className="btn"
-              disabled={!canSend}
-              onClick={() => send({ type: 'animation', name: m.id }, m.label)}
-            >{m.label}</button>
-          ))}
-        </div>
-        {motions.length === 0 && (
-          <div className="empty">
-            {canSend ? '当前模型还没配置额外动作；默认动作仍可使用' : '连上后会显示额外动作'}
-          </div>
-        )}
-      </section>
-
-      <section className="section">
-        <h2>我的音频</h2>
-        <div className="grid tight">
-          <label className="btn">导入音频<input hidden type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm" onChange={(event) => void importAudio(event.target.files?.[0])} /></label>
-          <button className="btn" onClick={() => recording ? (window as any).__personalAudioRecorder?.stop() : void recordAudio()}>{recording ? '停止录音' : '开始录音'}</button>
-          <button className="btn" onClick={() => void refreshPersonalAudio()}>刷新</button>
-        </div>
-        {personalAudio.length === 0 ? <div className="empty">这里只显示你自己录制或导入的音频</div> : personalAudio.map((clip) => (
-          <div className="status-row" key={clip.id}>
-            <span>{clip.name} · {Math.round(clip.durationMs / 1000)} 秒</span>
-            <button className="btn" onClick={async () => { const result = await getPersonalAudio(clip.id); if (result?.ok) { const url = URL.createObjectURL(new Blob([result.data], { type: result.mime })); const audio = new Audio(url); audio.onended = () => URL.revokeObjectURL(url); void audio.play(); } }}>试听</button>
-            <button className="btn" disabled={!canSend} onClick={() => void playPersonalAudio(clip.id)}>发送</button>
-            <button className="btn" onClick={async () => { const name = prompt('新名称', clip.name); if (name) { await renamePersonalAudio(clip.id, name); await refreshPersonalAudio(); } }}>重命名</button>
-            <button className="btn" onClick={async () => { await deletePersonalAudio(clip.id); await refreshPersonalAudio(); }}>删除</button>
-          </div>
-        ))}
-      </section>
-
-      <section className="section">
-        <h2>语音消息 · {ttsProvider === 'cosyvoice' ? 'CosyVoice' : 'ElevenLabs'}</h2>
-        <div className="tts-area">
-          <div className="tts-mode-row">
-            <button className={`btn ${ttsMode === 'managed' ? 'accent' : ''}`} onClick={() => selectTtsMode('managed')}>服务端声音</button>
-            {ttsProvider === 'elevenlabs' && <button className={`btn ${ttsMode === 'byok' ? 'accent' : ''}`} onClick={() => selectTtsMode('byok')}>使用我的 API Key</button>}
-            <span className="tts-hint">发送后由对方桌宠用你的克隆声音播放</span>
-          </div>
-          {ttsMode === 'byok' && (
-            <div className="tts-key-row">
-              <input
-                type="password"
-                value={ttsApiKeyInput}
-                onChange={(event) => setTtsApiKeyInput(event.target.value)}
-                placeholder={ttsKeyConfigured ? 'API Key 已安全保存，输入新 Key 可替换' : 'ElevenLabs API Key'}
-                autoComplete="off"
-              />
-              <button className="btn" disabled={!ttsApiKeyInput.trim()} onClick={saveByokKey}>验证并保存</button>
-              {ttsKeyConfigured && <button className="btn danger" onClick={clearByokKey}>删除 Key</button>}
-            </div>
-          )}
-          <div className="tts-voice-row">
-            <label htmlFor="tts-voice">我的声音</label>
-            <select
-              id="tts-voice"
-              value={ttsVoiceId}
-              disabled={status !== 'connected' || !ttsVoices.length}
-              onChange={(event) => {
-                setTtsVoiceId(event.target.value);
-                localStorage.setItem(LS_TTS_VOICE, event.target.value);
-              }}
+              className={`online-chip ${onlineDevices.length ? '' : 'offline'}`}
+              disabled={onlineDevices.length < 2}
+              aria-expanded={targetMenuOpen}
+              onClick={() => setTargetMenuOpen((open) => !open)}
             >
-              {!ttsVoices.length && <option value="">暂无可用声音</option>}
-              {ttsVoices.map((voice) => <option key={voice.id} value={voice.id}>{voice.label}</option>)}
-            </select>
-            <button className="btn" disabled={!ttsVoices.find((voice) => voice.id === ttsVoiceId)?.previewUrl} onClick={previewTtsVoice}>试听</button>
-            <span className="tts-status">{ttsState}</span>
+              <span className="status-dot" />
+              {peerName}{onlineDevices.length ? '在线' : '离线'}
+              {onlineDevices.length > 1 && <em>· {onlineDevices.length} 台⌄</em>}
+            </button>
+            {targetMenuOpen && onlineDevices.length > 1 && (
+              <div className="target-popover">
+                {onlineDevices.map((device) => (
+                  <label className="target-option" key={device.id}>
+                    <input type="checkbox" checked={targetIds.includes(device.id)} onChange={() => toggleTarget(device.id)} />
+                    <span><strong>{device.name}</strong><small>{targetIds.includes(device.id) ? '发送目标' : '在线'}</small></span>
+                    <i />
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
-          <textarea
-            value={tts}
-            onChange={(e) => setTts(e.target.value)}
-            placeholder="想你了… (Ctrl/Cmd + Enter 发送)"
-            maxLength={200}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                onSendTts();
-              }
-            }}
-          />
-          <div className="tts-row">
-            <button
-              className="btn accent"
-              disabled={!canSend || !tts.trim() || !ttsVoiceId}
-              onClick={onSendTts}
-            >让她听到 ▶</button>
-            <span className="tts-hint">只使用本人所有或已获授权的克隆声音</span>
-            <div style={{ flex: 1 }} />
-            <span className="tts-hint">{tts.length}/200</span>
-          </div>
-        </div>
-      </section>
+        </header>
 
-      <section className="section">
-        <h2>位置</h2>
-        <div className="grid tight">
-          {CORNERS.map((c) => (
-            <button
-              key={c.corner}
-              className="btn"
-              disabled={!canSend}
-              onClick={() => send({ type: 'relocate', corner: c.corner }, `贴 ${c.label}`)}
-            >{c.label}</button>
-          ))}
-        </div>
-      </section>
+        {activeView === 'control' && (
+          <main className="page control-page">
+            <section className="pet-hero card">
+              <div className="pet-face" aria-hidden="true">˶ᵔ ᵕ ᵔ˶</div>
+              <h1>想让{peerName}的桌宠做什么？</h1>
+            </section>
+            <section className="card action-panel">
+              <div className="section-title"><h2>快捷互动</h2></div>
+              <div className="action-grid">
+                {EXPRESSIONS.map((item, index) => (
+                  <button className={`action-tile ${index === 0 ? 'primary' : ''}`} key={item.name} disabled={!canSend} onClick={() => send({ type: 'expression', name: item.name }, item.label)}>
+                    <span>{['♡', '!', '☁', '⌁', '✦', '·'][index]}</span><b>{item.label}</b><small>表情</small>
+                  </button>
+                ))}
+                {(expandedMotions ? motions : motions.slice(0, 3)).filter((motion) => motion.id !== 'idle').map((motion) => (
+                  <button className="action-tile" key={motion.id} disabled={!canSend} onClick={() => send({ type: 'animation', name: motion.id }, motion.label)}>
+                    <span>↝</span><b>{motion.label}</b><small>动作</small>
+                  </button>
+                ))}
+              </div>
+              {motions.length > 4 && <button className="text-button" onClick={() => setExpandedMotions((value) => !value)}>{expandedMotions ? '收起动作' : '全部动作'}</button>}
+            </section>
+            <aside className="control-side">
+              <section className="card compact-card"><h2>移动位置</h2><div className="corner-grid">{CORNERS.map((item) => <button key={item.corner} disabled={!canSend} onClick={() => send({ type: 'relocate', corner: item.corner }, `移动到${item.label}`)}>{item.label}</button>)}</div></section>
+              <section className="card compact-card"><h2>和{peerName}通话</h2><button className="dark-button" onClick={() => setActiveView('call')}>打开通话</button></section>
+              {window.desktopPetControl && <section className="card compact-card"><div className="section-title"><h2>我的桌宠</h2><b>{Math.round(petScale * 100)}%</b></div><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} aria-label="调整本机桌宠大小" /></section>}
+            </aside>
+          </main>
+        )}
 
-      <div className={`toast ${toast ? 'on' : ''} ${toast?.err ? 'err' : ''}`}>
-        {toast?.msg}
+        {activeView === 'send' && (
+          <main className="page send-page">
+            <div className="page-heading"><h1>发送给{peerName}</h1><div className="segmented"><button className={sendView === 'tts' ? 'active' : ''} onClick={() => setSendView('tts')}>说句话</button><button className={sendView === 'audio' ? 'active' : ''} onClick={() => setSendView('audio')}>我的音频</button></div></div>
+            {sendView === 'tts' ? (
+              <section className="card tts-compose">
+                <div className="compose-main">
+                  <textarea value={tts} maxLength={200} onChange={(event) => setTts(event.target.value)} placeholder="输入想让桌宠说的话…" onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void onSendTts(); } }} />
+                  <div className="compose-actions"><label>声音<select value={ttsVoiceId} disabled={!ttsVoices.length} onChange={(event) => { setTtsVoiceId(event.target.value); localStorage.setItem(LS_TTS_VOICE, event.target.value); }}>{!ttsVoices.length && <option value="">暂无可用声音</option>}{ttsVoices.map((voice) => <option value={voice.id} key={voice.id}>{voice.label}</option>)}</select></label><button className="text-button" disabled={!ttsVoices.find((voice) => voice.id === ttsVoiceId)?.previewUrl} onClick={previewTtsVoice}>试听</button><span className="compose-state">{ttsState}</span><button className="primary-button" disabled={!canSend || !tts.trim() || !ttsVoiceId} onClick={() => void onSendTts()}>发送</button></div>
+                </div>
+              </section>
+            ) : (
+              <section className="card audio-library">
+                <div className="section-title"><h2>我的音频</h2><div className="button-row"><button onClick={() => recording ? personalAudioRecorderRef.current?.stop() : void recordAudio()}>{recording ? '停止录制' : '● 录制'}</button><label className="button-like">＋ 导入<input hidden type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm" onChange={(event) => void importAudio(event.target.files?.[0])} /></label></div></div>
+                <div className="audio-grid">
+                  {personalAudio.map((clip) => (
+                    <article className="audio-card" key={clip.id}>
+                      <button className="play-button" aria-label={`试听 ${clip.name}`} onClick={async () => { const result = await getPersonalAudio(clip.id); if (result?.ok) { const url = URL.createObjectURL(new Blob([result.data], { type: result.mime })); const audio = new Audio(url); audio.onended = () => URL.revokeObjectURL(url); void audio.play(); } }}>▶</button>
+                      {editingAudioId === clip.id ? <input value={audioNameDraft} onChange={(event) => setAudioNameDraft(event.target.value)} /> : <div><strong>{clip.name}</strong><small>{Math.round(clip.durationMs / 1000)} 秒</small></div>}
+                      <div className="audio-actions">
+                        {editingAudioId === clip.id ? <button onClick={async () => { if (audioNameDraft.trim()) await renamePersonalAudio(clip.id, audioNameDraft.trim()); setEditingAudioId(null); await refreshPersonalAudio(); }}>保存</button> : <button onClick={() => { setEditingAudioId(clip.id); setAudioNameDraft(clip.name); }}>重命名</button>}
+                        <button disabled={!canSend} onClick={() => void onPlayPersonalAudio(clip.id)}>发送</button>
+                        {deleteAudioId === clip.id ? <><button className="danger" onClick={async () => { await deletePersonalAudio(clip.id); setDeleteAudioId(null); await refreshPersonalAudio(); }}>确认删除</button><button onClick={() => setDeleteAudioId(null)}>取消</button></> : <button onClick={() => setDeleteAudioId(clip.id)}>删除</button>}
+                      </div>
+                    </article>
+                  ))}
+                  {!personalAudio.length && <button className="audio-empty" onClick={() => void recordAudio()}>＋ 添加第一段音频</button>}
+                </div>
+              </section>
+            )}
+          </main>
+        )}
+
+        {activeView === 'call' && (
+          <main className={`page call-page ${callActive ? 'active-call' : ''}`}>
+            <audio ref={remoteMicAudioRef} autoPlay muted={remoteMicMuted} /><audio ref={remoteSystemAudioRef} autoPlay muted={remoteSystemMuted} />
+            {callActive ? (
+              <>
+                <section className="video-stage-new" ref={videoStageRef}>
+                  <video ref={remoteVideoRef} className={remoteReady ? 'ready' : ''} playsInline autoPlay />
+                  {!remoteReady && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>{screenStatus === 'paused' ? '仅音频通话' : '正在连接画面…'}</strong></div>}
+                  <div className="call-controls"><button onClick={toggleLocalMic}>{micEnabled ? '关闭麦克风' : '打开麦克风'}</button><button onClick={() => void toggleRemoteAudio('system')}>{remoteSystemMuted ? '打开对方声音' : '静音对方声音'}</button><button disabled={!remoteReady} onClick={() => void toggleFullscreen()}>全屏</button><button className="hangup" onClick={onEndCall}>结束</button></div>
+                </section>
+                <aside className="call-sidebar"><section className="card"><h2>正在和{peerName}通话</h2><p>{callState === 'in-call' ? '已连接' : '连接中…'}</p></section><section className="card"><h2>通话控制</h2><label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label><label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label><label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label></section><section className="card connection-quality"><span className="status-dot" />{rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'}</section></aside>
+              </>
+            ) : (
+              <section className="card call-idle">
+                <div className="pet-face">˶ᵔ ᵕ ᵔ˶</div><h1>和{peerName}通话</h1>
+                {callableDevices.length > 1 && <div className="call-device-list">{callableDevices.map((device) => <label key={device.id}><input type="radio" name="call-target" checked={callTargetId === device.id} onChange={() => setCallTargetId(device.id)} />{device.name}</label>)}</div>}
+                <button className="primary-button large" disabled={!canCall} onClick={() => void onStartCall()}>开始通话</button>
+              </section>
+            )}
+          </main>
+        )}
+
+        {activeView === 'settings' && (
+          <main className="page settings-page">
+            <div className="page-heading"><h1>设置</h1></div>
+            <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>我的身份<select value={memberId} onChange={(event) => setMemberId(event.target.value as 'a' | 'b')} disabled={status === 'connecting' || status === 'connected'}><option value="a">用户 A</option><option value="b">用户 B</option></select></label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div><div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" onClick={() => void onConnect()}>连接</button>}</div></section>
+            <section className="card settings-section"><h2>成员名称</h2>{peers.members.map((member) => <div className="member-row" key={member.id}><span>{member.id === peers.self.memberId ? '我' : '对方'}</span>{editingMemberId === member.id ? <><input value={memberNameDraft} onChange={(event) => setMemberNameDraft(event.target.value)} /><button onClick={async () => { if (memberNameDraft.trim()) await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }}>保存</button><button onClick={() => setEditingMemberId(null)}>取消</button></> : <><strong>{member.displayName}</strong><button onClick={() => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }}>修改</button></>}</div>)}</section>
+            <section className="card settings-section"><h2>设备</h2>{peers.members.map((member) => <div className="device-group" key={member.id}><h3>{member.displayName}</h3>{member.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-signal ${device.petOnline ? 'online' : ''}`} /><div><strong>{device.name}{device.id === peers.self.deviceId ? ' · 本机' : ''}</strong><small>桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · {new Date(device.lastSeenAt).toLocaleString()}</small></div>{member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? <span className="inline-confirm"><button onClick={async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }}>确认认领</button><button onClick={() => setReclaimCandidate(null)}>取消</button></span> : <button onClick={() => setReclaimCandidate(device)}>认领为本机</button>)}</div>)}</div>)}</section>
+            {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button><button onClick={() => void exportDiagnostics()}>导出诊断日志</button></div></section>}
+            <section className="card settings-section"><h2>语音服务</h2><div className="button-row"><button className={ttsMode === 'managed' ? 'selected' : ''} onClick={() => selectTtsMode('managed')}>服务端声音</button>{ttsProvider === 'elevenlabs' && <button className={ttsMode === 'byok' ? 'selected' : ''} onClick={() => selectTtsMode('byok')}>我的 API Key</button>}</div>{ttsMode === 'byok' && <div className="key-row"><input type="password" value={ttsApiKeyInput} onChange={(event) => setTtsApiKeyInput(event.target.value)} placeholder={ttsKeyConfigured ? '已配置，输入新 Key 可替换' : 'ElevenLabs API Key'} /><button onClick={() => void saveByokKey()}>保存</button>{ttsKeyConfigured && <button className="danger" onClick={() => void clearByokKey()}>删除 Key</button>}</div>}</section>
+          </main>
+        )}
       </div>
+      <div className={`toast-new ${toast ? 'show' : ''} ${toast?.err ? 'error' : ''}`}>{toast?.msg}</div>
     </div>
   );
 }
@@ -1225,26 +1171,5 @@ function StatusPill({ status }: { status: Status }) {
     rejected:     { cls: 'bad',   text: '被拒绝' },
   };
   const m = map[status];
-  return <span className={`pill ${m.cls}`}><span className="dot" /> {m.text}</span>;
-}
-
-function PeerPill({ role, online }: { role: 'pet' | 'controller'; online: boolean }) {
-  const text = role === 'pet' ? '桌宠端' : '控制端';
-  return (
-    <span className={`pill ${online ? 'ok' : ''}`}>
-      <span className="dot" /> {text}：{online ? '在线' : '离线'}
-    </span>
-  );
-}
-
-function CallPill({ state }: { state: CallState }) {
-  const map: Record<CallState, { cls: string; text: string }> = {
-    idle:               { cls: '', text: '未通话' },
-    'requesting-media': { cls: 'warn', text: '拿麦克风中…' },
-    calling:            { cls: 'warn', text: '呼叫中…' },
-    'in-call':          { cls: 'ok', text: '通话中' },
-    error:              { cls: 'bad', text: '通话失败' },
-  };
-  const m = map[state];
   return <span className={`pill ${m.cls}`}><span className="dot" /> {m.text}</span>;
 }
