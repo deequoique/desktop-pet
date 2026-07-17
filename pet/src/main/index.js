@@ -1,7 +1,15 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { randomUUID } = require('crypto');
+const {
+  appendDiagnostic,
+  clampBoundsToWorkArea,
+  clampScale,
+  readDiagnosticLogs,
+  redactDiagnosticValue,
+} = require('./diagnostics');
 
 const DEV_URL = 'http://localhost:5173';
 const CONTROL_DEV_URL = 'http://localhost:5174';
@@ -24,15 +32,14 @@ const PET_H = 480;
 const MIN_SCALE = 0.3;
 const MAX_SCALE = 1.5;
 
-const clampScale = (s) => {
-  const n = Number(s);
-  if (!Number.isFinite(n)) return 1;
-  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, n));
-};
-
 const stateFile = () => path.join(app.getPath('userData'), 'pet-state.json');
 const pairingFile = () => path.join(app.getPath('userData'), 'pairing.json');
 const ttsCredentialsFile = () => path.join(app.getPath('userData'), 'tts-credentials.bin');
+const diagnosticLogFile = () => path.join(app.getPath('userData'), 'logs', 'diagnostic.jsonl');
+
+function diagnostic(event, payload = {}) {
+  appendDiagnostic(diagnosticLogFile(), event, payload);
+}
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')); }
@@ -49,7 +56,7 @@ function patchState(patch) {
 
 function currentScale() {
   const s = loadState();
-  return clampScale(s && s.scale != null ? s.scale : 1);
+  return clampScale(s && s.scale != null ? s.scale : 1, MIN_SCALE, MAX_SCALE);
 }
 
 function launchAtStartupEnabled() {
@@ -187,6 +194,118 @@ let updateState = {
   error: '',
 };
 
+function displaySnapshot(display) {
+  if (!display) return null;
+  return {
+    id: display.id,
+    bounds: display.bounds,
+    workArea: display.workArea,
+    scaleFactor: display.scaleFactor,
+    rotation: display.rotation,
+  };
+}
+
+function allDisplaySnapshots() {
+  try { return screen.getAllDisplays().map(displaySnapshot); }
+  catch { return []; }
+}
+
+function currentWindowSnapshot() {
+  if (!win || win.isDestroyed()) return null;
+  const bounds = win.getBounds();
+  return {
+    bounds,
+    display: displaySnapshot(screen.getDisplayMatching(bounds)),
+  };
+}
+
+function broadcastScaleChanged(scale) {
+  for (const target of [win, controlWin]) {
+    if (target && !target.isDestroyed()) target.webContents.send('pet:scale-changed', scale);
+  }
+}
+
+function applyPetScale(rawScale, source = 'unknown') {
+  if (!win || win.isDestroyed()) return { ok: false, error: 'pet_window_unavailable' };
+  const requestedScale = Number(rawScale);
+  const scale = clampScale(requestedScale, MIN_SCALE, MAX_SCALE);
+  const before = win.getBounds();
+  const display = screen.getDisplayMatching(before);
+  const width = Math.round(PET_W * scale);
+  const height = Math.round(PET_H * scale);
+  const desired = clampBoundsToWorkArea({
+    x: before.x + (before.width - width) / 2,
+    y: before.y + before.height - height,
+    width,
+    height,
+  }, display.workArea);
+
+  win.setBounds(desired);
+  const after = win.getBounds();
+  const actualScale = Math.round(clampScale(after.width / PET_W, MIN_SCALE, MAX_SCALE) * 1000) / 1000;
+  patchState({ x: after.x, y: after.y, scale: actualScale });
+  diagnostic('pet-scale-applied', {
+    source,
+    requestedScale: Number.isFinite(requestedScale) ? requestedScale : String(rawScale),
+    clampedScale: scale,
+    actualScale,
+    before,
+    desired,
+    after,
+    display: displaySnapshot(display),
+  });
+  broadcastScaleChanged(actualScale);
+  return { ok: true, scale: actualScale, bounds: after };
+}
+
+function diagnosticSnapshot() {
+  return redactDiagnosticValue({
+    generatedAt: new Date().toISOString(),
+    app: {
+      name: app.getName(),
+      version: app.getVersion(),
+      packaged: app.isPackaged,
+    },
+    runtime: {
+      platform: process.platform,
+      arch: process.arch,
+      osRelease: os.release(),
+      osVersion: typeof os.version === 'function' ? os.version() : '',
+      electron: process.versions.electron,
+      chrome: process.versions.chrome,
+      node: process.versions.node,
+    },
+    displays: allDisplaySnapshots(),
+    petWindow: currentWindowSnapshot(),
+    petState: loadState(),
+  });
+}
+
+async function exportDiagnostics(parentWindow = controlWin?.isVisible() ? controlWin : win) {
+  try {
+    const defaultName = `desktop-pet-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const result = await dialog.showSaveDialog(parentWindow && !parentWindow.isDestroyed() ? parentWindow : undefined, {
+      title: 'Export Desktop Pet Diagnostics',
+      defaultPath: path.join(app.getPath('documents'), defaultName),
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePath) {
+      diagnostic('diagnostics-export-canceled');
+      return { ok: false, canceled: true };
+    }
+    const bundle = redactDiagnosticValue({
+      ...diagnosticSnapshot(),
+      logs: readDiagnosticLogs(diagnosticLogFile()),
+    });
+    fs.writeFileSync(result.filePath, `${JSON.stringify(bundle, null, 2)}\n`, 'utf8');
+    diagnostic('diagnostics-exported');
+    return { ok: true, canceled: false, path: result.filePath };
+  } catch (error) {
+    diagnostic('diagnostics-export-failed', { error: error?.message || String(error) });
+    return { ok: false, canceled: false, error: error?.message || 'export_failed' };
+  }
+}
+
 function showUpdateMessage(type, message) {
   if (!win || win.isDestroyed()) return;
   dialog.showMessageBox(win, {
@@ -234,7 +353,10 @@ function rebuildTrayMenu() {
         const p = defaultBottomRight();
         win?.setPosition(p.x, p.y);
         patchState({ x: p.x, y: p.y });
+        diagnostic('pet-position-reset', { position: p, window: currentWindowSnapshot() });
       } },
+    { label: 'Reset Pet Size', click: () => applyPetScale(1, 'tray-reset') },
+    { label: 'Export Diagnostics...', click: () => { void exportDiagnostics(); } },
     { label: updateLabel, enabled: app.isPackaged && !!autoUpdater && !updateState.checking, click: () => {
         if (updateState.downloaded && autoUpdater) {
           autoUpdater.quitAndInstall(false, true);
@@ -333,7 +455,7 @@ function setupAutoUpdater() {
 function createWindow() {
   const saved = loadState();
   gameMode = !!saved?.gameMode;
-  const scale = clampScale(saved && saved.scale != null ? saved.scale : 1);
+  const scale = clampScale(saved && saved.scale != null ? saved.scale : 1, MIN_SCALE, MAX_SCALE);
   const w = Math.round(PET_W * scale);
   const h = Math.round(PET_H * scale);
   const hasPos = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y);
@@ -343,12 +465,14 @@ function createWindow() {
     return { x: workArea.x + workArea.width - w - 16, y: workArea.y + workArea.height - h - 16 };
   })();
   const pos = hasPos ? saved : fallbackPos;
+  const initialDisplay = screen.getDisplayMatching({ x: pos.x, y: pos.y, width: w, height: h });
+  const initialBounds = clampBoundsToWorkArea({ x: pos.x, y: pos.y, width: w, height: h }, initialDisplay.workArea);
 
   win = new BrowserWindow({
-    width: w,
-    height: h,
-    x: pos.x,
-    y: pos.y,
+    width: initialBounds.width,
+    height: initialBounds.height,
+    x: initialBounds.x,
+    y: initialBounds.y,
     transparent: true,
     frame: false,
     hasShadow: false,
@@ -385,10 +509,25 @@ function createWindow() {
     win.loadFile(path.join(__dirname, '../../dist/index.html'));
   }
 
+  diagnostic('pet-window-created', {
+    savedState: saved,
+    requestedScale: scale,
+    initialBounds,
+    actualBounds: win.getBounds(),
+    display: displaySnapshot(initialDisplay),
+  });
+  win.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
+  win.webContents.on('render-process-gone', (_event, details) => {
+    diagnostic('pet-render-process-gone', details);
+  });
+  win.on('unresponsive', () => diagnostic('pet-window-unresponsive', currentWindowSnapshot()));
+
   win.on('moved', () => {
     const [x, y] = win.getPosition();
     patchState({ x, y });
+    diagnostic('pet-window-moved', currentWindowSnapshot());
   });
+  win.on('resize', () => diagnostic('pet-window-resized', currentWindowSnapshot()));
 }
 
 function showControlWindow() {
@@ -415,6 +554,11 @@ function createControlWindow() {
   });
   if (isDev) controlWin.loadURL(CONTROL_DEV_URL);
   else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
+  controlWin.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
+  controlWin.webContents.on('render-process-gone', (_event, details) => {
+    diagnostic('control-render-process-gone', details);
+  });
+  controlWin.on('unresponsive', () => diagnostic('control-window-unresponsive'));
   controlWin.on('close', (event) => {
     if (app.isQuiting) return;
     event.preventDefault();
@@ -500,20 +644,19 @@ ipcMain.on('pet:relocate', (_e, corner) => {
   patchState({ x: p.x, y: p.y });
 });
 
-// 远程/本地 resize：scale → 重算窗口尺寸，锚定底部中心，避免缩放跑位。
-ipcMain.on('pet:resize', (_e, rawScale) => {
-  if (!win || win.isDestroyed()) return;
-  const scale = clampScale(rawScale);
-  const w = Math.round(PET_W * scale);
-  const h = Math.round(PET_H * scale);
-  const b = win.getBounds();
-  const x = Math.round(b.x + (b.width - w) / 2);
-  const y = Math.round(b.y + (b.height - h));
-  win.setBounds({ x, y, width: w, height: h });
-  patchState({ x, y, scale });
-});
-
 ipcMain.handle('pet:get-scale', () => currentScale());
+ipcMain.handle('pet:set-scale', (event, rawScale) => {
+  const source = event.sender === controlWin?.webContents ? 'control-panel' : 'pet-overlay';
+  return applyPetScale(rawScale, source);
+});
+ipcMain.handle('pet:reset-scale', (event) => {
+  const source = event.sender === controlWin?.webContents ? 'control-panel-reset' : 'pet-overlay-reset';
+  return applyPetScale(1, source);
+});
+ipcMain.handle('diagnostics:export', (event) => {
+  const parentWindow = BrowserWindow.fromWebContents(event.sender);
+  return exportDiagnostics(parentWindow);
+});
 
 // 60Hz 轮询光标位置 → 推给渲染层做 hit-test
 // macOS 透明窗 + setIgnoreMouseEvents 不会把 mousemove 转发给 renderer，必须主进程主动喂
@@ -605,6 +748,39 @@ ipcMain.handle('pet:desktop-source-id', async () => {
   }
 });
 
+function onDisplayMetricsChanged(_event, display, changedMetrics) {
+  diagnostic('display-metrics-changed', {
+    changedMetrics,
+    display: displaySnapshot(display),
+    petWindow: currentWindowSnapshot(),
+  });
+}
+
+function onDisplayAdded(_event, display) {
+  diagnostic('display-added', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
+}
+
+function onDisplayRemoved(_event, display) {
+  diagnostic('display-removed', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
+}
+
+function onUncaughtException(error, origin) {
+  diagnostic('uncaught-exception', {
+    origin,
+    name: error?.name,
+    message: error?.message || String(error),
+    stack: error?.stack,
+  });
+}
+
+function onUnhandledRejection(reason) {
+  diagnostic('unhandled-rejection', {
+    name: reason?.name,
+    message: reason?.message || String(reason),
+    stack: reason?.stack,
+  });
+}
+
 app.whenReady().then(() => {
   ensureParticipantId();
   ensureDefaultLaunchAtStartup();
@@ -613,6 +789,12 @@ app.whenReady().then(() => {
   createTray();
   startCursorPoll();
   setupAutoUpdater();
+  screen.on('display-metrics-changed', onDisplayMetricsChanged);
+  screen.on('display-added', onDisplayAdded);
+  screen.on('display-removed', onDisplayRemoved);
+  process.on('uncaughtExceptionMonitor', onUncaughtException);
+  process.on('unhandledRejection', onUnhandledRejection);
+  diagnostic('app-started', diagnosticSnapshot());
   setTimeout(() => checkForPetUpdates(false), 3000);
   if (!configuredServerUrl() || !configuredRoomSecret()) showControlWindow();
 
@@ -636,5 +818,10 @@ app.on('before-quit', () => {
 app.on('will-quit', () => {
   petDragging = false;
   stopCursorPoll();
+  screen.removeListener('display-metrics-changed', onDisplayMetricsChanged);
+  screen.removeListener('display-added', onDisplayAdded);
+  screen.removeListener('display-removed', onDisplayRemoved);
+  process.removeListener('uncaughtExceptionMonitor', onUncaughtException);
+  process.removeListener('unhandledRejection', onUnhandledRejection);
   globalShortcut.unregisterAll();
 });

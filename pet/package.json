@@ -12,6 +12,7 @@
     "dev:control": "npm run dev --prefix ../web",
     "dev:electron": "wait-on tcp:5173 tcp:5174 && electron .",
     "dev:electron:local": "wait-on tcp:5173 tcp:5174 tcp:3030 && electron .",
+    "test": "node --test test/*.test.cjs",
     "typecheck": "tsc -p tsconfig.json",
     "build:renderer": "npm run typecheck && node ../scripts/run-vite.cjs build && node ../scripts/build-control.cjs",
     "pack": "npm run build:renderer && electron-builder --dir",

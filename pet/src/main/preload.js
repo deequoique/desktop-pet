@@ -6,8 +6,13 @@ contextBridge.exposeInMainWorld('pet', {
   startDrag: () => ipcRenderer.send('pet:drag-start'),
   stopDrag: () => ipcRenderer.send('pet:drag-end'),
   relocate: (corner) => ipcRenderer.send('pet:relocate', corner),
-  resize: (scale) => ipcRenderer.send('pet:resize', scale),
+  resize: (scale) => ipcRenderer.invoke('pet:set-scale', scale),
   getScale: () => ipcRenderer.invoke('pet:get-scale'),
+  onScaleChanged: (cb) => {
+    const handler = (_event, scale) => cb(scale);
+    ipcRenderer.on('pet:scale-changed', handler);
+    return () => ipcRenderer.removeListener('pet:scale-changed', handler);
+  },
   onCursor: (cb) => ipcRenderer.on('pet:cursor', (_e, c) => cb(c)),
   listVoices: () => ipcRenderer.invoke('pet:voices'),
   getServerUrl: () => ipcRenderer.invoke('pet:server-url'),

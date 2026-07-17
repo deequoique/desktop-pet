@@ -12,8 +12,9 @@ declare global {
       startDrag: () => void;
       stopDrag: () => void;
       relocate: (corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right') => void;
-      resize: (scale: number) => void;
+      resize: (scale: number) => Promise<{ ok: boolean; scale?: number; error?: string }>;
       getScale: () => Promise<number>;
+      onScaleChanged: (cb: (scale: number) => void) => () => void;
       onCursor: (cb: (c: { cx: number; cy: number; ww: number; wh: number; inside: boolean }) => void) => void;
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
@@ -34,8 +35,9 @@ const browserPetBridge: PetBridge = {
   startDrag: () => {},
   stopDrag: () => {},
   relocate: () => {},
-  resize: () => {},
+  resize: async (scale) => ({ ok: true, scale }),
   getScale: async () => 1,
+  onScaleChanged: () => () => {},
   onCursor: (cb) => {
     const emit = (cx: number, cy: number, inside: boolean) => {
       cb({ cx, cy, ww: window.innerWidth, wh: window.innerHeight, inside });
@@ -1211,8 +1213,10 @@ function showSizeControls() {
 }
 
 function resizeBy(delta: number) {
-  currentScale = clampScale(Math.round((currentScale + delta) * 10) / 10);
-  petBridge.resize(currentScale);
+  const requestedScale = clampScale(Math.round((currentScale + delta) * 10) / 10);
+  void petBridge.resize(requestedScale).then((result) => {
+    if (result.ok && typeof result.scale === 'number') currentScale = clampScale(result.scale);
+  }).catch((error) => console.warn('[scale] resize failed:', error?.message || error));
   showSizeControls();
 }
 
@@ -1235,6 +1239,9 @@ sizeUp.addEventListener('click', (e) => {
 petBridge.getScale().then((scale) => {
   currentScale = clampScale(scale);
 }).catch(() => {});
+petBridge.onScaleChanged((scale) => {
+  currentScale = clampScale(scale);
+});
 
 // === 远程控制（M4a）===
 // A 端（controller）通过 Socket.IO 发指令，B 端（pet）路由到现有动作函数 / FBX 动作。

@@ -42,6 +42,8 @@ const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
 type PairingConfig = { serverUrl?: string; roomSecret?: string; participantId?: string };
+type PetScaleResult = { ok: boolean; scale?: number; error?: string };
+type DiagnosticsExportResult = { ok: boolean; canceled?: boolean; path?: string; error?: string };
 
 declare global {
   interface Window {
@@ -51,6 +53,11 @@ declare global {
       onPairingChanged: (cb: (config: PairingConfig) => void) => void;
       getTtsCredentials: () => Promise<{ configured: boolean; apiKey?: string }>;
       saveTtsCredentials: (apiKey: string) => Promise<{ ok: boolean; configured?: boolean; error?: string }>;
+      getPetScale: () => Promise<number>;
+      setPetScale: (scale: number) => Promise<PetScaleResult>;
+      resetPetScale: () => Promise<PetScaleResult>;
+      onPetScaleChanged: (cb: (scale: number) => void) => () => void;
+      exportDiagnostics: () => Promise<DiagnosticsExportResult>;
     };
   }
 }
@@ -206,6 +213,7 @@ export default function App() {
   const [ttsVoiceId, setTtsVoiceId] = useState(() => localStorage.getItem(LS_TTS_VOICE) || '');
   const [ttsState, setTtsState] = useState('等待发送');
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
+  const [petScale, setPetScaleState] = useState(1);
   const [callState, setCallState] = useState<CallState>('idle');
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
   const [remoteSystemMuted, setRemoteSystemMuted] = useState(true);
@@ -573,6 +581,15 @@ export default function App() {
   useEffect(() => {
     const bridge = window.desktopPetControl;
     if (!bridge) return;
+    bridge.getPetScale().then((scale) => setPetScaleState(scale)).catch((error) => {
+      showToast(`读取桌宠大小失败：${error?.message || error}`, true);
+    });
+    return bridge.onPetScaleChanged((scale) => setPetScaleState(scale));
+  }, [showToast]);
+
+  useEffect(() => {
+    const bridge = window.desktopPetControl;
+    if (!bridge) return;
     bridge.getTtsCredentials().then((result) => {
       setTtsKeyConfigured(!!result.configured);
       if (result.apiKey) setTtsApiKey(result.apiKey);
@@ -711,6 +728,32 @@ export default function App() {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     disconnect();
   }, [teardownCall]);
+
+  const changePetScale = useCallback(async (scale: number) => {
+    const result = await window.desktopPetControl?.setPetScale(scale);
+    if (!result) return;
+    if (!result.ok) {
+      showToast(result.error || '调整桌宠大小失败', true);
+      return;
+    }
+    if (typeof result.scale === 'number') setPetScaleState(result.scale);
+  }, [showToast]);
+
+  const resetPetScale = useCallback(async () => {
+    const result = await window.desktopPetControl?.resetPetScale();
+    if (!result) return;
+    if (!result.ok) {
+      showToast(result.error || '恢复默认大小失败', true);
+      return;
+    }
+    showToast('桌宠大小已恢复为 100%');
+  }, [showToast]);
+
+  const exportDiagnostics = useCallback(async () => {
+    const result = await window.desktopPetControl?.exportDiagnostics();
+    if (!result || result.canceled) return;
+    showToast(result.ok ? '诊断日志已导出' : `导出失败：${result.error || 'unknown'}`, !result.ok);
+  }, [showToast]);
 
   const canSend = status === 'connected' && peers.peerPetOnline;
   const canCall = canSend && peers.peerControllerOnline;
@@ -875,6 +918,29 @@ export default function App() {
             <button className="btn accent" onClick={onConnect}>连接</button>
           )}
         </div>
+        {window.desktopPetControl && (
+          <div className="pet-settings">
+            <div className="pet-settings-head">
+              <span>本机桌宠大小</span>
+              <strong>{Math.round(petScale * 100)}%</strong>
+            </div>
+            <input
+              className="pet-scale-range"
+              type="range"
+              min="30"
+              max="150"
+              step="10"
+              value={Math.round(petScale * 100)}
+              onChange={(event) => void changePetScale(Number(event.target.value) / 100)}
+              aria-label="调整本机桌宠大小"
+            />
+            <div className="pet-settings-actions">
+              <button className="btn" onClick={() => void resetPetScale()}>恢复默认大小</button>
+              <button className="btn" onClick={() => void exportDiagnostics()}>导出诊断日志</button>
+            </div>
+            <span className="hint">缩放异常时导出日志；不会包含房间密钥、API Key 或音频。</span>
+          </div>
+        )}
       </div>
 
       <section className="section">
