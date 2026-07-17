@@ -17,7 +17,6 @@ import {
   renameMember, discoverPairing, changeMember,
   reclaimDevice,
   type Command,
-  type ExpressionName,
   type MotionMeta,
   type Peers,
   type TtsStatus,
@@ -84,14 +83,13 @@ function localParticipantId() {
 const DEFAULT_SERVER = import.meta.env.VITE_PET_SERVER_URL || 'http://localhost:3030';
 const DEFAULT_SECRET = import.meta.env.VITE_PET_ROOM_SECRET || 'change-me';
 
-const EXPRESSIONS: { name: ExpressionName; label: string }[] = [
-  { name: 'joy', label: '开心' },
-  { name: 'surprised', label: '吃惊' },
-  { name: 'sorrow', label: '委屈' },
-  { name: 'angry', label: '生气' },
-  { name: 'blink', label: '眨眼' },
-  { name: 'neutral', label: '平静' },
-];
+const QUICK_MOTION_IDS = new Set(['joy', 'jumping', 'sorrow', 'waiting']);
+const QUICK_MOTION_ICONS: Record<string, string> = {
+  joy: '♡',
+  jumping: '↑',
+  sorrow: '☁',
+  waiting: '…',
+};
 
 type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
@@ -256,7 +254,6 @@ export default function App() {
   const [targetIds, setTargetIds] = useState<string[]>([]);
   const [callTargetId, setCallTargetId] = useState('');
   const [targetMenuOpen, setTargetMenuOpen] = useState(false);
-  const [expandedMotions, setExpandedMotions] = useState(false);
   const [editingMemberId, setEditingMemberId] = useState<'a' | 'b' | null>(null);
   const [memberNameDraft, setMemberNameDraft] = useState('');
   const [knownMemberNames, setKnownMemberNames] = useState(readMemberNames);
@@ -974,6 +971,7 @@ export default function App() {
   const callableDevices = peerMember?.devices.filter((device) => device.petOnline && device.controllerOnline) || [];
   const selectedDevices = onlineDevices.filter((device) => targetIds.includes(device.id));
   const canSend = status === 'connected' && selectedDevices.length > 0;
+  const quickMotions = motions.filter((motion) => QUICK_MOTION_IDS.has(motion.id));
   const canCall = status === 'connected' && callableDevices.some((device) => device.id === callTargetId);
   const pairingIncomplete = !!window.desktopPetControl && (!serverUrl.trim() || !secret.trim() || !memberId || !participantId || !deviceName.trim());
   const setupRequired = setupStage !== 'complete' || pairingIncomplete;
@@ -1189,18 +1187,13 @@ export default function App() {
             <section className="card action-panel">
               <div className="section-title"><h2>快捷互动</h2></div>
               <div className="action-grid">
-                {EXPRESSIONS.map((item, index) => (
-                  <button className={`action-tile ${index === 0 ? 'primary' : ''}`} key={item.name} disabled={!canSend} onClick={() => send({ type: 'expression', name: item.name }, item.label)}>
-                    <span>{['♡', '!', '☁', '⌁', '✦', '·'][index]}</span><b>{item.label}</b><small>表情</small>
-                  </button>
-                ))}
-                {(expandedMotions ? motions : motions.slice(0, 3)).filter((motion) => motion.id !== 'idle').map((motion) => (
+                {quickMotions.map((motion) => (
                   <button className="action-tile" key={motion.id} disabled={!canSend} onClick={() => send({ type: 'animation', name: motion.id }, motion.label)}>
-                    <span>↝</span><b>{motion.label}</b><small>动作</small>
+                    <span>{QUICK_MOTION_ICONS[motion.id] || '↝'}</span><b>{motion.label}</b><small>动作</small>
                   </button>
                 ))}
+                {!quickMotions.length && <p className="action-empty">{status === 'connected' ? '桌宠未提供可用动作' : '连接桌宠后显示可用动作'}</p>}
               </div>
-              {motions.length > 4 && <button className="text-button" onClick={() => setExpandedMotions((value) => !value)}>{expandedMotions ? '收起动作' : '全部动作'}</button>}
             </section>
             <aside className="control-side">
               <section className="card compact-card"><h2>移动位置</h2><div className="corner-grid">{CORNERS.map((item) => <button key={item.corner} disabled={!canSend} onClick={() => send({ type: 'relocate', corner: item.corner }, `移动到${item.label}`)}>{item.label}</button>)}</div></section>

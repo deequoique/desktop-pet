@@ -103,6 +103,61 @@ if (result.ok && result.scale != null) currentScale = result.scale;
 
 ## Pet renderer
 
+### 场景：Sprite 动作能力与快捷互动
+
+#### 1. 适用范围与触发条件
+
+修改 sprite 状态 ID、运行时帧目录、`pet:list-motions` 返回项或控制面板快捷互动时适用。动作名称、资源目录和用户可见语义必须同步，不能用固定 UI 模板猜测远端能力。
+
+#### 2. 签名
+
+```ts
+type MotionMeta = { id: string; label: string; loop: boolean };
+socket.emit('pet:list-motions', { targetDeviceId }, (motions: MotionMeta[]) => {});
+sendCommand({ type: 'animation', name: motion.id }, targetDeviceIds);
+```
+
+#### 3. 契约
+
+- `pet/src/renderer/main.ts` 的 `SPRITE_MOTIONS` 是当前 pet 对外声明能力的真相；每个 ID 必须存在同名 `pet/public/sprites/<pet>/<id>/` 帧目录。
+- 当前可由控制面板主动触发的动作是 `joy`（开心）、`jumping`（跳跃）、`sorrow`（委屈）、`waiting`（等待）。`idle`、`running-left`、`running-right` 是内部状态，不显示为快捷互动。
+- React 必须先与允许集合求交，再渲染远端实际返回的动作；不得追加硬编码表情模板。旧 `waving` / `failed` 仅可作为 pet 输入兼容别名，不能继续对外声明。
+- 动作按钮使用瞬时 `:active` 反馈，不使用永久首项高亮表示发送；reduced-motion 下移除 transform/transition。
+
+#### 4. 校验与错误矩阵
+
+| 条件 | 行为 |
+| --- | --- |
+| 远端未返回允许动作 | 显示中性空态，不生成虚假按钮 |
+| 远端返回内部移动/待机状态 | 保留在 pet 能力清单，但快捷互动过滤 |
+| 收到旧 `waving` / `failed` 命令 | 分别兼容映射到 `joy` / `sorrow` |
+| 动作目录或首帧缺失 | 构建前回归测试失败，不发布 |
+| 按钮禁用 | 不应用 hover/active 反馈，不发送命令 |
+
+#### 5. 正常、基准与错误案例
+
+- 正常：远端返回 `joy/jumping/sorrow/waiting`，UI 显示四个同名语义按钮并发送对应 animation ID。
+- 基准：断线或远端无可触发动作时只显示空态。
+- 错误：UI 固定渲染“开心/吃惊/生气”等表情，再把它们猜测映射到招手、跳跃或失败动画；或者把左右移动重复放入快捷互动。
+
+#### 6. 必需测试
+
+- pet unit：断言公开 ID/中文标签、运行时首帧目录、新旧目录不存在性，以及旧输入别名仍可识别。
+- control source regression：允许集合固定为四项，不存在 `EXPRESSIONS` / `expandedMotions`，且 active/reduced-motion 样式存在。
+- build/manual：运行 `npm run build:web` 与 `npm run build:pet`；用两个隔离 Electron 实例逐项确认远端动画。
+
+#### 7. 错误与正确写法
+
+```tsx
+// 错误：固定模板与远端能力并列渲染，会重复且语义错配。
+{EXPRESSIONS.map(renderExpression)}
+{motions.map(renderMotion)}
+
+// 正确：只投影远端真实声明、且允许用户主动触发的动作。
+const quickMotions = motions.filter((motion) => QUICK_MOTION_IDS.has(motion.id));
+{quickMotions.map(renderMotion)}
+```
+
 pet renderer 在单一模块内按功能区组织：constant 和 type 在 state 之前，每个小函数负责一个动画或交互关注点，底部 animation loop 统一协调更新。远程命令通过 discriminated `switch` 校验，再路由到现有 expression、motion、audio、relocation 或 sprite 函数。
 
 昂贵 Three.js object 和可复用数学 buffer 放在模块级，禁止在每帧动画内重复分配。异步 asset load 使用 `motionClipCache` 一类缓存；audio/WebRTC 资源必须显式清理。修改 motion ID、sprite frame 数、bone name、model rotation 等与 asset 耦合的常量前，先检查对应 manifest 和资源。

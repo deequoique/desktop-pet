@@ -104,34 +104,34 @@ type MotionMeta = {
   loop: boolean;
 };
 
-type SpriteState = 'idle' | 'running-right' | 'running-left' | 'waving' | 'jumping' | 'failed' | 'waiting';
+type SpriteState = 'idle' | 'running-right' | 'running-left' | 'joy' | 'jumping' | 'sorrow' | 'waiting';
 
 const SPRITE_BASE_URL = './sprites/screen-dog';
 const SPRITE_FRAMES: Record<SpriteState, number> = {
   idle: 6,
   'running-right': 8,
   'running-left': 8,
-  waving: 4,
+  joy: 4,
   jumping: 5,
-  failed: 8,
+  sorrow: 8,
   waiting: 6,
 };
 const SPRITE_FPS: Record<SpriteState, number> = {
   idle: 4,
   'running-right': 10,
   'running-left': 10,
-  waving: 7,
+  joy: 7,
   jumping: 8,
-  failed: 6,
+  sorrow: 6,
   waiting: 5,
 };
 const SPRITE_MOTIONS: MotionMeta[] = [
   { id: 'idle', label: '待机', loop: true },
   { id: 'running-right', label: '向右移动', loop: true },
   { id: 'running-left', label: '向左移动', loop: true },
-  { id: 'waving', label: '招手', loop: false },
+  { id: 'joy', label: '开心', loop: false },
   { id: 'jumping', label: '跳跃', loop: false },
-  { id: 'failed', label: '失败', loop: false },
+  { id: 'sorrow', label: '委屈', loop: false },
   { id: 'waiting', label: '等待', loop: true },
 ];
 
@@ -178,9 +178,9 @@ function spriteStateForCommand(id: string): SpriteState | null {
   const key = id.toLowerCase();
   if (/left|左/.test(key)) return 'running-left';
   if (/right|右/.test(key)) return 'running-right';
-  if (/wave|hello|greet|招手|打招呼/.test(key)) return 'waving';
+  if (/joy|happy|wave|hello|greet|开心|招手|打招呼/.test(key)) return 'joy';
   if (/jump|hop|跳/.test(key)) return 'jumping';
-  if (/fail|sad|error|失败|难过|错误/.test(key)) return 'failed';
+  if (/sorrow|fail|sad|error|委屈|失败|难过|错误/.test(key)) return 'sorrow';
   if (/wait|ask|等待|询问/.test(key)) return 'waiting';
   if (/idle|stand|待机|静止/.test(key)) return 'idle';
   return null;
@@ -613,8 +613,8 @@ const expState = new Map<string, ExpSlot>();
 
 function setExpression(name: ExpName, target: number, fadeMs = 300) {
   if (target > 0.2) {
-    if (name === 'joy') setSpriteState('waving', 1100);
-    else if (name === 'sorrow' || name === 'angry') setSpriteState('failed', 1800);
+    if (name === 'joy') setSpriteState('joy', 1100);
+    else if (name === 'sorrow' || name === 'angry') setSpriteState('sorrow', 1800);
     else if (name === 'surprised') setSpriteState('jumping', 900);
   }
   if (name === 'joy' && target > 0.2) triggerTailWag();
@@ -695,7 +695,7 @@ function triggerReaction(part: 'head' | 'body' | 'tail') {
   cooldownUntil[part] = now + 1500;
 
   const exp = PART_EXPRESSION[part];
-  setSpriteState(part === 'tail' ? 'waving' : 'jumping', part === 'tail' ? 1100 : 900);
+  setSpriteState(part === 'tail' ? 'joy' : 'jumping', part === 'tail' ? 1100 : 900);
   setExpression(exp, 1.0, 120);
   setTimeout(() => setExpression(exp, 0, 350), 650);
 
@@ -831,7 +831,7 @@ async function loadVrmaMotion(id: string): Promise<THREE.AnimationClip | null> {
 async function playMotion(id: string): Promise<boolean> {
   const sprite = spriteStateForCommand(id);
   if (sprite) {
-    const oneShotMs = sprite === 'waving' ? 1100 : sprite === 'jumping' ? 900 : sprite === 'failed' ? 1800 : 0;
+    const oneShotMs = sprite === 'joy' ? 1100 : sprite === 'jumping' ? 900 : sprite === 'sorrow' ? 1800 : 0;
     setSpriteState(sprite, oneShotMs);
     return true;
   }
@@ -946,7 +946,7 @@ window.addEventListener('mousedown', (e) => {
   dragDirection = 0;
   rotatingModel = e.shiftKey;
   clickMotionCandidate = false;
-  setSpriteState('waving', 1100);
+  setSpriteState('joy', 1100);
   if (rotatingModel) {
     if (!vrm) rotatingModel = false;
   }
