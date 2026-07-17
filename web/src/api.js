@@ -2,10 +2,12 @@ import { io } from 'socket.io-client';
 let socket = null;
 let listeners = {};
 let ttsApiKey = '';
+let targetDeviceId = '';
+export function setTargetDevice(deviceId) { targetDeviceId = deviceId; }
 export function setListeners(l) {
     listeners = l;
 }
-export function connect(serverUrl, secret, participantId) {
+export function connect(serverUrl, secret, identity) {
     if (socket)
         disconnect();
     listeners.onStatus?.('connecting');
@@ -17,7 +19,7 @@ export function connect(serverUrl, secret, participantId) {
     });
     socket = s;
     const join = () => {
-        s.emit('pet:join', { secret, role: 'controller', participantId }, (res) => {
+        s.emit('pet:join', { protocolVersion: 2, secret, role: 'controller', ...identity }, (res) => {
             if (res?.ok) {
                 listeners.onStatus?.('connected');
                 if (res.peers)
@@ -27,7 +29,7 @@ export function connect(serverUrl, secret, participantId) {
             }
             else {
                 listeners.onStatus?.('rejected');
-                listeners.onError?.(res?.code === 'room_full' ? '房间已满（最多两人）' : res?.error || '加入失败');
+                listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败');
             }
         });
     };
@@ -69,26 +71,10 @@ export function disconnect() {
 export function sendCommand(cmd) {
     if (!socket || !socket.connected)
         return false;
-    socket.emit('pet:command', cmd);
+    if (!targetDeviceId)
+        return false;
+    socket.emit('pet:command', { ...cmd, targetDeviceId });
     return true;
-}
-export function listVoices(timeoutMs = 4000) {
-    return new Promise((resolve) => {
-        if (!socket || !socket.connected)
-            return resolve([]);
-        let done = false;
-        const t = setTimeout(() => { if (!done) {
-            done = true;
-            resolve([]);
-        } }, timeoutMs);
-        socket.emit('pet:list-voices', (files) => {
-            if (done)
-                return;
-            done = true;
-            clearTimeout(t);
-            resolve(Array.isArray(files) ? files : []);
-        });
-    });
 }
 export function listMotions(timeoutMs = 4000) {
     return new Promise((resolve) => {
@@ -99,7 +85,7 @@ export function listMotions(timeoutMs = 4000) {
             done = true;
             resolve([]);
         } }, timeoutMs);
-        socket.emit('pet:list-motions', (motions) => {
+        socket.emit('pet:list-motions', { targetDeviceId }, (motions) => {
             if (done)
                 return;
             done = true;
@@ -111,7 +97,7 @@ export function listMotions(timeoutMs = 4000) {
 export function sendSignal(signal) {
     if (!socket || !socket.connected)
         return false;
-    socket.emit('webrtc:signal', signal);
+    socket.emit('webrtc:signal', { ...signal, targetDeviceId });
     return true;
 }
 export function requestRtcConfig() {
@@ -141,7 +127,7 @@ export function requestCall() {
     return new Promise((resolve) => {
         if (!socket?.connected)
             return resolve({ ok: false, code: 'disconnected' });
-        socket.timeout(4000).emit('call:start', (err, response) => {
+        socket.timeout(4000).emit('call:start', { targetDeviceId }, (err, response) => {
             if (err)
                 resolve({ ok: false, code: 'timeout' });
             else
@@ -189,7 +175,7 @@ export function createTts(text, voiceId) {
     return new Promise((resolve) => {
         if (!socket?.connected)
             return resolve({ ok: false, code: 'disconnected' });
-        socket.timeout(5000).emit('tts:create', { text, voiceId }, (err, response) => {
+        socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err, response) => {
             if (err)
                 resolve({ ok: false, code: 'timeout' });
             else
@@ -197,3 +183,18 @@ export function createTts(text, voiceId) {
         });
     });
 }
+function audioRequest(event, payload) {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(12000).emit(event, payload, (err, response) => resolve(err ? { ok: false, code: 'timeout' } : response));
+    });
+}
+export const listPersonalAudio = () => audioRequest('audio:list');
+export const addPersonalAudio = (payload) => audioRequest('audio:add', payload);
+export const renamePersonalAudio = (audioId, name) => audioRequest('audio:rename', { audioId, name });
+export const deletePersonalAudio = (audioId) => audioRequest('audio:delete', { audioId });
+export const playPersonalAudio = (audioId) => audioRequest('audio:play', { audioId, targetDeviceId });
+export const getPersonalAudio = (audioId) => audioRequest('audio:get', { audioId });
+export const renameMember = (memberId, displayName) => audioRequest('room:rename-member', { memberId, displayName });
+export const reclaimDevice = (deviceId, deviceName) => audioRequest('device:reclaim', { deviceId, deviceName });

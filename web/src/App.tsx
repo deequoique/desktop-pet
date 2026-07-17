@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   connect,
   disconnect,
   listMotions,
   listTtsVoices,
-  listVoices,
   createTts,
   endCall,
   requestCall,
@@ -12,7 +11,12 @@ import {
   sendCommand,
   sendSignal,
   setListeners,
+  setTargetDevice,
   setTtsCredentials,
+  addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
+  getPersonalAudio,
+  renameMember,
+  reclaimDevice,
   type Command,
   type ExpressionName,
   type MotionMeta,
@@ -22,6 +26,7 @@ import {
   type TtsVoice,
   type WebRtcSignal,
   type MediaStatus,
+  type PersonalAudio,
 } from './api';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
@@ -41,7 +46,7 @@ const LS_PARTICIPANT = 'pet.participantId';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
 
-type PairingConfig = { serverUrl?: string; roomSecret?: string; participantId?: string };
+type PairingConfig = { serverUrl?: string; roomSecret?: string; deviceId?: string; deviceName?: string; memberId?: 'a' | 'b' };
 type PetScaleResult = { ok: boolean; scale?: number; error?: string };
 type DiagnosticsExportResult = { ok: boolean; canceled?: boolean; path?: string; error?: string };
 
@@ -49,7 +54,7 @@ declare global {
   interface Window {
     desktopPetControl?: {
       getPairingConfig: () => Promise<PairingConfig>;
-      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
+      savePairingConfig: (config: PairingConfig) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
       onPairingChanged: (cb: (config: PairingConfig) => void) => void;
       getTtsCredentials: () => Promise<{ configured: boolean; apiKey?: string }>;
       saveTtsCredentials: (apiKey: string) => Promise<{ ok: boolean; configured?: boolean; error?: string }>;
@@ -160,16 +165,6 @@ async function readRtcRoute(pc: RTCPeerConnection): Promise<RtcRoute> {
   };
 }
 
-function voicePart(url: string): 'head' | 'body' | 'tail' | 'idle' | 'other' {
-  const name = url.split('/').pop() || '';
-  const m = name.match(/^(head|body|tail|idle)_/i);
-  return (m ? m[1].toLowerCase() : 'other') as any;
-}
-
-function voiceLabel(url: string): string {
-  return (url.split('/').pop() || url).replace(/\.[^.]+$/, '');
-}
-
 function ttsErrorMessage(code?: string) {
   const messages: Record<string, string> = {
     disconnected: '尚未连接 server',
@@ -197,12 +192,17 @@ export default function App() {
   const [secret, setSecret] = useState(() => localStorage.getItem(LS_SECRET) || DEFAULT_SECRET);
   const [status, setStatus] = useState<Status>('idle');
   const [participantId, setParticipantId] = useState(localParticipantId);
+  const [memberId, setMemberId] = useState<'a' | 'b'>('a');
+  const [deviceName, setDeviceName] = useState('浏览器');
+  const [targetId, setTargetId] = useState('');
   const [peers, setPeers] = useState<Peers>({
+    protocolVersion: 2, self: { memberId: 'a', deviceId: '' }, members: [],
     selfReady: false, peerOnline: false, peerPetOnline: false, peerControllerOnline: false,
     controller: false, pet: false,
   });
   const [motions, setMotions] = useState<MotionMeta[]>([]);
-  const [voices, setVoices] = useState<string[]>([]);
+  const [personalAudio, setPersonalAudio] = useState<PersonalAudio[]>([]);
+  const [recording, setRecording] = useState(false);
   const [tts, setTts] = useState('');
   const [ttsMode, setTtsMode] = useState<'managed' | 'byok'>(() => localStorage.getItem(LS_TTS_MODE) === 'byok' ? 'byok' : 'managed');
   const [ttsProvider, setTtsProvider] = useState<TtsProvider>('elevenlabs');
@@ -503,7 +503,15 @@ export default function App() {
   useEffect(() => {
     setListeners({
       onStatus: setStatus,
-      onPeers: setPeers,
+      onPeers: (next) => {
+        setPeers(next);
+        const devices = next.members.find((member) => member.id !== next.self.memberId)?.devices.filter((device) => device.petOnline) || [];
+        setTargetId((current) => {
+          const selected = devices.some((device) => device.id === current) ? current : devices.length === 1 ? devices[0].id : current;
+          setTargetDevice(selected);
+          return selected;
+        });
+      },
       onError: (m) => showToast(m, true),
       onSignal: (signal) => {
         handleSignal(signal).catch((e) => {
@@ -565,11 +573,13 @@ export default function App() {
     const applyConfig = (config: PairingConfig) => {
       const nextServer = String(config.serverUrl || '').trim();
       const nextSecret = String(config.roomSecret || '').trim();
-      const nextParticipant = String(config.participantId || '').trim();
+      const nextParticipant = String(config.deviceId || '').trim();
       setServerUrl(nextServer);
       setSecret(nextSecret);
       if (nextParticipant) setParticipantId(nextParticipant);
-      if (nextServer && nextSecret && nextParticipant) connect(nextServer, nextSecret, nextParticipant);
+      if (config.memberId) setMemberId(config.memberId);
+      if (config.deviceName) setDeviceName(config.deviceName);
+      if (nextServer && nextSecret && nextParticipant && config.memberId && config.deviceName) connect(nextServer, nextSecret, { memberId: config.memberId, deviceId: nextParticipant, deviceName: config.deviceName });
       else disconnect();
     };
     bridge.getPairingConfig().then(applyConfig).catch((e) => {
@@ -651,16 +661,11 @@ export default function App() {
   useEffect(() => {
     if (status !== 'connected' || !peers.peerPetOnline) {
       setMotions([]);
-      setVoices([]);
       if (!peers.peerPetOnline) teardownCall({ nextState: 'idle' });
       return;
     }
     listMotions().then((items) => {
       setMotions(items);
-    });
-    listVoices().then((files) => {
-      setVoices(files);
-      if (!files.length) showToast('桌宠端没有预录台词');
     });
   }, [status, peers.peerPetOnline, showToast, teardownCall]);
 
@@ -715,19 +720,59 @@ export default function App() {
       const result = await window.desktopPetControl.savePairingConfig({
         serverUrl: serverUrl.trim(),
         roomSecret: secret.trim(),
+        memberId,
+        deviceName,
       });
       if (!result.ok) showToast(result.error || '保存配置失败', true);
       return;
     }
     localStorage.setItem(LS_SERVER, serverUrl);
     localStorage.setItem(LS_SECRET, secret);
-    connect(serverUrl.trim(), secret.trim(), participantId);
-  }, [participantId, secret, serverUrl, showToast]);
+    connect(serverUrl.trim(), secret.trim(), { memberId, deviceId: participantId, deviceName });
+  }, [deviceName, memberId, participantId, secret, serverUrl, showToast]);
 
   const onDisconnect = useCallback(() => {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     disconnect();
   }, [teardownCall]);
+
+  const refreshPersonalAudio = useCallback(async () => {
+    const result = await listPersonalAudio();
+    if (result?.ok) setPersonalAudio(result.items || []);
+  }, []);
+
+  const uploadAudioBlob = useCallback(async (blob: Blob, name: string, durationMs: number) => {
+    const result = await addPersonalAudio({ name, mime: blob.type, durationMs, data: await blob.arrayBuffer() });
+    if (!result?.ok) return showToast(`添加音频失败：${result?.code || 'unknown'}`, true);
+    await refreshPersonalAudio();
+  }, [refreshPersonalAudio, showToast]);
+
+  const importAudio = useCallback(async (file?: File) => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const audio = new Audio(url);
+    audio.onloadedmetadata = async () => {
+      URL.revokeObjectURL(url);
+      await uploadAudioBlob(file, file.name.replace(/\.[^.]+$/, ''), Math.round(audio.duration * 1000));
+    };
+    audio.onerror = () => { URL.revokeObjectURL(url); showToast('无法读取这个音频文件', true); };
+  }, [showToast, uploadAudioBlob]);
+
+  const recordAudio = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const recorder = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '' });
+    const chunks: Blob[] = [];
+    const started = Date.now();
+    recorder.ondataavailable = (event) => chunks.push(event.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((track) => track.stop());
+      setRecording(false);
+      await uploadAudioBlob(new Blob(chunks, { type: recorder.mimeType }), `录音 ${new Date().toLocaleString()}`, Math.min(60_000, Date.now() - started));
+    };
+    recorder.start(); setRecording(true);
+    window.setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, 60_000);
+    (window as any).__personalAudioRecorder = recorder;
+  }, [uploadAudioBlob]);
 
   const changePetScale = useCallback(async (scale: number) => {
     const result = await window.desktopPetControl?.setPetScale(scale);
@@ -755,8 +800,9 @@ export default function App() {
     showToast(result.ok ? '诊断日志已导出' : `导出失败：${result.error || 'unknown'}`, !result.ok);
   }, [showToast]);
 
-  const canSend = status === 'connected' && peers.peerPetOnline;
-  const canCall = canSend && peers.peerControllerOnline;
+  const selectedDevice = peers.members.flatMap((member) => member.devices).find((device) => device.id === targetId);
+  const canSend = status === 'connected' && !!selectedDevice?.petOnline;
+  const canCall = canSend && !!selectedDevice?.controllerOnline;
 
   const send = useCallback((cmd: Command, label: string) => {
     if (!canSend) {
@@ -867,12 +913,6 @@ export default function App() {
     setMicEnabled(!micEnabled);
   }, [callState, micEnabled, setMicEnabled]);
 
-  const groupedVoices = useMemo(() => {
-    const g: Record<string, string[]> = { head: [], body: [], tail: [], idle: [], other: [] };
-    for (const v of voices) g[voicePart(v)].push(v);
-    return g;
-  }, [voices]);
-
   return (
     <div className="app">
       <header className="hero">
@@ -887,7 +927,32 @@ export default function App() {
         </div>
       </header>
 
+      <section className="section">
+        <h2>成员与设备</h2>
+        {peers.members.map((member) => (
+          <div key={member.id}>
+            <div className="status-row">
+              <strong>{member.displayName}{member.id === peers.self.memberId ? '（我）' : ''}</strong>
+              <button className="btn" onClick={async () => { const name = prompt('成员名称', member.displayName); if (name) await renameMember(member.id, name); }}>修改名称</button>
+            </div>
+            {member.devices.map((device) => <div className="empty" key={device.id}>
+              {device.name} · 桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · 最近连接 {new Date(device.lastSeenAt).toLocaleString()}
+              {member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && <button className="btn" onClick={async () => { if (confirm(`将当前设备认领为“${device.name}”？`)) await reclaimDevice(device.id, device.name); }}>认领为当前设备</button>}
+            </div>)}
+          </div>
+        ))}
+      </section>
+
       <div className="status-bar">
+        <div className="status-row">
+          <label>目标设备</label>
+          <select value={targetId} onChange={(event) => { setTargetId(event.target.value); setTargetDevice(event.target.value); }}>
+            <option value="">请选择对方设备</option>
+            {peers.members.find((member) => member.id !== peers.self.memberId)?.devices.map((device) => (
+              <option key={device.id} value={device.id}>{device.name} · 桌宠{device.petOnline ? '在线' : '离线'} / 控制端{device.controllerOnline ? '在线' : '离线'}</option>
+            ))}
+          </select>
+        </div>
         <div className="status-row">
           <label>服务器</label>
           <input
@@ -1041,28 +1106,21 @@ export default function App() {
       </section>
 
       <section className="section">
-        <h2>预录台词</h2>
-        {voices.length === 0 ? (
-          <div className="empty">
-            {canSend ? '桌宠端没扫到台词；放 .wav 到 pet/public/voices/ 下重启即可' : '连上后会显示'}
+        <h2>我的音频</h2>
+        <div className="grid tight">
+          <label className="btn">导入音频<input hidden type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm" onChange={(event) => void importAudio(event.target.files?.[0])} /></label>
+          <button className="btn" onClick={() => recording ? (window as any).__personalAudioRecorder?.stop() : void recordAudio()}>{recording ? '停止录音' : '开始录音'}</button>
+          <button className="btn" onClick={() => void refreshPersonalAudio()}>刷新</button>
+        </div>
+        {personalAudio.length === 0 ? <div className="empty">这里只显示你自己录制或导入的音频</div> : personalAudio.map((clip) => (
+          <div className="status-row" key={clip.id}>
+            <span>{clip.name} · {Math.round(clip.durationMs / 1000)} 秒</span>
+            <button className="btn" onClick={async () => { const result = await getPersonalAudio(clip.id); if (result?.ok) { const url = URL.createObjectURL(new Blob([result.data], { type: result.mime })); const audio = new Audio(url); audio.onended = () => URL.revokeObjectURL(url); void audio.play(); } }}>试听</button>
+            <button className="btn" disabled={!canSend} onClick={() => void playPersonalAudio(clip.id)}>发送</button>
+            <button className="btn" onClick={async () => { const name = prompt('新名称', clip.name); if (name) { await renamePersonalAudio(clip.id, name); await refreshPersonalAudio(); } }}>重命名</button>
+            <button className="btn" onClick={async () => { await deletePersonalAudio(clip.id); await refreshPersonalAudio(); }}>删除</button>
           </div>
-        ) : (
-          (['head', 'body', 'tail', 'idle', 'other'] as const).map((part) => groupedVoices[part]?.length ? (
-            <div key={part}>
-              <h3>{part}</h3>
-              <div className="grid">
-                {groupedVoices[part].map((url) => (
-                  <button
-                    key={url}
-                    className="btn"
-                    disabled={!canSend}
-                    onClick={() => send({ type: 'say_audio', url }, voiceLabel(url))}
-                  >{voiceLabel(url)}</button>
-                ))}
-              </div>
-            </div>
-          ) : null)
-        )}
+        ))}
       </section>
 
       <section className="section">

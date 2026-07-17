@@ -19,15 +19,16 @@ declare global {
       listVoices: () => Promise<string[]>;
       getServerUrl: () => Promise<string>;
       getRoomSecret: () => Promise<string>;
-      getPairingConfig: () => Promise<{ serverUrl?: string; roomSecret?: string; participantId?: string }>;
-      savePairingConfig: (config: { serverUrl: string; roomSecret: string }) => Promise<{ ok: boolean; error?: string; config?: { serverUrl: string; roomSecret: string; participantId?: string } }>;
-      onPairingChanged: (cb: (config: { serverUrl?: string; roomSecret?: string; participantId?: string }) => void) => void;
+      getPairingConfig: () => Promise<PairingConfig>;
+      savePairingConfig: (config: PairingConfig) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
+      onPairingChanged: (cb: (config: PairingConfig) => void) => void;
       getDesktopSourceId: () => Promise<string | null>;
     };
   }
 }
 
 type PetBridge = NonNullable<Window['pet']>;
+type PairingConfig = { serverUrl?: string; roomSecret?: string; deviceId?: string; deviceName?: string; memberId?: 'a' | 'b' };
 
 const browserPetBridge: PetBridge = {
   setClickable: () => {},
@@ -83,6 +84,8 @@ const sizeUp = document.getElementById('size-up') as HTMLButtonElement;
 const pairingForm = document.getElementById('pairing') as HTMLFormElement;
 const pairingServer = document.getElementById('pairing-server') as HTMLInputElement;
 const pairingSecret = document.getElementById('pairing-secret') as HTMLInputElement;
+const pairingMember = document.getElementById('pairing-member') as HTMLSelectElement;
+const pairingDevice = document.getElementById('pairing-device') as HTMLInputElement;
 const pairingError = document.getElementById('pairing-error')!;
 
 type MotionFallbackPart = 'head' | 'body' | 'tail';
@@ -1032,7 +1035,9 @@ scheduleBlink();
 // === 服务器地址 + 预录台词清单 ===
 let SERVER_URL = '';
 let ROOM_SECRET = '';
-let PARTICIPANT_ID = '';
+let DEVICE_ID = '';
+let DEVICE_NAME = '';
+let MEMBER_ID: 'a' | 'b' | '' = '';
 let pairingOpen = false;
 const voicesByPart: Record<'head' | 'body' | 'tail' | 'idle', string[]> = {
   head: [], body: [], tail: [], idle: [],
@@ -1040,18 +1045,20 @@ const voicesByPart: Record<'head' | 'body' | 'tail' | 'idle', string[]> = {
 let voicesFlat: string[] = []; // 给 A 端 list-voices ack 用
 
 function isPairingReady() {
-  return !!SERVER_URL.trim() && !!ROOM_SECRET.trim();
+  return !!SERVER_URL.trim() && !!ROOM_SECRET.trim() && !!DEVICE_ID && !!DEVICE_NAME && !!MEMBER_ID;
 }
 
 function normalizeServerUrl(url: string) {
   return url.trim().replace(/\/+$/, '');
 }
 
-function showPairing(config?: { serverUrl?: string; roomSecret?: string }) {
+function showPairing(config?: PairingConfig) {
   pairingOpen = true;
   pairingForm.classList.remove('hidden');
   pairingServer.value = config?.serverUrl || SERVER_URL || '';
   pairingSecret.value = config?.roomSecret || '';
+  pairingMember.value = config?.memberId || MEMBER_ID;
+  pairingDevice.value = config?.deviceName || DEVICE_NAME;
   pairingError.textContent = '';
   petBridge.setClickable(true);
   setTimeout(() => (pairingServer.value ? pairingSecret : pairingServer).focus(), 0);
@@ -1067,8 +1074,10 @@ pairingForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const serverUrl = normalizeServerUrl(pairingServer.value);
   const roomSecret = pairingSecret.value.trim();
-  if (!serverUrl || !roomSecret) {
-    pairingError.textContent = '请填写服务器地址和房间密钥。';
+  const memberId = pairingMember.value as 'a' | 'b' | '';
+  const deviceName = pairingDevice.value.trim();
+  if (!serverUrl || !roomSecret || !memberId || !deviceName) {
+    pairingError.textContent = '请填写服务器地址、密钥、身份和设备名称。';
     return;
   }
   if (!/^https?:\/\//i.test(serverUrl)) {
@@ -1077,24 +1086,28 @@ pairingForm.addEventListener('submit', async (e) => {
   }
 
   pairingError.textContent = '';
-  const res = await petBridge.savePairingConfig({ serverUrl, roomSecret });
+  const res = await petBridge.savePairingConfig({ serverUrl, roomSecret, memberId, deviceName });
   if (!res.ok) {
     pairingError.textContent = res.error || '保存失败，请重试。';
     return;
   }
   SERVER_URL = res.config?.serverUrl || serverUrl;
   ROOM_SECRET = res.config?.roomSecret || roomSecret;
-  PARTICIPANT_ID = res.config?.participantId || PARTICIPANT_ID;
+  DEVICE_ID = res.config?.deviceId || DEVICE_ID;
+  DEVICE_NAME = res.config?.deviceName || deviceName;
+  MEMBER_ID = res.config?.memberId || memberId;
   hidePairing();
   connectRemote();
 });
 
 (async () => {
-  let pairingConfig: { serverUrl?: string; roomSecret?: string; participantId?: string } = {};
+  let pairingConfig: PairingConfig = {};
   try { pairingConfig = await petBridge.getPairingConfig(); } catch {}
   SERVER_URL = normalizeServerUrl(pairingConfig.serverUrl || '');
   ROOM_SECRET = (pairingConfig.roomSecret || '').trim();
-  PARTICIPANT_ID = (pairingConfig.participantId || '').trim();
+  DEVICE_ID = (pairingConfig.deviceId || '').trim();
+  DEVICE_NAME = (pairingConfig.deviceName || '').trim();
+  MEMBER_ID = pairingConfig.memberId || '';
   await loadMotionManifest();
   try {
     const files = await petBridge.listVoices();
@@ -1116,8 +1129,8 @@ pairingForm.addEventListener('submit', async (e) => {
 petBridge.onPairingChanged((config) => {
   const nextServer = normalizeServerUrl(config.serverUrl || '');
   const nextSecret = String(config.roomSecret || '').trim();
-  const nextParticipant = String(config.participantId || '').trim();
-  if (nextServer === SERVER_URL && nextSecret === ROOM_SECRET && nextParticipant === PARTICIPANT_ID) return;
+  const nextDevice = String(config.deviceId || '').trim();
+  if (nextServer === SERVER_URL && nextSecret === ROOM_SECRET && nextDevice === DEVICE_ID && config.memberId === MEMBER_ID && config.deviceName === DEVICE_NAME) return;
   cleanupRtc(false);
   remoteSocket?.removeAllListeners();
   remoteSocket?.disconnect();
@@ -1125,8 +1138,10 @@ petBridge.onPairingChanged((config) => {
   remoteConnected = false;
   SERVER_URL = nextServer;
   ROOM_SECRET = nextSecret;
-  PARTICIPANT_ID = nextParticipant;
-  if (isPairingReady() && PARTICIPANT_ID) connectRemote();
+  DEVICE_ID = nextDevice;
+  DEVICE_NAME = String(config.deviceName || '').trim();
+  MEMBER_ID = config.memberId || '';
+  if (isPairingReady()) connectRemote();
 });
 
 // === Web Audio：播放音频 + 实时口型同步 ===
@@ -1700,7 +1715,7 @@ function connectRemote() {
   const join = () => {
     remoteSocket!.emit(
       'pet:join',
-      { secret: ROOM_SECRET, role: 'pet', participantId: PARTICIPANT_ID },
+      { protocolVersion: 2, secret: ROOM_SECRET, role: 'pet', memberId: MEMBER_ID, deviceId: DEVICE_ID, deviceName: DEVICE_NAME },
       (res: { ok: boolean; code?: string; error?: string }) => {
         if (res?.ok) {
           remoteConnected = true;
@@ -1730,6 +1745,13 @@ function connectRemote() {
   });
   remoteSocket.on('tts:play', (job: TtsPlay) => {
     void playTtsStream(job);
+  });
+  remoteSocket.on('audio:play', (clip: { mime: string; data: ArrayBuffer }) => {
+    const url = URL.createObjectURL(new Blob([clip.data], { type: clip.mime }));
+    const audio = new Audio(url);
+    audio.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true });
+    audio.addEventListener('error', () => URL.revokeObjectURL(url), { once: true });
+    void audio.play();
   });
   remoteSocket.on('webrtc:signal', (signal: WebRtcSignal) => {
     handleRtcSignal(signal).catch((e) => {

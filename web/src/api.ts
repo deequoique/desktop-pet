@@ -19,8 +19,12 @@ export type TtsVoice = { id: string; label: string; previewUrl?: string };
 export type TtsStatus = { jobId: string; state: 'dispatched' | 'generating' | 'playing' | 'completed' | 'error'; error?: string };
 export type TtsProvider = 'elevenlabs' | 'cosyvoice';
 export type TtsVoiceResponse = { ok: boolean; mode?: 'managed' | 'byok'; provider?: TtsProvider; code?: string; voices: TtsVoice[] };
+export type PersonalAudio = { id: string; name: string; mime: string; durationMs: number; size: number; createdAt: string };
 
 export type Peers = {
+  protocolVersion: 2;
+  self: { memberId: 'a' | 'b'; deviceId: string };
+  members: Array<{ id: 'a' | 'b'; displayName: string; devices: Array<{ id: string; name: string; lastSeenAt: string; petOnline: boolean; controllerOnline: boolean }> }>;
   selfReady: boolean;
   peerOnline: boolean;
   peerPetOnline: boolean;
@@ -58,12 +62,15 @@ export type Listeners = {
 let socket: Socket | null = null;
 let listeners: Listeners = {};
 let ttsApiKey = '';
+let targetDeviceId = '';
+export type ConnectionIdentity = { memberId: 'a' | 'b'; deviceId: string; deviceName: string };
+export function setTargetDevice(deviceId: string) { targetDeviceId = deviceId; }
 
 export function setListeners(l: Listeners) {
   listeners = l;
 }
 
-export function connect(serverUrl: string, secret: string, participantId: string): Socket {
+export function connect(serverUrl: string, secret: string, identity: ConnectionIdentity): Socket {
   if (socket) disconnect();
   listeners.onStatus?.('connecting');
   const s = io(serverUrl, {
@@ -77,7 +84,7 @@ export function connect(serverUrl: string, secret: string, participantId: string
   const join = () => {
     s.emit(
       'pet:join',
-      { secret, role: 'controller', participantId },
+      { protocolVersion: 2, secret, role: 'controller', ...identity },
       (res: { ok: boolean; code?: string; error?: string; peers?: Peers }) => {
         if (res?.ok) {
           listeners.onStatus?.('connected');
@@ -85,7 +92,7 @@ export function connect(serverUrl: string, secret: string, participantId: string
           if (ttsApiKey) s.emit('tts:set-credentials', { apiKey: ttsApiKey }, () => {});
         } else {
           listeners.onStatus?.('rejected');
-          listeners.onError?.(res?.code === 'room_full' ? '房间已满（最多两人）' : res?.error || '加入失败');
+          listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败');
         }
       }
     );
@@ -129,22 +136,9 @@ export function disconnect() {
 
 export function sendCommand(cmd: Command): boolean {
   if (!socket || !socket.connected) return false;
-  socket.emit('pet:command', cmd);
+  if (!targetDeviceId) return false;
+  socket.emit('pet:command', { ...cmd, targetDeviceId });
   return true;
-}
-
-export function listVoices(timeoutMs = 4000): Promise<string[]> {
-  return new Promise((resolve) => {
-    if (!socket || !socket.connected) return resolve([]);
-    let done = false;
-    const t = setTimeout(() => { if (!done) { done = true; resolve([]); } }, timeoutMs);
-    socket.emit('pet:list-voices', (files: string[]) => {
-      if (done) return;
-      done = true;
-      clearTimeout(t);
-      resolve(Array.isArray(files) ? files : []);
-    });
-  });
 }
 
 export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
@@ -152,7 +146,7 @@ export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
     if (!socket || !socket.connected) return resolve([]);
     let done = false;
     const t = setTimeout(() => { if (!done) { done = true; resolve([]); } }, timeoutMs);
-    socket.emit('pet:list-motions', (motions: MotionMeta[]) => {
+    socket.emit('pet:list-motions', { targetDeviceId }, (motions: MotionMeta[]) => {
       if (done) return;
       done = true;
       clearTimeout(t);
@@ -163,7 +157,7 @@ export function listMotions(timeoutMs = 4000): Promise<MotionMeta[]> {
 
 export function sendSignal(signal: WebRtcSignal): boolean {
   if (!socket || !socket.connected) return false;
-  socket.emit('webrtc:signal', signal);
+  socket.emit('webrtc:signal', { ...signal, targetDeviceId });
   return true;
 }
 
@@ -191,7 +185,7 @@ export function sendHangup(): boolean {
 export function requestCall(): Promise<{ ok: boolean; callId?: string; code?: string }> {
   return new Promise((resolve) => {
     if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
-    socket.timeout(4000).emit('call:start', (err: Error | null, response: any) => {
+    socket.timeout(4000).emit('call:start', { targetDeviceId }, (err: Error | null, response: any) => {
       if (err) resolve({ ok: false, code: 'timeout' });
       else resolve(response || { ok: false });
     });
@@ -232,9 +226,25 @@ export function listTtsVoices(): Promise<TtsVoiceResponse> {
 export function createTts(text: string, voiceId: string): Promise<{ ok: boolean; jobId?: string; state?: string; position?: number; code?: string }> {
   return new Promise((resolve) => {
     if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
-    socket.timeout(5000).emit('tts:create', { text, voiceId }, (err: Error | null, response: any) => {
+    socket.timeout(5000).emit('tts:create', { text, voiceId, targetDeviceId }, (err: Error | null, response: any) => {
       if (err) resolve({ ok: false, code: 'timeout' });
       else resolve(response || { ok: false, code: 'tts_create_failed' });
     });
   });
 }
+
+function audioRequest(event: string, payload?: unknown): Promise<any> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+    socket.timeout(12_000).emit(event, payload, (err: Error | null, response: any) => resolve(err ? { ok: false, code: 'timeout' } : response));
+  });
+}
+
+export const listPersonalAudio = () => audioRequest('audio:list');
+export const addPersonalAudio = (payload: { name: string; mime: string; durationMs: number; data: ArrayBuffer }) => audioRequest('audio:add', payload);
+export const renamePersonalAudio = (audioId: string, name: string) => audioRequest('audio:rename', { audioId, name });
+export const deletePersonalAudio = (audioId: string) => audioRequest('audio:delete', { audioId });
+export const playPersonalAudio = (audioId: string) => audioRequest('audio:play', { audioId, targetDeviceId });
+export const getPersonalAudio = (audioId: string) => audioRequest('audio:get', { audioId });
+export const renameMember = (memberId: 'a' | 'b', displayName: string) => audioRequest('room:rename-member', { memberId, displayName });
+export const reclaimDevice = (deviceId: string, deviceName: string) => audioRequest('device:reclaim', { deviceId, deviceName });

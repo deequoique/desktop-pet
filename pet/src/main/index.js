@@ -134,16 +134,19 @@ function pairingSnapshot() {
   return {
     serverUrl: configuredServerUrl(),
     roomSecret: configuredRoomSecret(),
-    participantId: pairingConfig.participantId || '',
+    deviceId: pairingConfig.deviceId || pairingConfig.participantId || '',
+    deviceName: pairingConfig.deviceName || os.hostname(),
+    memberId: pairingConfig.memberId || '',
   };
 }
 
-function ensureParticipantId() {
-  if (!pairingConfig.participantId) {
-    pairingConfig.participantId = randomUUID();
+function ensureDeviceId() {
+  if (!pairingConfig.deviceId) {
+    pairingConfig.deviceId = pairingConfig.participantId || randomUUID();
+    delete pairingConfig.participantId;
     writeJson(pairingFile(), pairingConfig);
   }
-  return pairingConfig.participantId;
+  return pairingConfig.deviceId;
 }
 
 function loadTtsApiKey() {
@@ -714,13 +717,17 @@ ipcMain.handle('pet:save-pairing-config', (_e, config) => {
   const next = {
     serverUrl: String(config?.serverUrl || '').trim(),
     roomSecret: String(config?.roomSecret || '').trim(),
+    memberId: String(config?.memberId || '').trim(),
+    deviceName: String(config?.deviceName || '').trim().slice(0, 80),
   };
-  if (!next.serverUrl || !next.roomSecret) {
-    return { ok: false, error: 'serverUrl and roomSecret required' };
+  if (!next.serverUrl || !next.roomSecret || !['a', 'b'].includes(next.memberId) || !next.deviceName) {
+    return { ok: false, error: 'serverUrl, roomSecret, memberId and deviceName required' };
   }
   pairingConfig.serverUrl = next.serverUrl;
   pairingConfig.roomSecret = next.roomSecret;
-  ensureParticipantId();
+  pairingConfig.memberId = next.memberId;
+  pairingConfig.deviceName = next.deviceName;
+  ensureDeviceId();
   const ok = writeJson(pairingFile(), pairingConfig);
   const snapshot = pairingSnapshot();
   if (ok) {

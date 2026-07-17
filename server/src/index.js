@@ -4,8 +4,10 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { Readable } from 'stream';
+import fs from 'node:fs';
 import { Server as SocketIOServer } from 'socket.io';
 import WebSocket from 'ws';
+import { PersistentStore } from './persistent-store.js';
 
 const PORT = process.env.PORT || 3030;
 
@@ -97,6 +99,7 @@ const ROOM_SECRET_HASHES = new Set(
     .split(',').map((value) => value.trim()).filter(Boolean).map(hashSecret)
 );
 const ROOM_GRACE_MS = Math.max(0, Number(process.env.ROOM_GRACE_MS || 30_000));
+const store = new PersistentStore(process.env.PET_DATA_DIR || new URL('../data', import.meta.url).pathname);
 
 const app = express();
 app.use(cors());
@@ -118,6 +121,7 @@ const io = new SocketIOServer(httpServer, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   // 留 polling 兜底；国内/严苛代理下 ws 升级失败时还能跑
   transports: ['websocket', 'polling'],
+  maxHttpBufferSize: 11 * 1024 * 1024,
 });
 
 // roomHash -> { participants: Map<participantId, participant>, callId }
@@ -138,8 +142,14 @@ function participantForSocket(socket) {
   return roomForSocket(socket)?.participants.get(socket.data?.participantId) || null;
 }
 
-function otherParticipant(room, participantId) {
-  return [...room.participants.values()].find((p) => p.id !== participantId) || null;
+function otherMemberId(memberId) { return memberId === 'a' ? 'b' : 'a'; }
+
+function otherParticipant(room, deviceId, targetDeviceId) {
+  const self = room.participants.get(deviceId);
+  if (!self) return null;
+  const candidates = [...room.participants.values()].filter((p) => p.memberId === otherMemberId(self.memberId));
+  if (targetDeviceId) return candidates.find((p) => p.id === targetDeviceId) || null;
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
 function participantOnline(participant) {
@@ -148,15 +158,27 @@ function participantOnline(participant) {
 
 function peerSnapshot(room, participantId) {
   const self = room.participants.get(participantId);
-  const peer = otherParticipant(room, participantId);
+  const peerDevices = [...room.participants.values()].filter((p) => p.memberId === otherMemberId(self?.memberId));
+  const registry = store.room(room.hash);
+  const members = ['a', 'b'].map((memberId) => ({
+    id: memberId,
+    displayName: registry.members[memberId].displayName,
+    devices: store.devices(room.hash, memberId).map((device) => {
+      const runtime = room.participants.get(device.id);
+      return { ...device, petOnline: !!runtime?.pet, controllerOnline: !!runtime?.controller };
+    }),
+  }));
   return {
+    protocolVersion: 2,
+    self: { memberId: self?.memberId, deviceId: self?.id },
+    members,
     selfReady: !!(self?.pet && self?.controller),
-    peerOnline: participantOnline(peer),
-    peerPetOnline: !!peer?.pet,
-    peerControllerOnline: !!peer?.controller,
+    peerOnline: peerDevices.some((device) => !!device.controller),
+    peerPetOnline: peerDevices.some((device) => !!device.pet),
+    peerControllerOnline: peerDevices.some((device) => !!device.controller),
     // v1.1 UI compatibility: from this participant's perspective these mean remote endpoints.
-    pet: !!peer?.pet,
-    controller: !!peer?.controller,
+    pet: peerDevices.some((device) => !!device.pet),
+    controller: peerDevices.some((device) => !!device.controller),
   };
 }
 
@@ -180,9 +202,16 @@ function emitToRoomEndpoints(room, event, payload) {
 function endRoomCall(room, reason = 'ended') {
   if (!room.callId) return;
   const callId = room.callId;
+  const deviceIds = room.call ? [room.call.initiatorDeviceId, room.call.targetDeviceId] : [];
+  for (const deviceId of deviceIds) {
+    const device = room.participants.get(deviceId);
+    for (const socketId of [device?.pet, device?.controller]) if (socketId) {
+      io.to(socketId).emit('call:end', { callId, reason });
+      io.to(socketId).emit('webrtc:hangup', { callId, reason });
+    }
+  }
   room.callId = null;
-  emitToRoomEndpoints(room, 'call:end', { callId, reason });
-  emitToRoomEndpoints(room, 'webrtc:hangup', { callId, reason });
+  room.call = null;
 }
 
 // === TTS jobs ===
@@ -510,22 +539,28 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (data?.protocolVersion !== 2 || !['a', 'b'].includes(data?.memberId)
+      || !String(data?.deviceId || '').trim() || !String(data?.deviceName || '').trim()) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'upgrade_required', error: 'protocol v2 required' });
+      return;
+    }
     let room = rooms.get(roomHash);
     if (!room) {
       room = { hash: roomHash, participants: new Map(), callId: null };
       rooms.set(roomHash, room);
     }
-    // 老客户端没有 participantId：controller 与 pet 各视为一名参与者，保持旧式配对。
-    const participantId = String(data?.participantId || `legacy-${role}`).slice(0, 128);
+    const participantId = String(data.deviceId).slice(0, 128);
+    const memberId = data.memberId;
     let participant = room.participants.get(participantId);
-    if (!participant && room.participants.size >= 2) {
-      if (typeof ack === 'function') ack({ ok: false, code: 'room_full', error: 'room full' });
+    if (participant && participant.memberId !== memberId) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'device_identity_conflict' });
       return;
     }
     if (!participant) {
-      participant = { id: participantId, pet: null, controller: null, releaseTimer: null };
+      participant = { id: participantId, memberId, pet: null, controller: null, releaseTimer: null };
       room.participants.set(participantId, participant);
     }
+    store.touchDevice(roomHash, memberId, participantId, String(data.deviceName).trim().slice(0, 80));
     if (participant.releaseTimer) {
       clearTimeout(participant.releaseTimer);
       participant.releaseTimer = null;
@@ -544,28 +579,122 @@ io.on('connection', (socket) => {
     socket.data.role = role;
     socket.data.roomHash = roomHash;
     socket.data.participantId = participantId;
+    socket.data.memberId = memberId;
     socket.join(roomChannel(roomHash));
     if (typeof ack === 'function') ack({ ok: true, peers: peerSnapshot(room, participantId) });
     emitPeerSnapshots(room);
-    console.log(`[socket] ${role} joined room=${roomHash.slice(0, 8)} participant=${participantId}`);
+    console.log(`[socket] ${role} joined room=${roomHash.slice(0, 8)} member=${memberId} device=${participantId}`);
+  });
+
+  socket.on('room:rename-member', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const memberId = payload?.memberId;
+    const displayName = String(payload?.displayName || '').trim().slice(0, 40);
+    if (!room || !['a', 'b'].includes(memberId) || !displayName) {
+      if (typeof ack === 'function') ack({ ok: false, code: 'invalid_name' });
+      return;
+    }
+    store.renameMember(room.hash, memberId, displayName);
+    emitPeerSnapshots(room);
+    if (typeof ack === 'function') ack({ ok: true });
+  });
+
+  socket.on('device:reclaim', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const oldDeviceId = String(payload?.deviceId || '');
+    const oldRuntime = room?.participants.get(oldDeviceId);
+    if (!room || !oldDeviceId || oldRuntime?.pet || oldRuntime?.controller) {
+      if (typeof ack === 'function') ack({ ok: false, code: oldRuntime ? 'device_online' : 'device_not_found' });
+      return;
+    }
+    const current = participantForSocket(socket);
+    const item = store.reclaimDevice(room.hash, socket.data.memberId, oldDeviceId, current.id, String(payload?.deviceName || '').trim().slice(0, 80) || store.devices(room.hash, socket.data.memberId).find((device) => device.id === oldDeviceId)?.name || '设备');
+    if (!item) return typeof ack === 'function' && ack({ ok: false, code: 'device_not_found' });
+    room.participants.delete(oldDeviceId);
+    emitPeerSnapshots(room);
+    if (typeof ack === 'function') ack({ ok: true, device: item });
+  });
+
+  socket.on('audio:list', (payload, ack) => {
+    if (typeof payload === 'function') ack = payload;
+    const room = roomForSocket(socket);
+    if (typeof ack === 'function') ack(room ? { ok: true, items: store.audio(room.hash, socket.data.memberId) } : { ok: false, code: 'not_joined', items: [] });
+  });
+
+  socket.on('audio:add', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const data = Buffer.isBuffer(payload?.data) ? payload.data : Buffer.from(payload?.data || []);
+    const mime = String(payload?.mime || '').toLowerCase();
+    const allowed = new Map([
+      ['audio/mpeg', 'mp3'], ['audio/mp3', 'mp3'], ['audio/wav', 'wav'], ['audio/x-wav', 'wav'],
+      ['audio/ogg', 'ogg'], ['audio/mp4', 'm4a'], ['audio/x-m4a', 'm4a'], ['audio/webm', 'webm'],
+    ]);
+    const name = String(payload?.name || '').trim().slice(0, 80);
+    const durationMs = Number(payload?.durationMs || 0);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined' });
+    if (!name || !allowed.has(mime) || !data.length || data.length > 10 * 1024 * 1024 || durationMs <= 0 || durationMs > 60_000) {
+      return typeof ack === 'function' && ack({ ok: false, code: 'invalid_audio' });
+    }
+    if (store.audio(room.hash, socket.data.memberId).length >= 100) {
+      return typeof ack === 'function' && ack({ ok: false, code: 'audio_limit_reached' });
+    }
+    const item = store.addAudio(room.hash, socket.data.memberId, { name, mime, extension: allowed.get(mime), durationMs, data });
+    if (typeof ack === 'function') ack({ ok: true, item });
+  });
+
+  socket.on('audio:rename', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const name = String(payload?.name || '').trim().slice(0, 80);
+    const item = room && name ? store.renameAudio(room.hash, socket.data.memberId, String(payload?.audioId || ''), name) : null;
+    if (typeof ack === 'function') ack(item ? { ok: true, item } : { ok: false, code: 'audio_not_found' });
+  });
+
+  socket.on('audio:delete', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const ok = !!room && store.deleteAudio(room.hash, socket.data.memberId, String(payload?.audioId || ''));
+    if (typeof ack === 'function') ack(ok ? { ok: true } : { ok: false, code: 'audio_not_found' });
+  });
+
+  socket.on('audio:get', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const audio = room && store.audioPath(room.hash, socket.data.memberId, String(payload?.audioId || ''));
+    if (!audio) return typeof ack === 'function' && ack({ ok: false, code: 'audio_not_found' });
+    try { if (typeof ack === 'function') ack({ ok: true, mime: audio.item.mime, data: fs.readFileSync(audio.file) }); }
+    catch { if (typeof ack === 'function') ack({ ok: false, code: 'audio_unavailable' }); }
+  });
+
+  socket.on('audio:play', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const target = room && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId);
+    const audio = room && store.audioPath(room.hash, socket.data.memberId, String(payload?.audioId || ''));
+    if (!target?.pet) return typeof ack === 'function' && ack({ ok: false, code: 'peer_pet_offline' });
+    if (!audio) return typeof ack === 'function' && ack({ ok: false, code: 'audio_not_found' });
+    try {
+      const data = fs.readFileSync(audio.file);
+      io.to(target.pet).emit('audio:play', { id: audio.item.id, name: audio.item.name, mime: audio.item.mime, data });
+      if (typeof ack === 'function') ack({ ok: true });
+    } catch {
+      if (typeof ack === 'function') ack({ ok: false, code: 'audio_unavailable' });
+    }
   });
 
   socket.on('pet:command', (cmd) => {
     if (socket.data?.role !== 'controller') return;
     const room = roomForSocket(socket);
-    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
+    const petId = room && otherParticipant(room, socket.data.participantId, cmd?.targetDeviceId)?.pet;
     if (!petId) return;
-    io.to(petId).emit('pet:command', cmd);
+    const { targetDeviceId: _targetDeviceId, ...command } = cmd || {};
+    io.to(petId).emit('pet:command', command);
   });
 
   // controller 想知道 pet 当前有哪些预录台词；ack 链：server 转发给 pet，pet 回 callback。
-  socket.on('pet:list-voices', (ack) => {
+  socket.on('pet:list-voices', (payload, ack) => {
     if (socket.data?.role !== 'controller') {
       if (typeof ack === 'function') ack([]);
       return;
     }
     const room = roomForSocket(socket);
-    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
+    const petId = room && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId)?.pet;
     if (!petId) {
       if (typeof ack === 'function') ack([]);
       return;
@@ -579,13 +708,13 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('pet:list-motions', (ack) => {
+  socket.on('pet:list-motions', (payload, ack) => {
     if (socket.data?.role !== 'controller') {
       if (typeof ack === 'function') ack([]);
       return;
     }
     const room = roomForSocket(socket);
-    const petId = room && otherParticipant(room, socket.data.participantId)?.pet;
+    const petId = room && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId)?.pet;
     if (!petId) {
       if (typeof ack === 'function') ack([]);
       return;
@@ -686,7 +815,7 @@ io.on('connection', (socket) => {
       if (typeof ack === 'function') ack({ ok: false, code: 'tts_voice_not_allowed' });
       return;
     }
-    const target = otherParticipant(room, socket.data.participantId);
+    const target = otherParticipant(room, socket.data.participantId, payload?.targetDeviceId);
     if (!target?.pet) {
       if (typeof ack === 'function') ack({ ok: false, code: 'peer_pet_offline' });
       return;
@@ -731,7 +860,9 @@ io.on('connection', (socket) => {
     if (payload?.callId && payload.callId !== room.callId) return;
     const role = socket.data?.role;
     const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
-    const targetId = targetRole && otherParticipant(room, socket.data.participantId)?.[targetRole];
+    const pairedDeviceId = room.call && (socket.data.participantId === room.call.initiatorDeviceId
+      ? room.call.targetDeviceId : room.call.initiatorDeviceId);
+    const targetId = targetRole && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId || pairedDeviceId)?.[targetRole];
     if (!targetId) return;
     io.to(targetId).emit('webrtc:signal', payload);
   });
@@ -752,7 +883,8 @@ io.on('connection', (socket) => {
     const state = String(payload?.state || '');
     if (!['screen', 'microphone', 'system-audio'].includes(media)) return;
     if (!['available', 'paused', 'unavailable'].includes(state)) return;
-    const targetId = otherParticipant(room, socket.data.participantId)?.controller;
+    const pairedDeviceId = socket.data.participantId === room.call?.initiatorDeviceId ? room.call?.targetDeviceId : room.call?.initiatorDeviceId;
+    const targetId = otherParticipant(room, socket.data.participantId, pairedDeviceId)?.controller;
     if (!targetId) return;
     const allowedReasons = new Set(['relay_audio_only', 'capture_failed', 'track_ended']);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
@@ -761,19 +893,21 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('call:start', (ack) => {
+  socket.on('call:start', (payload, ack) => {
     const room = roomForSocket(socket);
     if (!room || socket.data?.role !== 'controller') return;
-    const peer = otherParticipant(room, socket.data.participantId);
-    const ready = room.participants.size === 2
-      && [...room.participants.values()].every((p) => p.pet && p.controller);
-    if (!peer || !ready) {
+    const peer = otherParticipant(room, socket.data.participantId, payload?.targetDeviceId);
+    const self = participantForSocket(socket);
+    if (!peer?.pet || !peer?.controller || !self?.pet || !self?.controller) {
       if (typeof ack === 'function') ack({ ok: false, code: 'peer_not_ready' });
       return;
     }
-    if (!room.callId) room.callId = randomUUID();
-    for (const participant of room.participants.values()) {
-      if (participant.controller) io.to(participant.controller).emit('call:start', { callId: room.callId });
+    if (!room.callId) {
+      room.callId = randomUUID();
+      room.call = { initiatorDeviceId: self.id, targetDeviceId: peer.id };
+    }
+    for (const participant of [self, peer]) if (participant.controller) {
+      io.to(participant.controller).emit('call:start', { callId: room.callId, peerDeviceId: participant.id === self.id ? peer.id : self.id });
     }
     if (typeof ack === 'function') ack({ ok: true, callId: room.callId });
   });
@@ -793,7 +927,9 @@ io.on('connection', (socket) => {
     const room = roomForSocket(socket);
     const role = socket.data?.role;
     const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
-    const targetId = room && targetRole && otherParticipant(room, socket.data.participantId)?.[targetRole];
+    const pairedDeviceId = room?.call && (socket.data.participantId === room.call.initiatorDeviceId
+      ? room.call.targetDeviceId : room.call.initiatorDeviceId);
+    const targetId = room && targetRole && otherParticipant(room, socket.data.participantId, pairedDeviceId)?.[targetRole];
     if (!targetId) return;
     io.to(targetId).emit('webrtc:error', payload);
   });
@@ -806,7 +942,7 @@ io.on('connection', (socket) => {
     participant[role] = null;
     if (role === 'pet') failTtsForTarget(room.hash, participant.id, 'peer_pet_offline');
     if (role === 'controller') failByokJobsForRequester(room.hash, participant.id);
-    endRoomCall(room, 'peer_disconnected');
+    if (room.call && [room.call.initiatorDeviceId, room.call.targetDeviceId].includes(participant.id)) endRoomCall(room, 'peer_disconnected');
     if (!participantOnline(participant)) {
       participant.releaseTimer = setTimeout(() => {
         if (participantOnline(participant)) return;

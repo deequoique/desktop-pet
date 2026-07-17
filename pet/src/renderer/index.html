@@ -143,8 +143,12 @@
         <h1>连接桌宠房间</h1>
         <label for="pairing-server">服务器地址</label>
         <input id="pairing-server" type="url" placeholder="https://pet.example.com" autocomplete="off" />
-        <label for="pairing-secret">房间密钥 / 配对码</label>
-        <input id="pairing-secret" type="password" placeholder="输入你拿到的配对码" autocomplete="off" />
+        <label for="pairing-secret">服务器密钥</label>
+        <input id="pairing-secret" type="password" placeholder="输入服务器密钥" autocomplete="off" />
+        <label for="pairing-member">我的身份</label>
+        <select id="pairing-member"><option value="">请选择</option><option value="a">用户 A</option><option value="b">用户 B</option></select>
+        <label for="pairing-device">设备名称</label>
+        <input id="pairing-device" type="text" maxlength="80" placeholder="例如：卧室电脑" autocomplete="off" />
         <button type="submit">保存并连接</button>
         <div id="pairing-error"></div>
       </div>
