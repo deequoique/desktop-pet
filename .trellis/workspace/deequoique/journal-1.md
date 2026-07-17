@@ -75,3 +75,37 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 多设备在线状态与个人音频
+
+**Date**: 2026-07-17
+**Task**: 多设备在线状态与个人音频
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+完成协议 v2 双成员多设备身份、设备状态和定向路由；支持双方修改成员名称、离线设备认领与 30 天清理；新增成员私有音频录制、导入、试听、重命名、删除和发送；所有 server/pet/web 测试与构建通过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e645890` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
