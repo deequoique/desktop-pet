@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -187,6 +187,7 @@ function defaultBottomRight() {
 
 let win = null;
 let controlWin = null;
+let mediaFloatWin = null;
 let tray = null;
 let gameMode = false;
 let petDragging = false;
@@ -228,6 +229,46 @@ function broadcastScaleChanged(scale) {
   for (const target of [win, controlWin]) {
     if (target && !target.isDestroyed()) target.webContents.send('pet:scale-changed', scale);
   }
+}
+
+function mediaFloatBounds() {
+  const saved = loadState()?.mediaFloatBounds;
+  const anchor = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
+    ? saved : controlWin?.getBounds() || screen.getPrimaryDisplay().workArea;
+  const display = screen.getDisplayMatching(anchor);
+  const fallback = {
+    x: display.workArea.x + display.workArea.width - 480 - 20,
+    y: display.workArea.y + display.workArea.height - 270 - 20,
+    width: 480,
+    height: 270,
+  };
+  const requested = saved && Number.isFinite(saved.width) && Number.isFinite(saved.height)
+    ? { ...saved, width: Math.max(320, saved.width), height: Math.max(180, saved.height) }
+    : fallback;
+  return clampBoundsToWorkArea(requested, display.workArea);
+}
+
+function persistMediaFloatBounds() {
+  if (!mediaFloatWin || mediaFloatWin.isDestroyed()) return;
+  patchState({ mediaFloatBounds: mediaFloatWin.getBounds() });
+}
+
+function clampMediaFloatToVisibleArea() {
+  if (!mediaFloatWin || mediaFloatWin.isDestroyed()) return;
+  const bounds = mediaFloatWin.getBounds();
+  const display = screen.getDisplayMatching(bounds);
+  mediaFloatWin.setBounds(clampBoundsToWorkArea(bounds, display.workArea));
+  persistMediaFloatBounds();
+}
+
+function setupMediaPermissions() {
+  const isTrusted = (webContents) => webContents === win?.webContents || webContents === controlWin?.webContents;
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    return permission === 'media' && isTrusted(webContents);
+  });
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(permission === 'media' && isTrusted(webContents));
+  });
 }
 
 function applyPetScale(rawScale, source = 'unknown') {
@@ -565,6 +606,49 @@ function createControlWindow() {
       nodeIntegration: false,
     },
   });
+  controlWin.webContents.setWindowOpenHandler(({ url, frameName }) => {
+    if (url !== 'about:blank' || frameName !== 'media-float') return { action: 'deny' };
+    const bounds = mediaFloatBounds();
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        ...bounds,
+        minWidth: 320,
+        minHeight: 180,
+        resizable: true,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        title: '通话浮窗',
+        backgroundColor: '#17141c',
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+        },
+      },
+    };
+  });
+  controlWin.webContents.on('did-create-window', (child, details) => {
+    if (details.frameName !== 'media-float') {
+      child.close();
+      return;
+    }
+    if (mediaFloatWin && !mediaFloatWin.isDestroyed() && mediaFloatWin !== child) mediaFloatWin.close();
+    mediaFloatWin = child;
+    mediaFloatWin.setAlwaysOnTop(true, 'floating');
+    mediaFloatWin.setFullScreenable(false);
+    mediaFloatWin.on('move', persistMediaFloatBounds);
+    mediaFloatWin.on('resize', persistMediaFloatBounds);
+    mediaFloatWin.on('unresponsive', () => diagnostic('media-float-unresponsive'));
+    mediaFloatWin.webContents.on('render-process-gone', (_event, info) => diagnostic('media-float-render-process-gone', info));
+    mediaFloatWin.on('closed', () => {
+      mediaFloatWin = null;
+      if (controlWin && !controlWin.isDestroyed()) {
+        controlWin.webContents.send('media-float:closed');
+        controlWin.show();
+        controlWin.focus();
+      }
+    });
+  });
   if (isDev) controlWin.loadURL(CONTROL_DEV_URL);
   else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
   controlWin.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
@@ -776,14 +860,17 @@ function onDisplayMetricsChanged(_event, display, changedMetrics) {
     display: displaySnapshot(display),
     petWindow: currentWindowSnapshot(),
   });
+  clampMediaFloatToVisibleArea();
 }
 
 function onDisplayAdded(_event, display) {
   diagnostic('display-added', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
+  clampMediaFloatToVisibleArea();
 }
 
 function onDisplayRemoved(_event, display) {
   diagnostic('display-removed', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
+  clampMediaFloatToVisibleArea();
 }
 
 function onUncaughtException(error, origin) {
@@ -808,6 +895,7 @@ app.whenReady().then(() => {
   ensureDefaultLaunchAtStartup();
   createWindow();
   createControlWindow();
+  setupMediaPermissions();
   createTray();
   startCursorPoll();
   setupAutoUpdater();

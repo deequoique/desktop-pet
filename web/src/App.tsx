@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   connect,
   disconnect,
@@ -10,6 +11,9 @@ import {
   requestRtcConfig,
   sendCommand,
   sendSignal,
+  sendCameraSignal,
+  sendMediaStatus,
+  requestMediaControl,
   setListeners,
   setTtsCredentials,
   addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
@@ -50,6 +54,7 @@ const LS_TARGET_DEVICES = 'pet.targetDeviceIds';
 const LS_MEMBER_NAMES = 'pet.memberNames';
 const LS_TTS_MODE = 'pet.ttsMode';
 const LS_TTS_VOICE = 'pet.ttsVoiceId';
+const LS_CAMERA_DEVICE = 'pet.cameraDeviceId';
 
 type PairingConfig = { serverUrl?: string; roomSecret?: string; deviceId?: string; deviceName?: string; memberId?: 'a' | 'b' };
 type PetScaleResult = { ok: boolean; scale?: number; error?: string };
@@ -68,6 +73,7 @@ declare global {
       resetPetScale: () => Promise<PetScaleResult>;
       onPetScaleChanged: (cb: (scale: number) => void) => () => void;
       exportDiagnostics: () => Promise<DiagnosticsExportResult>;
+      onMediaFloatClosed: (cb: () => void) => () => void;
     };
   }
 }
@@ -292,11 +298,25 @@ export default function App() {
   const [micEnabled, setMicEnabledState] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
   const [screenStatus, setScreenStatus] = useState<MediaStatus['state']>('unavailable');
+  const [screenDesired, setScreenDesired] = useState(true);
+  const [screenControlPending, setScreenControlPending] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState<MediaStatus['state']>('unavailable');
+  const [cameraDesired, setCameraDesired] = useState(false);
+  const [cameraControlPending, setCameraControlPending] = useState(false);
+  const [isCameraSender, setIsCameraSender] = useState(false);
+  const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState(() => localStorage.getItem(LS_CAMERA_DEVICE) || '');
+  const [cameraPreviewCollapsed, setCameraPreviewCollapsed] = useState(false);
+  const [cameraHidden, setCameraHidden] = useState(false);
+  const [preferredPrimary, setPreferredPrimary] = useState<'screen' | 'camera'>('screen');
+  const [floatContainer, setFloatContainer] = useState<HTMLElement | null>(null);
   const [remoteTrackSummary, setRemoteTrackSummary] = useState('无');
   const [rtcRoute, setRtcRoute] = useState<RtcRoute>(EMPTY_RTC_ROUTE);
   const toastTimer = useRef<number | null>(null);
   const personalAudioRecorderRef = useRef<MediaRecorder | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteCameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localCameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteMicAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteSystemAudioRef = useRef<HTMLAudioElement | null>(null);
   const videoStageRef = useRef<HTMLDivElement | null>(null);
@@ -304,6 +324,18 @@ export default function App() {
   const remoteMicStreamRef = useRef<MediaStream | null>(null);
   const remoteSystemStreamRef = useRef<MediaStream | null>(null);
   const rtcPcRef = useRef<RTCPeerConnection | null>(null);
+  const cameraPcRef = useRef<RTCPeerConnection | null>(null);
+  const cameraSenderRef = useRef<RTCRtpSender | null>(null);
+  const localCameraStreamRef = useRef<MediaStream | null>(null);
+  const remoteCameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraPendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const cameraSenderDeviceIdRef = useRef('');
+  const selfDeviceIdRef = useRef('');
+  const cameraRouteIsP2PRef = useRef(false);
+  const cameraRouteKnownRef = useRef(false);
+  const cameraDesiredRef = useRef(false);
+  const cameraCapturePendingRef = useRef(false);
+  const mediaFloatWindowRef = useRef<Window | null>(null);
   const localAudioRef = useRef<MediaStream | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const currentCallIdRef = useRef<string | null>(null);
@@ -336,11 +368,34 @@ export default function App() {
     recoveryTimerRef.current = null;
     iceRestartedRef.current = false;
     rtcPcRef.current = null;
+    try { cameraPcRef.current?.close(); } catch {}
+    cameraPcRef.current = null;
+    cameraSenderRef.current = null;
+    cameraPendingCandidatesRef.current = [];
+    cameraRouteIsP2PRef.current = false;
+    cameraRouteKnownRef.current = false;
+    for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
+    localCameraStreamRef.current = null;
+    remoteCameraStreamRef.current = null;
+    cameraDesiredRef.current = false;
+    setCameraDesired(false);
+    setCameraStatus('unavailable');
+    setIsCameraSender(false);
+    setCameraHidden(false);
+    setPreferredPrimary('screen');
+    if (localCameraVideoRef.current) localCameraVideoRef.current.srcObject = null;
+    if (remoteCameraVideoRef.current) remoteCameraVideoRef.current.srcObject = null;
+    try { mediaFloatWindowRef.current?.close(); } catch {}
+    mediaFloatWindowRef.current = null;
+    setFloatContainer(null);
     pendingCandidatesRef.current = [];
     stopLocalAudio();
     setMicEnabled(false);
     setRemoteReady(false);
     setScreenStatus('unavailable');
+    setScreenDesired(true);
+    setScreenControlPending(false);
+    setCameraControlPending(false);
     setRemoteTrackSummary('无');
     setRtcRoute(EMPTY_RTC_ROUTE);
     remoteVideoStreamRef.current = null;
@@ -563,6 +618,191 @@ export default function App() {
     }
   }, [ensurePeerConnection, flushPendingCandidates, sendRtcSignal]);
 
+  const refreshCameraDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === 'videoinput');
+    setCameraDevices(devices);
+    setSelectedCameraId((current) => {
+      if (current && devices.some((device) => device.deviceId === current)) return current;
+      const fallback = devices[0]?.deviceId || '';
+      if (fallback) localStorage.setItem(LS_CAMERA_DEVICE, fallback);
+      return fallback;
+    });
+  }, []);
+
+  const reportCameraStatus = useCallback((state: MediaStatus['state'], reason?: MediaStatus['reason']) => {
+    const callId = currentCallIdRef.current;
+    if (!callId) return;
+    setCameraStatus(state);
+    sendMediaStatus({ callId, media: 'camera', state, ...(reason ? { reason } : {}) });
+  }, []);
+
+  const syncCameraSenderTrack = useCallback(async () => {
+    const sender = cameraSenderRef.current;
+    if (!sender) return;
+    const track = cameraDesiredRef.current && cameraRouteIsP2PRef.current
+      ? localCameraStreamRef.current?.getVideoTracks()[0] || null
+      : null;
+    await sender.replaceTrack(track);
+    if (!cameraDesiredRef.current) reportCameraStatus('unavailable', 'controller_disabled');
+    else if (!cameraRouteKnownRef.current) reportCameraStatus('paused');
+    else if (!cameraRouteIsP2PRef.current) reportCameraStatus('paused', 'relay_audio_only');
+    else if (track) reportCameraStatus('available');
+    else reportCameraStatus('unavailable', 'capture_failed');
+  }, [reportCameraStatus]);
+
+  const setLocalCameraEnabled = useCallback(async (enabled: boolean) => {
+    cameraDesiredRef.current = enabled;
+    cameraCapturePendingRef.current = enabled;
+    setCameraDesired(enabled);
+    if (!enabled) {
+      try { await cameraSenderRef.current?.replaceTrack(null); } catch {}
+      for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
+      localCameraStreamRef.current = null;
+      if (localCameraVideoRef.current) localCameraVideoRef.current.srcObject = null;
+      reportCameraStatus('unavailable', 'controller_disabled');
+      cameraCapturePendingRef.current = false;
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      cameraDesiredRef.current = false;
+      setCameraDesired(false);
+      reportCameraStatus('unavailable', 'capture_failed');
+      showToast('当前环境不支持摄像头', true);
+      cameraCapturePendingRef.current = false;
+      return;
+    }
+    try {
+      for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          ...(selectedCameraId ? { deviceId: { exact: selectedCameraId } } : {}),
+          width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 24 },
+        },
+        audio: false,
+      });
+      if (!cameraDesiredRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      localCameraStreamRef.current = stream;
+      const track = stream.getVideoTracks()[0];
+      track.addEventListener('ended', () => {
+        if (localCameraStreamRef.current !== stream) return;
+        localCameraStreamRef.current = null;
+        reportCameraStatus('unavailable', 'device_lost');
+        void refreshCameraDevices();
+        showToast('摄像头已断开，正在尝试默认设备', true);
+      }, { once: true });
+      if (localCameraVideoRef.current) {
+        localCameraVideoRef.current.srcObject = stream;
+        void localCameraVideoRef.current.play().catch(() => {});
+      }
+      await refreshCameraDevices();
+      await syncCameraSenderTrack();
+      cameraCapturePendingRef.current = false;
+    } catch (error: any) {
+      cameraDesiredRef.current = false;
+      setCameraDesired(false);
+      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+      reportCameraStatus('unavailable', denied ? 'permission_denied' : 'capture_failed');
+      showToast(denied ? '没有获得摄像头权限' : `摄像头打开失败：${error?.message || error}`, true);
+      cameraCapturePendingRef.current = false;
+    }
+  }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, syncCameraSenderTrack]);
+
+  const ensureCameraPeerConnection = useCallback(async (senderSide: boolean) => {
+    if (cameraPcRef.current) return cameraPcRef.current;
+    const pc = new RTCPeerConnection(await requestRtcConfig());
+    cameraPcRef.current = pc;
+    if (!senderSide) pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.onicecandidate = (event) => {
+      const callId = currentCallIdRef.current;
+      if (event.candidate && callId) sendCameraSignal({ callId, candidate: event.candidate.toJSON() });
+    };
+    pc.ontrack = (event) => {
+      const stream = remoteCameraStreamRef.current ?? new MediaStream();
+      remoteCameraStreamRef.current = stream;
+      if (!stream.getTracks().some((track) => track.id === event.track.id)) stream.addTrack(event.track);
+      if (remoteCameraVideoRef.current) {
+        remoteCameraVideoRef.current.srcObject = stream;
+        void remoteCameraVideoRef.current.play().catch(() => {});
+      }
+      setCameraStatus('available');
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        readRtcRoute(pc).then(async (route) => {
+          cameraRouteKnownRef.current = true;
+          cameraRouteIsP2PRef.current = !route.relayed;
+          if (senderSide) await syncCameraSenderTrack();
+        }).catch(() => {
+          cameraRouteKnownRef.current = false;
+          cameraRouteIsP2PRef.current = false;
+          if (senderSide) void syncCameraSenderTrack();
+        });
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        cameraRouteKnownRef.current = false;
+        cameraRouteIsP2PRef.current = false;
+        if (senderSide) void syncCameraSenderTrack();
+      }
+    };
+    return pc;
+  }, [syncCameraSenderTrack]);
+
+  const flushCameraCandidates = useCallback(async () => {
+    const pc = cameraPcRef.current;
+    if (!pc?.remoteDescription) return;
+    while (cameraPendingCandidatesRef.current.length) {
+      const candidate = cameraPendingCandidatesRef.current.shift();
+      if (candidate) await pc.addIceCandidate(candidate);
+    }
+  }, []);
+
+  const handleCameraSignal = useCallback(async (signal: WebRtcSignal) => {
+    if (!signal?.callId || signal.callId !== currentCallIdRef.current) return;
+    const senderSide = selfDeviceIdRef.current === cameraSenderDeviceIdRef.current;
+    const pc = await ensureCameraPeerConnection(senderSide);
+    if (signal.description?.type === 'offer') {
+      if (!senderSide) return;
+      await pc.setRemoteDescription(signal.description);
+      const videoTransceiver = pc.getTransceivers().find((item) => item.receiver.track.kind === 'video');
+      if (!videoTransceiver) throw new Error('camera transceiver missing');
+      videoTransceiver.direction = 'sendonly';
+      cameraSenderRef.current = videoTransceiver.sender;
+      await flushCameraCandidates();
+      await pc.setLocalDescription(await pc.createAnswer());
+      sendCameraSignal({ callId: signal.callId, description: pc.localDescription });
+      return;
+    }
+    if (signal.description?.type === 'answer') {
+      if (senderSide) return;
+      await pc.setRemoteDescription(signal.description);
+      await flushCameraCandidates();
+      return;
+    }
+    if (signal.candidate) {
+      if (!pc.remoteDescription) cameraPendingCandidatesRef.current.push(signal.candidate);
+      else await pc.addIceCandidate(signal.candidate);
+    }
+  }, [ensureCameraPeerConnection, flushCameraCandidates]);
+
+  const beginCameraCall = useCallback(async (callId: string, cameraSenderDeviceId: string) => {
+    cameraSenderDeviceIdRef.current = cameraSenderDeviceId;
+    const senderSide = selfDeviceIdRef.current === cameraSenderDeviceId;
+    setIsCameraSender(senderSide);
+    setCameraDesired(false);
+    cameraDesiredRef.current = false;
+    setCameraStatus('unavailable');
+    if (senderSide) {
+      await refreshCameraDevices();
+      return;
+    }
+    const pc = await ensureCameraPeerConnection(false);
+    await pc.setLocalDescription(await pc.createOffer());
+    sendCameraSignal({ callId, description: pc.localDescription });
+  }, [ensureCameraPeerConnection, refreshCameraDevices]);
+
   const beginMediaCall = useCallback(async (callId: string) => {
     if (currentCallIdRef.current === callId && rtcPcRef.current) return;
     teardownCall({ nextState: 'requesting-media' });
@@ -579,6 +819,7 @@ export default function App() {
       onStatus: setStatus,
       onPeers: (next) => {
         setPeers(next);
+        selfDeviceIdRef.current = next.self.deviceId;
         const names = {
           a: next.members.find((member) => member.id === 'a')?.displayName || '用户 A',
           b: next.members.find((member) => member.id === 'b')?.displayName || '用户 B',
@@ -607,6 +848,17 @@ export default function App() {
           teardownCall({ nextState: 'error' });
         });
       },
+      onCameraSignal: (signal) => {
+        handleCameraSignal(signal).catch((error) => {
+          console.warn('[webrtc] camera signal failed:', error);
+          showToast(`摄像头连接失败：${error?.message || error}`, true);
+        });
+      },
+      onMediaControl: (control) => {
+        if (control.callId !== currentCallIdRef.current || control.media !== 'camera' || !isCameraSender) return;
+        setCameraControlPending(true);
+        setLocalCameraEnabled(control.enabled).finally(() => setCameraControlPending(false));
+      },
       onHangup: () => {
         if (!currentCallIdRef.current) return;
         teardownCall({ nextState: 'idle' });
@@ -620,16 +872,34 @@ export default function App() {
         if (payload.callId !== currentCallIdRef.current) return;
         if (payload.media === 'screen') {
           setScreenStatus(payload.state);
+          setScreenControlPending(false);
+          if (payload.reason === 'controller_disabled') setScreenDesired(false);
+          else if (payload.state === 'available') setScreenDesired(true);
           setRemoteReady(payload.state === 'available' && !!remoteVideoStreamRef.current?.getVideoTracks().length);
           if (payload.reason === 'relay_audio_only') showToast('当前走 TURN：已停用画面，仅保留音频');
           if (payload.reason === 'capture_failed') showToast('对方屏幕采集失败，音频仍可继续', true);
           if (payload.reason === 'track_ended') showToast('对方已停止屏幕共享，音频仍可继续');
         }
+        if (payload.media === 'camera') {
+          setCameraStatus(payload.state);
+          setCameraControlPending(false);
+          if (payload.reason === 'controller_disabled' || payload.state === 'unavailable') setCameraDesired(false);
+          else setCameraDesired(true);
+          if (payload.reason === 'permission_denied') showToast('对方未授予摄像头权限', true);
+          if (payload.reason === 'device_lost') showToast('对方摄像头已断开', true);
+          if (payload.reason === 'relay_audio_only') showToast('TURN 模式不传输摄像头画面');
+        }
       },
-      onCallStart: (callId, peerDeviceId) => {
+      onCallStart: (callId, peerDeviceId, cameraSenderDeviceId) => {
         callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
+        if (cameraSenderDeviceId) {
+          cameraSenderDeviceIdRef.current = cameraSenderDeviceId;
+          setIsCameraSender(selfDeviceIdRef.current === cameraSenderDeviceId);
+        }
         setActiveView('call');
-        beginMediaCall(callId).catch((e) => {
+        beginMediaCall(callId).then(() => {
+          if (cameraSenderDeviceId) return beginCameraCall(callId, cameraSenderDeviceId);
+        }).catch((e) => {
           console.warn('[webrtc] start coordinated call failed:', e);
           showToast(`通话失败：${e?.message || e}`, true);
           teardownCall({ nextState: 'error' });
@@ -654,7 +924,7 @@ export default function App() {
       setListeners({});
       teardownCall({ nextState: 'idle' });
     };
-  }, [beginMediaCall, handleSignal, showToast, teardownCall]);
+  }, [beginCameraCall, beginMediaCall, handleCameraSignal, handleSignal, isCameraSender, setLocalCameraEnabled, showToast, teardownCall]);
 
   useEffect(() => {
     const bridge = window.desktopPetControl;
@@ -802,6 +1072,89 @@ export default function App() {
       showToast(`全屏切换失败：${e?.message || e}`, true);
     }
   }, [showToast]);
+
+  const bindScreenVideo = useCallback((element: HTMLVideoElement | null) => {
+    remoteVideoRef.current = element;
+    if (!element || !remoteVideoStreamRef.current) return;
+    element.srcObject = remoteVideoStreamRef.current;
+    element.muted = true;
+    void element.play().catch(() => {});
+  }, []);
+
+  const bindRemoteCameraVideo = useCallback((element: HTMLVideoElement | null) => {
+    remoteCameraVideoRef.current = element;
+    if (!element || !remoteCameraStreamRef.current) return;
+    element.srcObject = remoteCameraStreamRef.current;
+    element.muted = true;
+    void element.play().catch(() => {});
+  }, []);
+
+  const bindLocalCameraVideo = useCallback((element: HTMLVideoElement | null) => {
+    localCameraVideoRef.current = element;
+    if (!element || !localCameraStreamRef.current) return;
+    element.srcObject = localCameraStreamRef.current;
+    element.muted = true;
+    void element.play().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return;
+    const onDeviceChange = () => void refreshCameraDevices();
+    mediaDevices.addEventListener('devicechange', onDeviceChange);
+    return () => mediaDevices.removeEventListener('devicechange', onDeviceChange);
+  }, [refreshCameraDevices]);
+
+  useEffect(() => {
+    if (!isCameraSender || !cameraDesired || !selectedCameraId) return;
+    const activeTrack = localCameraStreamRef.current?.getVideoTracks()[0];
+    const activeId = activeTrack?.getSettings().deviceId;
+    if (!cameraCapturePendingRef.current && (!activeTrack || activeTrack.readyState !== 'live' || activeId !== selectedCameraId)) {
+      void setLocalCameraEnabled(true);
+    }
+  }, [cameraDesired, isCameraSender, selectedCameraId, setLocalCameraEnabled]);
+
+  useEffect(() => {
+    const bridge = window.desktopPetControl;
+    if (!bridge) return;
+    return bridge.onMediaFloatClosed(() => {
+      mediaFloatWindowRef.current = null;
+      setFloatContainer(null);
+    });
+  }, []);
+
+  const openMediaFloat = useCallback(() => {
+    if (!window.desktopPetControl) return;
+    if (mediaFloatWindowRef.current && !mediaFloatWindowRef.current.closed) {
+      mediaFloatWindowRef.current.focus();
+      return;
+    }
+    const child = window.open('about:blank', 'media-float', 'width=480,height=270');
+    if (!child) {
+      showToast('无法创建系统浮窗', true);
+      return;
+    }
+    child.document.title = '通话浮窗';
+    child.document.documentElement.style.background = '#17141c';
+    child.document.body.style.margin = '0';
+    child.document.body.style.overflow = 'hidden';
+    for (const node of document.querySelectorAll('link[rel="stylesheet"], style')) {
+      child.document.head.appendChild(node.cloneNode(true));
+    }
+    const root = child.document.createElement('div');
+    root.className = 'media-float-root';
+    child.document.body.appendChild(root);
+    child.addEventListener('beforeunload', () => {
+      mediaFloatWindowRef.current = null;
+      setFloatContainer(null);
+    }, { once: true });
+    mediaFloatWindowRef.current = child;
+    setFloatContainer(root);
+  }, [showToast]);
+
+  const closeMediaFloat = useCallback(() => {
+    mediaFloatWindowRef.current?.close();
+  }, []);
 
   useEffect(() => {
     if (callState !== 'calling' && callState !== 'in-call') return;
@@ -1120,6 +1473,40 @@ export default function App() {
     teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
   }, [teardownCall]);
 
+  const toggleRemoteScreen = useCallback(async () => {
+    const callId = currentCallIdRef.current;
+    if (!callId || screenControlPending) return;
+    const enabled = !screenDesired;
+    setScreenControlPending(true);
+    const result = await requestMediaControl({ callId, media: 'screen', enabled });
+    if (!result.ok) {
+      setScreenControlPending(false);
+      showToast(`屏幕控制失败：${result.code || 'unknown'}`, true);
+    }
+  }, [screenControlPending, screenDesired, showToast]);
+
+  const toggleCamera = useCallback(async () => {
+    const callId = currentCallIdRef.current;
+    if (!callId || cameraControlPending) return;
+    const enabled = !cameraDesired;
+    setCameraControlPending(true);
+    if (isCameraSender) {
+      await setLocalCameraEnabled(enabled);
+      setCameraControlPending(false);
+      return;
+    }
+    const result = await requestMediaControl({ callId, media: 'camera', enabled });
+    if (!result.ok) {
+      setCameraControlPending(false);
+      showToast(`摄像头控制失败：${result.code || 'unknown'}`, true);
+    }
+  }, [cameraControlPending, cameraDesired, isCameraSender, setLocalCameraEnabled, showToast]);
+
+  const selectCamera = useCallback((deviceId: string) => {
+    setSelectedCameraId(deviceId);
+    if (deviceId) localStorage.setItem(LS_CAMERA_DEVICE, deviceId);
+  }, []);
+
   const toggleLocalMic = useCallback(() => {
     if (callState !== 'in-call' && callState !== 'calling') return;
     setMicEnabled(!micEnabled);
@@ -1128,6 +1515,32 @@ export default function App() {
   const peerName = peerMember?.displayName || '对方';
   const selfName = selfMember?.displayName || '我';
   const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
+  const remoteCameraAvailable = !isCameraSender && cameraStatus === 'available';
+  const effectivePrimary: 'screen' | 'camera' = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
+    ? 'camera'
+    : !cameraHidden && preferredPrimary === 'camera' && remoteCameraAvailable ? 'camera' : 'screen';
+  const mediaStage = callActive ? (
+    <section className={`video-stage-new unified-media-stage ${floatContainer ? 'detached' : ''}`} ref={videoStageRef}>
+      <div className={`media-surface screen-surface ${effectivePrimary === 'screen' ? 'primary' : 'inset'} ${screenStatus === 'available' ? 'available' : ''}`}>
+        <video ref={bindScreenVideo} playsInline autoPlay muted />
+        {screenStatus !== 'available' && <div className="surface-label">屏幕{screenStatus === 'paused' ? '已暂停' : '不可用'}</div>}
+      </div>
+      {!cameraHidden && !isCameraSender && <div className={`media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} ${remoteCameraAvailable ? 'available' : ''}`}>
+        <video ref={bindRemoteCameraVideo} playsInline autoPlay muted />
+        {!remoteCameraAvailable && <div className="surface-label">摄像头未开启</div>}
+      </div>}
+      {screenStatus !== 'available' && !remoteCameraAvailable && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>音频通话中</strong></div>}
+      <div className="call-controls media-controls">
+        <button disabled={screenControlPending} onClick={() => void toggleRemoteScreen()}>{screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享'}</button>
+        <button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头'}</button>
+        {!isCameraSender && remoteCameraAvailable && <button onClick={() => setCameraHidden((hidden) => !hidden)}>{cameraHidden ? '显示摄像头' : '隐藏摄像头'}</button>}
+        {!isCameraSender && remoteCameraAvailable && !cameraHidden && <button onClick={() => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen')}>交换画面</button>}
+        {window.desktopPetControl && (floatContainer ? <button onClick={closeMediaFloat}>返回控制面板</button> : <button onClick={openMediaFloat}>系统浮窗</button>)}
+        {!floatContainer && <button disabled={!remoteReady && !remoteCameraAvailable} onClick={() => void toggleFullscreen()}>全屏</button>}
+        <button className="hangup" onClick={onEndCall}>结束</button>
+      </div>
+    </section>
+  ) : null;
 
   return (
     <div className="control-app">
@@ -1240,12 +1653,8 @@ export default function App() {
             <audio ref={remoteMicAudioRef} autoPlay muted={remoteMicMuted} /><audio ref={remoteSystemAudioRef} autoPlay muted={remoteSystemMuted} />
             {callActive ? (
               <>
-                <section className="video-stage-new" ref={videoStageRef}>
-                  <video ref={remoteVideoRef} className={remoteReady ? 'ready' : ''} playsInline autoPlay />
-                  {!remoteReady && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>{screenStatus === 'paused' ? '仅音频通话' : '正在连接画面…'}</strong></div>}
-                  <div className="call-controls"><button onClick={toggleLocalMic}>{micEnabled ? '关闭麦克风' : '打开麦克风'}</button><button onClick={() => void toggleRemoteAudio('system')}>{remoteSystemMuted ? '打开对方声音' : '静音对方声音'}</button><button disabled={!remoteReady} onClick={() => void toggleFullscreen()}>全屏</button><button className="hangup" onClick={onEndCall}>结束</button></div>
-                </section>
-                <aside className="call-sidebar"><section className="card"><h2>正在和{peerName}通话</h2><p>{callState === 'in-call' ? '已连接' : '连接中…'}</p></section><section className="card"><h2>通话控制</h2><label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label><label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label><label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label></section><section className="card connection-quality"><span className="status-dot" />{rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'}</section></aside>
+                {!floatContainer && mediaStage}
+                <aside className="call-sidebar"><section className="card"><h2>正在和{peerName}通话</h2><p>{callState === 'in-call' ? '已连接' : '连接中…'}</p></section><section className="card"><h2>通话控制</h2><label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label><label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label><label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label></section>{isCameraSender && <section className="card camera-preview-card"><div className="section-title"><h2>我的摄像头</h2><button onClick={() => setCameraPreviewCollapsed((value) => !value)}>{cameraPreviewCollapsed ? '展开预览' : '收起预览'}</button></div>{!cameraPreviewCollapsed && <video ref={bindLocalCameraVideo} autoPlay muted playsInline />}{cameraDevices.length > 0 && <select aria-label="选择摄像头" value={selectedCameraId} onChange={(event) => selectCamera(event.target.value)}>{cameraDevices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `摄像头 ${index + 1}`}</option>)}</select>}<button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraDesired ? '关闭并释放摄像头' : '打开摄像头'}</button><small>收起预览不会停止发送；关闭会真正释放硬件。</small></section>}<section className="card connection-quality"><span className="status-dot" />{rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'}</section></aside>
               </>
             ) : (
               <section className="card call-idle">
@@ -1275,6 +1684,7 @@ export default function App() {
           </main>
         )}
       </div>
+      {floatContainer && mediaStage && createPortal(mediaStage, floatContainer)}
       <div className={`toast-new ${toast ? 'show' : ''} ${toast?.err ? 'error' : ''}`}>{toast?.msg}</div>
     </div>
   );

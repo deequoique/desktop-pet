@@ -38,12 +38,13 @@ export type WebRtcSignal = {
   description?: RTCSessionDescriptionInit | null;
   candidate?: RTCIceCandidateInit | null;
 };
+export type MediaControl = { callId: string; media: 'screen' | 'camera'; enabled: boolean };
 export type RtcConfig = { iceServers: RTCIceServer[]; iceTransportPolicy: RTCIceTransportPolicy; expiresAt?: number };
 export type MediaStatus = {
   callId: string;
-  media: 'screen' | 'microphone' | 'system-audio';
+  media: 'screen' | 'camera' | 'microphone' | 'system-audio';
   state: 'available' | 'paused' | 'unavailable';
-  reason?: 'relay_audio_only' | 'capture_failed' | 'track_ended';
+  reason?: 'relay_audio_only' | 'controller_disabled' | 'capture_failed' | 'permission_denied' | 'device_lost' | 'track_ended';
 };
 
 export type Listeners = {
@@ -51,10 +52,12 @@ export type Listeners = {
   onPeers?: (p: Peers) => void;
   onError?: (msg: string) => void;
   onSignal?: (signal: WebRtcSignal) => void;
+  onCameraSignal?: (signal: WebRtcSignal) => void;
+  onMediaControl?: (control: MediaControl) => void;
   onHangup?: () => void;
   onRtcError?: (msg: string) => void;
   onMediaStatus?: (status: MediaStatus) => void;
-  onCallStart?: (callId: string, peerDeviceId?: string) => void;
+  onCallStart?: (callId: string, peerDeviceId?: string, cameraSenderDeviceId?: string) => void;
   onCallEnd?: (callId?: string, reason?: string) => void;
   onTtsStatus?: (status: TtsStatus) => void;
 };
@@ -114,13 +117,15 @@ export function connect(serverUrl: string, secret: string, identity: ConnectionI
     listeners.onStatus?.('rejected');
   });
   s.on('webrtc:signal', (signal: WebRtcSignal) => listeners.onSignal?.(signal));
+  s.on('webrtc:camera-signal', (signal: WebRtcSignal) => listeners.onCameraSignal?.(signal));
+  s.on('webrtc:media-control', (control: MediaControl) => listeners.onMediaControl?.(control));
   s.on('webrtc:hangup', () => listeners.onHangup?.());
   s.on('webrtc:error', (payload: { message?: string }) => {
     listeners.onRtcError?.(payload?.message || '通话出错');
   });
   s.on('webrtc:media-status', (payload: MediaStatus) => listeners.onMediaStatus?.(payload));
-  s.on('call:start', (payload: { callId?: string; peerDeviceId?: string }) => {
-    if (payload?.callId) listeners.onCallStart?.(payload.callId, payload.peerDeviceId);
+  s.on('call:start', (payload: { callId?: string; peerDeviceId?: string; cameraSenderDeviceId?: string }) => {
+    if (payload?.callId) listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraSenderDeviceId);
   });
   s.on('call:end', (payload: { callId?: string; reason?: string }) => {
     listeners.onCallEnd?.(payload?.callId, payload?.reason);
@@ -192,6 +197,28 @@ export function sendSignal(signal: WebRtcSignal, targetDeviceId?: string): boole
   if (!socket || !socket.connected) return false;
   socket.emit('webrtc:signal', { ...signal, targetDeviceId });
   return true;
+}
+
+export function sendCameraSignal(signal: WebRtcSignal): boolean {
+  if (!socket || !socket.connected) return false;
+  socket.emit('webrtc:camera-signal', signal);
+  return true;
+}
+
+export function sendMediaStatus(status: MediaStatus): boolean {
+  if (!socket || !socket.connected) return false;
+  socket.emit('webrtc:media-status', status);
+  return true;
+}
+
+export function requestMediaControl(control: MediaControl): Promise<ActionResult> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
+    socket.timeout(4000).emit('webrtc:media-control', control, (err: Error | null, response: ActionResult) => {
+      if (err) resolve({ ok: false, code: 'timeout' });
+      else resolve(response || { ok: false });
+    });
+  });
 }
 
 export function requestRtcConfig(): Promise<RtcConfig> {

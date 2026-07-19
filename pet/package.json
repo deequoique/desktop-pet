@@ -56,6 +56,11 @@
       "icon": "build/icon.icns",
       "category": "public.app-category.entertainment",
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+      "extendInfo": {
+        "NSCameraUsageDescription": "用于在通话中预览并向对方发送你的摄像头画面。",
+        "NSMicrophoneUsageDescription": "用于在通话中向对方发送你的语音。",
+        "NSCameraUseContinuityCameraDeviceType": true
+      },
       "target": [
         {
           "target": "dmg",

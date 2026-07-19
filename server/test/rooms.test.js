@@ -36,6 +36,10 @@ function join({ secret = 'alpha', role, memberId, deviceId, deviceName = deviceI
   return connect({ protocolVersion: 2, secret, role, memberId, deviceId, deviceName });
 }
 
+function emitAck(socket, event, payload) {
+  return new Promise((resolve) => socket.emit(event, payload, resolve));
+}
+
 server = spawn(process.execPath, ['src/index.js'], {
   cwd: new URL('..', import.meta.url),
   env: { ...process.env, PORT: String(port), ROOM_SECRETS: 'alpha,beta', ROOM_GRACE_MS: '40', PET_DATA_DIR: dataDir },
@@ -75,6 +79,79 @@ try {
   const command = once(bPet2.socket, 'pet:command');
   aController.socket.emit('pet:command', { targetDeviceId: 'b-tablet', type: 'animation', name: 'wave' });
   assert.equal((await command).name, 'wave');
+
+  const aCallStart = once(aController.socket, 'call:start');
+  const bCallStart = once(bController1.socket, 'call:start');
+  const started = await emitAck(aController.socket, 'call:start', { targetDeviceId: 'b-pc' });
+  assert.equal(started.ok, true);
+  const [aCall, bCall] = await Promise.all([aCallStart, bCallStart]);
+  assert.equal(aCall.callId, started.callId);
+  assert.equal(aCall.peerDeviceId, 'b-pc');
+  assert.equal(aCall.cameraSenderDeviceId, 'b-pc');
+  assert.equal(bCall.peerDeviceId, 'a-laptop');
+  assert.equal(bCall.cameraSenderDeviceId, 'b-pc');
+
+  const screenControl = once(bPet1.socket, 'webrtc:media-control');
+  let leakedScreenControl = false;
+  const onLeakedScreenControl = () => { leakedScreenControl = true; };
+  bPet2.socket.on('webrtc:media-control', onLeakedScreenControl);
+  assert.deepEqual(await emitAck(aController.socket, 'webrtc:media-control', {
+    callId: started.callId, media: 'screen', enabled: false,
+  }), { ok: true });
+  assert.deepEqual(await screenControl, { callId: started.callId, media: 'screen', enabled: false });
+  await wait(20);
+  bPet2.socket.off('webrtc:media-control', onLeakedScreenControl);
+  assert.equal(leakedScreenControl, false);
+
+  const cameraControl = once(bController1.socket, 'webrtc:media-control');
+  assert.deepEqual(await emitAck(aController.socket, 'webrtc:media-control', {
+    callId: started.callId, media: 'camera', enabled: true,
+  }), { ok: true });
+  assert.deepEqual(await cameraControl, { callId: started.callId, media: 'camera', enabled: true });
+  assert.equal((await emitAck(bController1.socket, 'webrtc:media-control', {
+    callId: started.callId, media: 'camera', enabled: false,
+  })).code, 'not_allowed');
+  assert.equal((await emitAck(aController.socket, 'webrtc:media-control', {
+    callId: 'stale-call', media: 'screen', enabled: true,
+  })).code, 'not_in_call');
+  assert.equal((await emitAck(bPet1.socket, 'webrtc:media-control', {
+    callId: started.callId, media: 'screen', enabled: true,
+  })).code, 'not_in_call');
+
+  const cameraSignal = once(bController1.socket, 'webrtc:camera-signal');
+  aController.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, description: { type: 'offer', sdp: 'camera-offer' },
+  });
+  assert.equal((await cameraSignal).description.sdp, 'camera-offer');
+
+  const cameraStatus = once(aController.socket, 'webrtc:media-status');
+  bController1.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'unavailable', reason: 'controller_disabled',
+  });
+  assert.deepEqual(await cameraStatus, {
+    callId: started.callId, media: 'camera', state: 'unavailable', reason: 'controller_disabled',
+  });
+
+  const screenStatus = once(aController.socket, 'webrtc:media-status');
+  bPet1.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'screen', state: 'paused', reason: 'controller_disabled',
+  });
+  assert.deepEqual(await screenStatus, {
+    callId: started.callId, media: 'screen', state: 'paused', reason: 'controller_disabled',
+  });
+
+  let unrelatedStatusReceived = false;
+  const onUnrelatedStatus = () => { unrelatedStatusReceived = true; };
+  aController.socket.on('webrtc:media-status', onUnrelatedStatus);
+  bPet2.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'screen', state: 'available',
+  });
+  await wait(20);
+  aController.socket.off('webrtc:media-status', onUnrelatedStatus);
+  assert.equal(unrelatedStatusReceived, false);
+
+  aController.socket.emit('call:end', { callId: started.callId });
+  await wait(20);
 
   const audio = Buffer.from('test-audio');
   const added = await new Promise((resolve) => aController.socket.emit('audio:add', {

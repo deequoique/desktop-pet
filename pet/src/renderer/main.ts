@@ -1276,6 +1276,8 @@ let rtcScreenStream: MediaStream | null = null;
 let rtcMicStream: MediaStream | null = null;
 let rtcRemoteAudioStream: MediaStream | null = null;
 const rtcPendingCandidates: RTCIceCandidateInit[] = [];
+let screenRequestedByController = true;
+let screenRouteIsP2P = false;
 const rtcAudioEl = new Audio();
 rtcAudioEl.autoplay = true;
 rtcAudioEl.volume = 1;
@@ -1364,10 +1366,26 @@ function requestRtcConfig(): Promise<RTCConfiguration> {
 function emitMediaStatus(
   media: 'screen' | 'microphone' | 'system-audio',
   state: 'available' | 'paused' | 'unavailable',
-  reason?: 'relay_audio_only' | 'capture_failed' | 'track_ended',
+  reason?: 'relay_audio_only' | 'controller_disabled' | 'capture_failed' | 'track_ended',
 ) {
   if (!activeCallId) return;
   remoteSocket?.emit('webrtc:media-status', { callId: activeCallId, media, state, ...(reason ? { reason } : {}) });
+}
+
+function applyRequestedScreenState() {
+  const screenTrack = rtcScreenStream?.getVideoTracks()[0];
+  if (!screenTrack || screenTrack.readyState !== 'live') {
+    emitMediaStatus('screen', 'unavailable', 'capture_failed');
+    return;
+  }
+  screenTrack.enabled = screenRequestedByController && screenRouteIsP2P;
+  if (!screenRequestedByController) {
+    emitMediaStatus('screen', 'paused', 'controller_disabled');
+  } else if (!screenRouteIsP2P) {
+    emitMediaStatus('screen', 'paused', 'relay_audio_only');
+  } else {
+    emitMediaStatus('screen', 'available');
+  }
 }
 
 async function selectedPairUsesRelay(pc: RTCPeerConnection): Promise<boolean> {
@@ -1457,6 +1475,8 @@ function cleanupRtc(sendHangup = false) {
   rtcMicStream = null;
   rtcRemoteAudioStream = null;
   rtcAudioEl.srcObject = null;
+  screenRequestedByController = true;
+  screenRouteIsP2P = false;
   activeCallId = '';
 }
 
@@ -1628,12 +1648,14 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     if (state === 'connected') {
       noteRemote('call on');
       selectedPairUsesRelay(pc).then((relayed) => {
-        const screenTrack = rtcScreenStream?.getVideoTracks()[0];
-        if (screenTrack) screenTrack.enabled = !relayed;
-        emitMediaStatus('screen', relayed ? 'paused' : screenTrack ? 'available' : 'unavailable', relayed ? 'relay_audio_only' : undefined);
+        screenRouteIsP2P = !relayed;
+        applyRequestedScreenState();
       }).catch((error) => console.warn('[webrtc] route inspection failed:', error));
     }
     if (state === 'failed' || state === 'disconnected') {
+      screenRouteIsP2P = false;
+      const screenTrack = rtcScreenStream?.getVideoTracks()[0];
+      if (screenTrack) screenTrack.enabled = false;
       showReply('网络波动，等待通话恢复…', 2500);
     }
     if (state === 'closed') {
@@ -1757,6 +1779,12 @@ function connectRemote() {
     handleRtcSignal(signal).catch((e) => {
       reportRtcError(`信令失败：${e?.message || e}`);
     });
+  });
+  remoteSocket.on('webrtc:media-control', (control: { callId?: string; media?: string; enabled?: boolean }) => {
+    if (!activeCallId || control?.callId !== activeCallId || control.media !== 'screen' || typeof control.enabled !== 'boolean') return;
+    screenRequestedByController = control.enabled;
+    applyRequestedScreenState();
+    showReply(control.enabled ? '控制端恢复了屏幕共享' : '控制端暂停了屏幕共享', 2200);
   });
   remoteSocket.on('webrtc:hangup', () => {
     cleanupRtc(false);

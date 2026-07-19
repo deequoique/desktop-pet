@@ -43,6 +43,8 @@ export function connect(serverUrl, secret, identity) {
         listeners.onStatus?.('rejected');
     });
     s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));
+    s.on('webrtc:camera-signal', (signal) => listeners.onCameraSignal?.(signal));
+    s.on('webrtc:media-control', (control) => listeners.onMediaControl?.(control));
     s.on('webrtc:hangup', () => listeners.onHangup?.());
     s.on('webrtc:error', (payload) => {
         listeners.onRtcError?.(payload?.message || '通话出错');
@@ -50,7 +52,7 @@ export function connect(serverUrl, secret, identity) {
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('call:start', (payload) => {
         if (payload?.callId)
-            listeners.onCallStart?.(payload.callId, payload.peerDeviceId);
+            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraSenderDeviceId);
     });
     s.on('call:end', (payload) => {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);
@@ -126,6 +128,30 @@ export function sendSignal(signal, targetDeviceId) {
         return false;
     socket.emit('webrtc:signal', { ...signal, targetDeviceId });
     return true;
+}
+export function sendCameraSignal(signal) {
+    if (!socket || !socket.connected)
+        return false;
+    socket.emit('webrtc:camera-signal', signal);
+    return true;
+}
+export function sendMediaStatus(status) {
+    if (!socket || !socket.connected)
+        return false;
+    socket.emit('webrtc:media-status', status);
+    return true;
+}
+export function requestMediaControl(control) {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(4000).emit('webrtc:media-control', control, (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout' });
+            else
+                resolve(response || { ok: false });
+        });
+    });
 }
 export function requestRtcConfig() {
     return new Promise((resolve) => {

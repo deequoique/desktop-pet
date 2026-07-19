@@ -15,4 +15,9 @@ contextBridge.exposeInMainWorld('desktopPetControl', {
     return () => ipcRenderer.removeListener('pet:scale-changed', handler);
   },
   exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
+  onMediaFloatClosed: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('media-float:closed', handler);
+    return () => ipcRenderer.removeListener('media-float:closed', handler);
+  },
 });
