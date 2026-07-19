@@ -315,3 +315,35 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: Diagnose Suzhou pairing timeout
+
+**Date**: 2026-07-19
+**Task**: Diagnose Suzhou pairing timeout
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+Confirmed TCP, HTTP, WebSocket, and Socket.IO connectivity; isolated the timeout to a production server/client version mismatch where v1.4.1 pairing:discover was missing while existing Daqing devices bypassed onboarding via pet:join. No business code changes.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
