@@ -347,3 +347,37 @@ Confirmed TCP, HTTP, WebSocket, and Socket.IO connectivity; isolated the timeout
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Camera and floating media window
+
+**Date**: 2026-07-19
+**Task**: Camera and floating media window
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+Implemented one-way camera with two-party controls and local preview, controller-exclusive screen sharing controls, unified media layout, resizable always-on-top Electron float, scoped media permissions, TURN audio-only enforcement, tests, builds, and macOS package validation.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2bc0f7d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
