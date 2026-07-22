@@ -14,14 +14,16 @@
 .unified-media-stage{isolation:isolate;min-height:calc(100vh - 172px)}
 .unified-media-stage.detached,.media-float-root .unified-media-stage{width:100vw;height:100vh;min-height:180px;border-radius:0}
 .unified-media-stage .media-surface{position:absolute;background:#17141c;overflow:hidden;transition:inset .2s ease,width .2s ease,height .2s ease,border-radius .2s ease;z-index:1}
-.unified-media-stage .media-surface.primary{inset:18px 18px 82px;border-radius:18px}
-.unified-media-stage .media-surface.inset{inset:auto 34px 102px auto;width:min(30%,320px);height:min(30%,190px);min-width:160px;min-height:90px;border:2px solid rgba(255,255,255,.78);border-radius:15px;z-index:3;box-shadow:0 12px 30px rgba(0,0,0,.35)}
+.unified-media-stage .media-surface.primary{inset:14px 14px 64px;border-radius:16px}
+.unified-media-stage .media-surface.inset{inset:auto 28px 78px auto;width:min(30%,320px);height:min(30%,190px);min-width:160px;min-height:90px;border:2px solid rgba(255,255,255,.78);border-radius:15px;z-index:3;box-shadow:0 12px 30px rgba(0,0,0,.35)}
 .unified-media-stage .media-surface video{position:absolute;inset:0;width:100%;height:100%;border-radius:inherit;object-fit:contain;background:#17141c;opacity:0}
 .unified-media-stage .media-surface.available video{opacity:1}
 .unified-media-stage .surface-label{position:absolute;inset:0;display:grid;place-items:center;color:#ddd5e5;font-size:13px;background:linear-gradient(140deg,#332d3c,#211d27)}
-.unified-media-stage .call-placeholder{inset:18px 18px 82px;z-index:2}
-.unified-media-stage .media-controls{z-index:5;overflow-x:auto;justify-content:flex-start;padding:0 18px}
-.media-float-root .media-controls button{padding:9px 11px;font-size:12px;white-space:nowrap}
+.unified-media-stage .call-placeholder{inset:14px 14px 64px;z-index:2}
+.unified-media-stage .media-controls{bottom:12px;z-index:5;overflow-x:auto;justify-content:flex-start;gap:6px;padding:0 14px}
+.unified-media-stage .media-controls button{height:32px;border-radius:10px;padding:0 11px;font-size:12px;line-height:1;white-space:nowrap}
+.media-float-root .unified-media-stage .media-surface.primary{inset:0;border-radius:0}
+.media-float-root .unified-media-stage .media-surface.inset{right:12px;bottom:12px;width:30%;height:30%;min-width:96px;min-height:54px;border-radius:10px}
 .camera-preview-card video{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;border-radius:12px;background:#17141c;margin:10px 0}
 .camera-preview-card select,.camera-preview-card>button{width:100%;margin-top:9px}
 .camera-preview-card small{display:block;color:var(--muted);margin-top:10px;line-height:1.4}

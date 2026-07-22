@@ -91,7 +91,8 @@ Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera s
 - `screen` control 从任一 call controller 路由到另一 call device 的 pet；`camera` control 只允许 initiator controller 路由到 target controller。
 - sender 本地 camera UI 调用相同本地状态转换，不通过 server 请求自身授权。
 - pet 保存 `screenRequestedByController`，实际 enabled 必须为 `screenRequestedByController && routeIsConfirmedP2P`。
-- Electron 浮窗只允许 `about:blank` + frame name `media-float`，可调整大小、置顶、持久化并 clamp bounds；原生关闭只返回控制面板，不结束 call。
+- Electron 浮窗只允许 `about:blank` + frame name `media-float`，可自由调整宽高、置顶、持久化并 clamp bounds；不得调用 `setAspectRatio` 锁定比例，原生关闭只返回控制面板，不结束 call。
+- 系统浮窗是纯媒体画布：portal/detached 状态不得挂载 `.media-controls`、surface label、状态或占位内容；屏幕/摄像头主画面铺满 client area，视频统一 `object-fit: contain` 以完整显示且不裁切。所有操作只留在嵌入式控制面板，并使用一致的紧凑按钮尺寸。
 - 摄像头/麦克风权限只允许 pet/control app webContents；macOS 包必须声明 camera、microphone 与 Continuity Camera usage。
 
 ### 4. Validation & Error Matrix
@@ -108,16 +109,17 @@ Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera s
 
 ### 5. Good/Base/Bad Cases
 
-- Good：viewer 开 camera，sender 只采集一次并显示本地预览，P2P 确认后同一 track 发送；任一方关闭后硬件灯熄灭。
+- Good：viewer 开 camera，sender 只采集一次并显示本地预览，P2P 确认后同一 track 发送；任一方关闭后硬件灯熄灭。系统浮窗只显示媒体，可自由改变宽高，并以 `contain` 完整显示画面。
 - Base：camera off、screen on；关闭浮窗后媒体视图回嵌入页，call 和 tracks 不重建。
-- Bad：pet 暴露屏幕停止按钮；客户端传 socket ID；camera 合并进稳定的 screen/audio PC；relay route 未确认就 attach video；只隐藏 preview DOM 却不释放 camera。
+- Bad：pet 暴露屏幕停止按钮；客户端传 socket ID；camera 合并进稳定的 screen/audio PC；relay route 未确认就 attach video；只隐藏 preview DOM 却不释放 camera；浮窗内继续渲染按钮/状态、使用 `cover` 裁切内容或锁定固定宽高比。
 
 ### 6. Tests Required
 
 - Server integration：断言 screen control 只到配对 pet，camera control/signal 只到指定 sender controller，camera status 只到 viewer；wrong role、stale call、非 call device 无泄漏。
 - Pet/Web build：TypeScript 通过，生成 `web/src/*.js` 与 TS 同步；teardown 停止 tracks、关闭两个 PC、清 candidate 与 DOM `srcObject`。
-- Electron test/package：断言 window allowlist、topmost/resizable/bounds persistence、preload listener cleanup；检查成品 Info.plist 三个 camera/microphone key。
-- 双机手工：双方 camera 开关、设备切换/热拔插、屏幕远停/恢复、TURN audio-only、浮窗移动/缩放/关闭/显示器变化。
+- Electron test/package：断言 window allowlist、topmost/resizable/bounds persistence、无 aspect-ratio lock、preload listener cleanup；检查成品 Info.plist 三个 camera/microphone key。
+- Renderer source regression：断言 float portal 不挂载 controls/label/placeholder，主 surface 填满 client area，视频为 `object-fit: contain`，嵌入式按钮采用统一紧凑尺寸。
+- 双机手工：双方 camera 开关、设备切换/热拔插、屏幕远停/恢复、TURN audio-only、浮窗移动/任意宽高缩放/完整无裁切显示/关闭/显示器变化。
 
 ### 7. Wrong vs Correct
 
@@ -126,6 +128,8 @@ Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera s
 ```ts
 cameraVideo.hidden = true; // hardware and RTP keep running
 screenTrack.enabled = true; // selected route is still unknown/relay
+mediaFloatWin.setAspectRatio(16 / 9);
+video.style.objectFit = 'cover'; // crops shared content
 ```
 
 #### Correct
@@ -134,4 +138,7 @@ screenTrack.enabled = true; // selected route is still unknown/relay
 await cameraSender.replaceTrack(null);
 cameraTrack.stop();
 screenTrack.enabled = screenRequestedByController && routeIsConfirmedP2P;
+const controls = !floatContainer && <div className="media-controls">...</div>;
+// .media-float-root .media-surface.primary { inset: 0 }
+// video { object-fit: contain }
 ```

@@ -1152,10 +1152,6 @@ export default function App() {
     setFloatContainer(root);
   }, [showToast]);
 
-  const closeMediaFloat = useCallback(() => {
-    mediaFloatWindowRef.current?.close();
-  }, []);
-
   useEffect(() => {
     if (callState !== 'calling' && callState !== 'in-call') return;
     const timer = window.setInterval(() => {
@@ -1523,22 +1519,22 @@ export default function App() {
     <section className={`video-stage-new unified-media-stage ${floatContainer ? 'detached' : ''}`} ref={videoStageRef}>
       <div className={`media-surface screen-surface ${effectivePrimary === 'screen' ? 'primary' : 'inset'} ${screenStatus === 'available' ? 'available' : ''}`}>
         <video ref={bindScreenVideo} playsInline autoPlay muted />
-        {screenStatus !== 'available' && <div className="surface-label">屏幕{screenStatus === 'paused' ? '已暂停' : '不可用'}</div>}
+        {!floatContainer && screenStatus !== 'available' && <div className="surface-label">屏幕{screenStatus === 'paused' ? '已暂停' : '不可用'}</div>}
       </div>
       {!cameraHidden && !isCameraSender && <div className={`media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} ${remoteCameraAvailable ? 'available' : ''}`}>
         <video ref={bindRemoteCameraVideo} playsInline autoPlay muted />
-        {!remoteCameraAvailable && <div className="surface-label">摄像头未开启</div>}
+        {!floatContainer && !remoteCameraAvailable && <div className="surface-label">摄像头未开启</div>}
       </div>}
-      {screenStatus !== 'available' && !remoteCameraAvailable && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>音频通话中</strong></div>}
-      <div className="call-controls media-controls">
+      {!floatContainer && screenStatus !== 'available' && !remoteCameraAvailable && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>音频通话中</strong></div>}
+      {!floatContainer && <div className="call-controls media-controls">
         <button disabled={screenControlPending} onClick={() => void toggleRemoteScreen()}>{screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享'}</button>
         <button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头'}</button>
         {!isCameraSender && remoteCameraAvailable && <button onClick={() => setCameraHidden((hidden) => !hidden)}>{cameraHidden ? '显示摄像头' : '隐藏摄像头'}</button>}
         {!isCameraSender && remoteCameraAvailable && !cameraHidden && <button onClick={() => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen')}>交换画面</button>}
-        {window.desktopPetControl && (floatContainer ? <button onClick={closeMediaFloat}>返回控制面板</button> : <button onClick={openMediaFloat}>系统浮窗</button>)}
-        {!floatContainer && <button disabled={!remoteReady && !remoteCameraAvailable} onClick={() => void toggleFullscreen()}>全屏</button>}
+        {window.desktopPetControl && <button onClick={openMediaFloat}>系统浮窗</button>}
+        <button disabled={!remoteReady && !remoteCameraAvailable} onClick={() => void toggleFullscreen()}>全屏</button>
         <button className="hangup" onClick={onEndCall}>结束</button>
-      </div>
+      </div>}
     </section>
   ) : null;
 
