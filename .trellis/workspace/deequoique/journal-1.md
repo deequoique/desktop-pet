@@ -381,3 +381,37 @@ Implemented one-way camera with two-party controls and local preview, controller
 ### Next Steps
 
 - None - task complete
+
+
+## Session 12: Simplify floating media UI
+
+**Date**: 2026-07-22
+**Task**: Simplify floating media UI
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+Made the system media float a freely resizable, pure screen/camera canvas with contain/no-crop rendering; compacted embedded call controls; added regression coverage and validated with builds, pet tests, and two local Electron instances.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bbc3c94` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
