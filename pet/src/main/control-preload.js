@@ -15,9 +15,15 @@ contextBridge.exposeInMainWorld('desktopPetControl', {
     return () => ipcRenderer.removeListener('pet:scale-changed', handler);
   },
   exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
+  openExternal: (url) => ipcRenderer.invoke('note:open-external', url),
   onMediaFloatClosed: (cb) => {
     const handler = () => cb();
     ipcRenderer.on('media-float:closed', handler);
     return () => ipcRenderer.removeListener('media-float:closed', handler);
+  },
+  onOpenNoteComposer: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('note:open-composer', handler);
+    return () => ipcRenderer.removeListener('note:open-composer', handler);
   },
 });

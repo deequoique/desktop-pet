@@ -20,7 +20,7 @@
 
 - `rooms`：从 room hash 映射到在线 device runtime 和当前设备对 call。
 - `socket.data`：已加入的 endpoint role、固定 memberId、稳定 deviceId、房间，以及临时 BYOK 凭据和声音列表。
-- `PersistentStore`：持久化 A/B 成员显示名、设备历史和成员私有音频 metadata/file；通过 `PET_DATA_DIR` 指定目录。
+- `PersistentStore`：持久化 A/B 成员显示名、设备历史、成员私有音频，以及成员级异步便签/附件/批阅/收藏；通过 `PET_DATA_DIR` 指定目录。
 - `ttsJobs`：一次性 job 记录。
 - `ttsQueues`：按目标 pet 建立的 FIFO queue，包括 active 项。
 - `ttsRateWindows`：请求方的限流时间戳窗口。

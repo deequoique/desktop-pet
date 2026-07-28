@@ -39,6 +39,8 @@ cursor、drag 等高频事件式操作使用 `send`；pairing config、scale、�
 
 Electron 负责持久化 pairing 和加密 BYOK 凭据。独立 web 入口已废弃，不是发布或验收目标；现有浏览器 fallback 仅可作为开发调试兼容层，不应为其新增产品功能或阻塞 Electron 交付。
 
+桌面便签一类需要多个置顶窗口的功能仍由唯一 pet renderer Socket 持有数据。子窗口只能使用 main 进程精确 allowlist 的 `about:blank + frameName` 创建，不能建立自己的 Socket；移动、缩放、外链和游戏模式等 OS 行为经 preload 交给 main。parent renderer reload、退出或被替换时必须关闭子窗口并释放 Blob URL。
+
 ## Electron 自动更新渠道
 
 产品允许正式版安装发现 GitHub prerelease。`electron-updater` 的 `allowPrerelease` 默认值取决于当前安装版本：正式版默认是 `false`，因此不得依赖该默认值。初始化打包应用的 updater 时必须显式设置：

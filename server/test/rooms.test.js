@@ -170,6 +170,52 @@ try {
   assert.equal(played.ok, true);
   assert.deepEqual(Buffer.from((await playback).data), audio);
 
+  const noteAtPet1 = once(bPet1.socket, 'note:changed');
+  const noteAtPet2 = once(bPet2.socket, 'note:changed');
+  const createdNote = await emitAck(aController.socket, 'note:create', {
+    body: '稍后看看这个',
+    paperColor: 'yellow',
+    media: { kind: 'video', url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
+  });
+  assert.equal(createdNote.ok, true);
+  assert.equal((await noteAtPet1).note.id, createdNote.note.id);
+  assert.equal((await noteAtPet2).note.id, createdNote.note.id);
+  const inbox = await emitAck(bPet1.socket, 'note:list', { view: 'inbox' });
+  assert.equal(inbox.items.length, 1);
+  assert.equal(inbox.items[0].media.source, 'youtube.com');
+  assert.equal((await emitAck(bPet1.socket, 'note:create', { body: 'bad', paperColor: 'yellow' })).code, 'wrong_role');
+
+  const noticedAtOtherDevice = once(bPet2.socket, 'note:changed');
+  let noticedLeakedToSender = false;
+  const onSenderNotice = (payload) => { if (payload.reason === 'noticed') noticedLeakedToSender = true; };
+  aController.socket.on('note:changed', onSenderNotice);
+  assert.equal((await emitAck(bPet1.socket, 'note:mark-noticed', { noteId: createdNote.note.id })).ok, true);
+  assert.equal((await noticedAtOtherDevice).reason, 'noticed');
+  await wait(20);
+  aController.socket.off('note:changed', onSenderNotice);
+  assert.equal(noticedLeakedToSender, false);
+  const senderSnapshot = await emitAck(aController.socket, 'note:list', { view: 'sent' });
+  assert.equal('noticedAt' in senderSnapshot.items[0], false);
+
+  let favoriteLeakedToRecipient = false;
+  const onRecipientFavorite = (payload) => { if (payload.reason === 'favorite') favoriteLeakedToRecipient = true; };
+  bPet1.socket.on('note:changed', onRecipientFavorite);
+  assert.equal((await emitAck(aController.socket, 'note:set-favorite', {
+    noteId: createdNote.note.id, favorite: true,
+  })).ok, true);
+  await wait(20);
+  bPet1.socket.off('note:changed', onRecipientFavorite);
+  assert.equal(favoriteLeakedToRecipient, false);
+  const reviewedAtSender = once(aController.socket, 'note:changed');
+  assert.equal((await emitAck(bPet2.socket, 'note:review', {
+    noteId: createdNote.note.id, reply: { body: '收到 👍' },
+  })).ok, true);
+  const reviewedEvent = await reviewedAtSender;
+  assert.equal(reviewedEvent.reason, 'reviewed');
+  assert.equal(reviewedEvent.note.review.body, '收到 👍');
+  assert.equal((await emitAck(bPet1.socket, 'note:review', { noteId: createdNote.note.id })).code, 'note_already_reviewed');
+  assert.equal((await emitAck(aController.socket, 'note:list', { view: 'favorites' })).items.length, 1);
+
   bController1.socket.disconnect();
   await wait(30);
   const offlineState = await new Promise((resolve) => {

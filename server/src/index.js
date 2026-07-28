@@ -99,7 +99,24 @@ const ROOM_SECRET_HASHES = new Set(
     .split(',').map((value) => value.trim()).filter(Boolean).map(hashSecret)
 );
 const ROOM_GRACE_MS = Math.max(0, Number(process.env.ROOM_GRACE_MS || 30_000));
-const store = new PersistentStore(process.env.PET_DATA_DIR || new URL('../data', import.meta.url).pathname);
+function boundedIntEnv(name, fallback, max) {
+  const value = Number(process.env[name]);
+  return Number.isSafeInteger(value) && value >= 0 && value <= max ? value : fallback;
+}
+const NOTE_LIMITS = {
+  imageMaxBytes: boundedIntEnv('NOTE_IMAGE_MAX_BYTES', 2 * 1024 * 1024, 32 * 1024 * 1024),
+  pendingMax: boundedIntEnv('NOTE_PENDING_MAX', 500, 10_000),
+  pendingImageMaxBytes: boundedIntEnv('NOTE_PENDING_IMAGE_MAX_BYTES', 500 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
+  favoriteMax: boundedIntEnv('NOTE_FAVORITE_MAX', 500, 10_000),
+  favoriteImageMaxBytes: boundedIntEnv('NOTE_FAVORITE_IMAGE_MAX_BYTES', 500 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
+  roomImageMaxBytes: boundedIntEnv('NOTE_ROOM_IMAGE_MAX_BYTES', 2 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024),
+  historyTtlMs: boundedIntEnv('NOTE_HISTORY_TTL_DAYS', 30, 3650) * 24 * 60 * 60 * 1000,
+};
+const store = new PersistentStore(
+  process.env.PET_DATA_DIR || new URL('../data', import.meta.url).pathname,
+  () => Date.now(),
+  NOTE_LIMITS,
+);
 
 const app = express();
 app.use(cors());
@@ -197,6 +214,76 @@ function emitToRoomEndpoints(room, event, payload) {
       if (socketId) io.to(socketId).emit(event, payload);
     }
   }
+}
+
+function emitToMemberEndpoints(room, memberId, event, payload) {
+  for (const participant of room.participants.values()) {
+    if (participant.memberId !== memberId) continue;
+    for (const socketId of [participant.pet, participant.controller]) {
+      if (socketId) io.to(socketId).emit(event, payload);
+    }
+  }
+}
+
+function emitNoteChanged(room, note, reason) {
+  for (const memberId of ['a', 'b']) {
+    const snapshot = store.noteSnapshot(note, memberId);
+    if (snapshot) emitToMemberEndpoints(room, memberId, 'note:changed', { reason, note: snapshot });
+  }
+}
+
+function graphemeLength(value) {
+  const text = String(value || '');
+  if (typeof Intl.Segmenter === 'function') return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)].length;
+  return [...text].length;
+}
+
+function normalizeNoteLink(media) {
+  if (!['song', 'video'].includes(media?.kind)) return null;
+  try {
+    const url = new URL(String(media.url || ''));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.href.length > 2048) return null;
+    const host = url.hostname.replace(/^www\./, '');
+    const normalized = { kind: media.kind, url: url.href, source: host };
+    if (['youtube.com', 'youtu.be'].includes(host)) {
+      const videoId = host === 'youtu.be' ? url.pathname.split('/')[1] : url.searchParams.get('v');
+      if (videoId && /^[\w-]{6,20}$/.test(videoId)) normalized.thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeNoteCreate(payload) {
+  const body = String(payload?.body || '').trim();
+  const paperColor = String(payload?.paperColor || 'yellow');
+  if (graphemeLength(body) > 1000 || !['yellow', 'pink', 'blue', 'sage', 'lavender'].includes(paperColor)) return null;
+  let media = null;
+  if (payload?.media?.kind === 'image') {
+    const mime = String(payload.media.mime || '').toLowerCase().split(';', 1)[0].trim();
+    const data = Buffer.isBuffer(payload.media.data) ? payload.media.data : Buffer.from(payload.media.data || []);
+    media = { kind: 'image', image: { mime, data } };
+  } else if (payload?.media) {
+    media = normalizeNoteLink(payload.media);
+    if (!media) return null;
+  }
+  if (!body && !media) return null;
+  return { body, paperColor, media };
+}
+
+function normalizeNoteReply(reply) {
+  if (reply == null) return { ok: true, reply: null };
+  const body = String(reply.body || '').trim();
+  if (graphemeLength(body) > 500) return { ok: false };
+  let image;
+  if (reply.image) {
+    const mime = String(reply.image.mime || '').toLowerCase().split(';', 1)[0].trim();
+    const data = Buffer.isBuffer(reply.image.data) ? reply.image.data : Buffer.from(reply.image.data || []);
+    image = { mime, data };
+  }
+  if (!body && !image) return { ok: false };
+  return { ok: true, reply: { ...(body ? { body } : {}), ...(image ? { image } : {}) } };
 }
 
 function endRoomCall(room, reason = 'ended') {
@@ -715,6 +802,110 @@ io.on('connection', (socket) => {
     catch { if (typeof ack === 'function') ack({ ok: false, code: 'audio_unavailable' }); }
   });
 
+  socket.on('note:create', (payload, ack) => {
+    const room = roomForSocket(socket);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined' });
+    if (socket.data?.role !== 'controller') return typeof ack === 'function' && ack({ ok: false, code: 'wrong_role' });
+    const input = normalizeNoteCreate(payload);
+    if (!input) return typeof ack === 'function' && ack({ ok: false, code: 'invalid_note' });
+    let result;
+    try { result = store.createNote(room.hash, socket.data.memberId, input); }
+    catch (error) {
+      console.warn('[note] create failed:', error?.message || error);
+      result = { ok: false, code: 'note_storage_failed' };
+    }
+    if (!result.ok) return typeof ack === 'function' && ack(result);
+    emitNoteChanged(room, result.note, 'created');
+    if (typeof ack === 'function') ack({ ok: true, note: store.noteSnapshot(result.note, socket.data.memberId) });
+  });
+
+  socket.on('note:list', (payload, ack) => {
+    if (typeof payload === 'function') { ack = payload; payload = {}; }
+    const room = roomForSocket(socket);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined', items: [] });
+    const view = String(payload?.view || (socket.data?.role === 'pet' ? 'inbox' : 'sent'));
+    if (!['inbox', 'sent', 'history', 'favorites'].includes(view)) {
+      return typeof ack === 'function' && ack({ ok: false, code: 'invalid_note', items: [] });
+    }
+    const limit = Math.min(500, Math.max(1, Number(payload?.limit || 500)));
+    const items = store.listNotes(room.hash, socket.data.memberId, view).slice(0, limit);
+    if (typeof ack === 'function') ack({ ok: true, items });
+  });
+
+  socket.on('note:mark-noticed', (payload, ack) => {
+    const room = roomForSocket(socket);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined' });
+    try {
+      const result = store.markNoteNoticed(room.hash, socket.data.memberId, String(payload?.noteId || ''));
+      if (!result.ok) return typeof ack === 'function' && ack(result);
+      const note = store.noteSnapshot(result.note, socket.data.memberId);
+      emitToMemberEndpoints(room, socket.data.memberId, 'note:changed', { reason: 'noticed', note });
+      if (typeof ack === 'function') ack({ ok: true, note: store.noteSnapshot(result.note, socket.data.memberId) });
+    } catch (error) {
+      console.warn('[note] mark noticed failed:', error?.message || error);
+      if (typeof ack === 'function') ack({ ok: false, code: 'note_storage_failed' });
+    }
+  });
+
+  socket.on('note:review', (payload, ack) => {
+    const room = roomForSocket(socket);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined' });
+    const normalized = normalizeNoteReply(payload?.reply);
+    if (!normalized.ok) return typeof ack === 'function' && ack({ ok: false, code: 'invalid_note' });
+    try {
+      const result = store.reviewNote(room.hash, socket.data.memberId, String(payload?.noteId || ''), normalized.reply);
+      if (!result.ok) {
+        return typeof ack === 'function' && ack({
+          ok: false,
+          code: result.code,
+          ...(result.note ? { note: store.noteSnapshot(result.note, socket.data.memberId) } : {}),
+        });
+      }
+      emitNoteChanged(room, result.note, 'reviewed');
+      if (typeof ack === 'function') ack({ ok: true, note: store.noteSnapshot(result.note, socket.data.memberId) });
+    } catch (error) {
+      console.warn('[note] review failed:', error?.message || error);
+      if (typeof ack === 'function') ack({ ok: false, code: 'note_storage_failed' });
+    }
+  });
+
+  socket.on('note:set-favorite', (payload, ack) => {
+    const room = roomForSocket(socket);
+    if (!room) return typeof ack === 'function' && ack({ ok: false, code: 'not_joined' });
+    try {
+      const result = store.setNoteFavorite(
+        room.hash,
+        socket.data.memberId,
+        String(payload?.noteId || ''),
+        payload?.favorite === true,
+      );
+      if (!result.ok) return typeof ack === 'function' && ack(result);
+      const note = store.noteSnapshot(result.note, socket.data.memberId);
+      if (note) emitToMemberEndpoints(room, socket.data.memberId, 'note:changed', { reason: 'favorite', note });
+      else emitToMemberEndpoints(room, socket.data.memberId, 'note:removed', { noteId: result.note.id, reason: 'favorite_removed' });
+      if (typeof ack === 'function') ack({ ok: true, ...(note ? { note } : {}) });
+    } catch (error) {
+      console.warn('[note] favorite failed:', error?.message || error);
+      if (typeof ack === 'function') ack({ ok: false, code: 'note_storage_failed' });
+    }
+  });
+
+  socket.on('note:get-attachment', (payload, ack) => {
+    const room = roomForSocket(socket);
+    const item = room && store.noteAttachmentPath(
+      room.hash,
+      socket.data.memberId,
+      String(payload?.noteId || ''),
+      String(payload?.attachmentId || ''),
+    );
+    if (!item) return typeof ack === 'function' && ack({ ok: false, code: 'note_not_found' });
+    try {
+      if (typeof ack === 'function') ack({ ok: true, mime: item.item.mime, data: fs.readFileSync(item.file) });
+    } catch {
+      if (typeof ack === 'function') ack({ ok: false, code: 'note_storage_failed' });
+    }
+  });
+
   socket.on('audio:play', (payload, ack) => {
     const room = roomForSocket(socket);
     const target = room && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId);
@@ -1079,6 +1270,21 @@ io.on('connection', (socket) => {
     console.log(`[socket] ${role} left participant=${participant.id}`);
   });
 });
+
+setInterval(() => {
+  try {
+    const result = store.prune((roomHash, _memberId, deviceId) => participantOnline(rooms.get(roomHash)?.participants.get(deviceId)));
+    for (const removed of result.removedNotes) {
+      const room = rooms.get(removed.roomHash);
+      if (!room) continue;
+      for (const memberId of ['a', 'b']) {
+        emitToMemberEndpoints(room, memberId, 'note:removed', { noteId: removed.noteId, reason: 'expired' });
+      }
+    }
+  } catch (error) {
+    console.warn('[note] prune failed:', error?.message || error);
+  }
+}, 60 * 60 * 1000).unref();
 
 httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);

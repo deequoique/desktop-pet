@@ -23,6 +23,12 @@ declare global {
       savePairingConfig: (config: PairingConfig) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
       onPairingChanged: (cb: (config: PairingConfig) => void) => void;
       getDesktopSourceId: () => Promise<string | null>;
+      openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
+      isGameMode: () => Promise<boolean>;
+      openNoteComposer: () => void;
+      onGameModeChanged: (cb: (enabled: boolean) => void) => () => void;
+      onNoteWindowClosed: (cb: (frameName: string) => void) => () => void;
+      onNoteWindowInteracted: (cb: (frameName: string) => void) => () => void;
     };
   }
 }
@@ -54,6 +60,15 @@ const browserPetBridge: PetBridge = {
   savePairingConfig: async (config) => ({ ok: true, config }),
   onPairingChanged: () => {},
   getDesktopSourceId: async () => null,
+  openExternal: async (url) => {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return { ok: true };
+  },
+  isGameMode: async () => false,
+  openNoteComposer: () => {},
+  onGameModeChanged: () => () => {},
+  onNoteWindowClosed: () => () => {},
+  onNoteWindowInteracted: () => () => {},
 };
 
 const petBridge: PetBridge = window.pet ?? browserPetBridge;
@@ -87,6 +102,8 @@ const pairingSecret = document.getElementById('pairing-secret') as HTMLInputElem
 const pairingMember = document.getElementById('pairing-member') as HTMLSelectElement;
 const pairingDevice = document.getElementById('pairing-device') as HTMLInputElement;
 const pairingError = document.getElementById('pairing-error')!;
+const notesDock = document.getElementById('notes-dock') as HTMLButtonElement;
+const notesCount = document.getElementById('notes-count')!;
 
 type MotionFallbackPart = 'head' | 'body' | 'tail';
 
@@ -1136,6 +1153,12 @@ petBridge.onPairingChanged((config) => {
   remoteSocket?.disconnect();
   remoteSocket = null;
   remoteConnected = false;
+  noteInbox.clear();
+  releaseNoteImages();
+  for (const child of noteCardWindows.values()) if (!child.closed) child.close();
+  noteCardWindows.clear();
+  syncNotesDock();
+  renderNoteStack();
   SERVER_URL = nextServer;
   ROOM_SECRET = nextSecret;
   DEVICE_ID = nextDevice;
@@ -1257,6 +1280,445 @@ petBridge.getScale().then((scale) => {
 petBridge.onScaleChanged((scale) => {
   currentScale = clampScale(scale);
 });
+
+// === 异步桌面便签 ===
+type NoteAttachment = {
+  id: string;
+  mime: string;
+  size: number;
+  width?: number;
+  height?: number;
+};
+type NoteMedia =
+  | { kind: 'image'; attachment: NoteAttachment }
+  | { kind: 'song' | 'video'; url: string; source?: string; thumbnailUrl?: string };
+type DesktopNote = {
+  id: string;
+  revision: number;
+  senderMemberId: 'a' | 'b';
+  recipientMemberId: 'a' | 'b';
+  body: string;
+  paperColor: 'yellow' | 'pink' | 'blue' | 'sage' | 'lavender';
+  media?: NoteMedia | null;
+  createdAt: string;
+  noticedAt?: string;
+  review?: { reviewedAt: string; body?: string; imageAttachment?: NoteAttachment };
+  favorite: boolean;
+};
+type NoteImageInput = { mime: string; data: ArrayBuffer };
+type NoteResponse = { ok: boolean; code?: string; note?: DesktopNote; items?: DesktopNote[]; mime?: string; data?: ArrayBuffer };
+
+const noteInbox = new Map<string, DesktopNote>();
+const noteCardWindows = new Map<string, Window>();
+let noteStackWindow: Window | null = null;
+let noteGameMode = false;
+const noteImageUrls = new Map<string, string>();
+const NOTE_COLLAPSED_STORAGE = 'pet.noteCollapsedIds';
+const collapsedNoteIds = new Set<string>((() => {
+  try {
+    const value = JSON.parse(localStorage.getItem(NOTE_COLLAPSED_STORAGE) || '[]');
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+})());
+
+const NOTE_PAPERS: Record<DesktopNote['paperColor'], string> = {
+  yellow: '#F4D77D',
+  pink: '#E8B7C8',
+  blue: '#AFC9D8',
+  sage: '#B8C9A3',
+  lavender: '#C8B7D8',
+};
+
+const NOTE_WINDOW_CSS = `
+  :root{color-scheme:light;font-family:ui-rounded,"SF Pro Rounded",system-ui,sans-serif}
+  *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;background:transparent}
+  .hidden{display:none!important}
+  body{padding:8px;color:#302a2c}.sheet{height:100%;overflow:auto;border-radius:18px;padding:18px;
+  box-shadow:0 14px 38px rgba(32,24,30,.28);border:1px solid rgba(72,52,55,.12)}
+  .bar{display:flex;align-items:center;gap:7px;margin-bottom:12px;-webkit-app-region:drag}
+  .bar strong{flex:1;font-size:13px}.bar button,.actions button,.emoji button,.stack-row button{-webkit-app-region:no-drag}
+  button{border:0;border-radius:10px;padding:7px 10px;background:rgba(255,255,255,.66);color:#332d30;cursor:pointer}
+  button:hover{background:#fff}button.primary{background:#443a42;color:white}
+  .body{white-space:pre-wrap;font-size:16px;line-height:1.55;overflow-wrap:anywhere}
+  .badge{display:inline-block;border-radius:9px;padding:3px 7px;background:#e85c72;color:white;font-size:10px}
+  .media{margin:12px 0;border-radius:13px;overflow:hidden;background:rgba(255,255,255,.42)}
+  .media img{display:block;width:100%;max-height:260px;object-fit:contain}
+  .link{display:flex;align-items:center;gap:10px;padding:12px;text-align:left;width:100%}
+  .link span{overflow:hidden;text-overflow:ellipsis}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}
+  .reply{margin-top:12px;padding-top:12px;border-top:1px solid rgba(53,43,47,.14)}
+  textarea{width:100%;min-height:70px;resize:vertical;border:1px solid rgba(53,43,47,.18);border-radius:10px;
+  padding:9px;background:rgba(255,255,255,.66);font:inherit}.emoji{display:flex;gap:5px;margin:7px 0}
+  .hint{font-size:11px;opacity:.66;margin:5px 0}.stack{background:#fff9eb}.stack-row{display:flex;align-items:center;gap:8px;
+  margin:8px 0;padding:10px;border-radius:12px;background:white}.stack-row .copy{flex:1;min-width:0}
+  .stack-row strong,.stack-row small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .stack-row small{opacity:.62;margin-top:3px}.empty{text-align:center;padding:48px 10px;opacity:.6}
+  @media(prefers-contrast:more){.sheet{background:#fff!important;color:#000;border:2px solid #000}
+  button,textarea{border:1px solid #000}.badge,button.primary{background:#000!important;color:#fff!important}}
+  @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+`;
+
+function noteRequest(event: string, payload?: unknown): Promise<NoteResponse> {
+  return new Promise((resolve) => {
+    if (!remoteSocket?.connected) return resolve({ ok: false, code: 'disconnected' });
+    remoteSocket.timeout(15_000).emit(event, payload, (error: Error | null, response: NoteResponse) => {
+      resolve(error ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'note_request_failed' });
+    });
+  });
+}
+
+function noteError(code?: string) {
+  const labels: Record<string, string> = {
+    disconnected: '网络暂时断开了',
+    timeout: '请求超时，请重试',
+    invalid_note: '回复内容不符合要求',
+    invalid_image: '请选择 2 MB 内的 JPEG 或 PNG',
+    note_already_reviewed: '这张便签已在另一台设备批阅',
+    favorite_limit_reached: '收藏数量已满',
+    favorite_image_limit: '收藏图片空间已满',
+  };
+  return labels[code || ''] || '操作失败，请重试';
+}
+
+function noteGraphemeLength(value: string) {
+  const Segmenter = (Intl as typeof Intl & {
+    Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => {
+      segment(input: string): Iterable<unknown>;
+    };
+  }).Segmenter;
+  return Segmenter ? [...new Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].length : [...value].length;
+}
+
+function syncNotesDock() {
+  const notes = [...noteInbox.values()].filter((note) => !note.review);
+  const fresh = notes.filter((note) => !note.noticedAt).length;
+  notesCount.textContent = fresh ? `${fresh}/${notes.length}` : String(notes.length);
+  notesCount.classList.toggle('hidden', notes.length === 0);
+  notesDock.classList.toggle('has-new', fresh > 0);
+  notesDock.title = notes.length ? `${fresh} 张新便签，${notes.length} 张待批阅` : '便签堆是空的';
+}
+
+function releaseNoteImages(noteId?: string) {
+  for (const [key, url] of noteImageUrls) {
+    if (!noteId || key.startsWith(`${noteId}:`)) {
+      URL.revokeObjectURL(url);
+      noteImageUrls.delete(key);
+    }
+  }
+}
+
+function persistCollapsedNotes() {
+  localStorage.setItem(NOTE_COLLAPSED_STORAGE, JSON.stringify([...collapsedNoteIds]));
+}
+
+function makeButton(doc: Document, label: string, onClick: () => void, primary = false) {
+  const button = doc.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  if (primary) button.className = 'primary';
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+async function attachmentUrl(note: DesktopNote, attachment: NoteAttachment) {
+  const cacheKey = `${note.id}:${attachment.id}`;
+  const cached = noteImageUrls.get(cacheKey);
+  if (cached) return cached;
+  const response = await noteRequest('note:get-attachment', { noteId: note.id, attachmentId: attachment.id });
+  if (!response.ok || !response.data) return '';
+  const url = URL.createObjectURL(new Blob([response.data], { type: response.mime || attachment.mime }));
+  noteImageUrls.set(cacheKey, url);
+  return url;
+}
+
+async function noteImageInput(file: File): Promise<NoteImageInput> {
+  if (!['image/jpeg', 'image/png'].includes(file.type)) throw new Error('invalid_image');
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('invalid_image');
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  let quality = .9;
+  let blob: Blob | null = null;
+  do {
+    blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+    quality -= .12;
+  } while (blob && blob.size > 2 * 1024 * 1024 && quality >= .3);
+  if (!blob || blob.size > 2 * 1024 * 1024) throw new Error('invalid_image');
+  return { mime: 'image/jpeg', data: await blob.arrayBuffer() };
+}
+
+function markNoteNoticed(noteId: string) {
+  const note = noteInbox.get(noteId);
+  if (!note || note.noticedAt) return;
+  void noteRequest('note:mark-noticed', { noteId }).then((result) => {
+    if (result.ok && result.note) reconcileNote(result.note, false);
+  });
+}
+
+async function renderNoteCard(noteId: string, child: Window) {
+  const note = noteInbox.get(noteId);
+  if (!note || note.review || child.closed) return;
+  const doc = child.document;
+  doc.title = '桌面便签';
+  doc.head.replaceChildren();
+  const style = doc.createElement('style');
+  style.textContent = NOTE_WINDOW_CSS;
+  doc.head.appendChild(style);
+  const sheet = doc.createElement('main');
+  sheet.className = 'sheet';
+  sheet.style.background = NOTE_PAPERS[note.paperColor] || NOTE_PAPERS.yellow;
+  sheet.addEventListener('pointerdown', () => markNoteNoticed(note.id), { once: true });
+
+  const bar = doc.createElement('div');
+  bar.className = 'bar';
+  const title = doc.createElement('strong');
+  title.textContent = `来自 ${note.senderMemberId.toUpperCase()}`;
+  bar.append(title);
+  if (!note.noticedAt) {
+    const badge = doc.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = 'NEW';
+    bar.append(badge);
+  }
+  bar.append(makeButton(doc, note.favorite ? '★' : '☆', () => {
+    void noteRequest('note:set-favorite', { noteId, favorite: !note.favorite }).then((result) => {
+      if (result.ok && result.note) reconcileNote(result.note, false);
+      else showReply(noteError(result.code), 2600);
+    });
+  }));
+  bar.append(makeButton(doc, '收进堆', () => {
+    collapsedNoteIds.add(note.id);
+    persistCollapsedNotes();
+    child.close();
+  }));
+  sheet.append(bar);
+
+  if (note.body) {
+    const body = doc.createElement('div');
+    body.className = 'body';
+    body.textContent = note.body;
+    sheet.append(body);
+  }
+  if (note.media) {
+    const media = doc.createElement('div');
+    media.className = 'media';
+    if (note.media.kind === 'image') {
+      const image = doc.createElement('img');
+      image.alt = '便签图片';
+      media.append(image);
+      void attachmentUrl(note, note.media.attachment).then((url) => { if (url && !child.closed) image.src = url; });
+    } else {
+      const linkMedia = note.media;
+      if (linkMedia.thumbnailUrl) {
+        const thumbnail = doc.createElement('img');
+        thumbnail.alt = '';
+        thumbnail.referrerPolicy = 'no-referrer';
+        thumbnail.src = linkMedia.thumbnailUrl;
+        media.append(thumbnail);
+      }
+      const link = makeButton(doc, `${linkMedia.kind === 'song' ? '♫' : '▶'}  ${linkMedia.source || linkMedia.url}`, () => {
+        void petBridge.openExternal(linkMedia.url);
+      });
+      link.className = 'link';
+      media.append(link);
+    }
+    sheet.append(media);
+  }
+
+  const actions = doc.createElement('div');
+  actions.className = 'actions';
+  const replyPanel = doc.createElement('section');
+  replyPanel.className = 'reply hidden';
+  const replyText = doc.createElement('textarea');
+  replyText.placeholder = '可以写回复，也可以只选 emoji 或图片（最多 500 个字）';
+  const emoji = doc.createElement('div');
+  emoji.className = 'emoji';
+  for (const value of ['❤️', '👍', '🥰', '收到', '抱抱']) {
+    emoji.append(makeButton(doc, value, () => {
+      replyText.value = `${replyText.value}${replyText.value ? ' ' : ''}${value}`;
+      replyText.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      replyText.focus();
+    }));
+  }
+  const imageInput = doc.createElement('input');
+  imageInput.type = 'file';
+  imageInput.accept = 'image/jpeg,image/png';
+  const hint = doc.createElement('div');
+  hint.className = 'hint';
+  const updateReplyHint = () => {
+    hint.textContent = `${noteGraphemeLength(replyText.value)} / 500 · 回复会和“已批阅”一次提交；失败时仍保持未批阅。`;
+  };
+  replyText.addEventListener('input', updateReplyHint);
+  updateReplyHint();
+  replyPanel.append(replyText, emoji, imageInput, hint);
+  replyPanel.append(makeButton(doc, '发送回复并批阅', () => {
+    const body = replyText.value.trim();
+    const file = imageInput.files?.[0];
+    void (async () => {
+      if (noteGraphemeLength(body) > 500) {
+        showReply('回复最多 500 个字符', 3000);
+        return;
+      }
+      const reply = body || file ? {
+        ...(body ? { body } : {}),
+        ...(file ? { image: await noteImageInput(file) } : {}),
+      } : undefined;
+      const result = await noteRequest('note:review', { noteId, ...(reply ? { reply } : {}) });
+      if (!result.ok) {
+        showReply(noteError(result.code), 3000);
+        return;
+      }
+      if (result.note) reconcileNote(result.note, false);
+    })().catch(() => showReply('回复图片处理失败，请换一张试试', 3000));
+  }, true));
+  actions.append(makeButton(doc, '批阅', () => {
+    void noteRequest('note:review', { noteId }).then((result) => {
+      if (result.ok && result.note) reconcileNote(result.note, false);
+      else showReply(noteError(result.code), 3000);
+    });
+  }, true));
+  actions.append(makeButton(doc, '批阅并回复', () => {
+    replyPanel.classList.toggle('hidden');
+    if (!replyPanel.classList.contains('hidden')) replyText.focus();
+  }));
+  sheet.append(actions, replyPanel);
+  doc.body.replaceChildren(sheet);
+}
+
+function openNoteCard(noteId: string) {
+  if (noteGameMode) return;
+  const note = noteInbox.get(noteId);
+  if (!note || note.review) return;
+  if (collapsedNoteIds.delete(noteId)) persistCollapsedNotes();
+  let child = noteCardWindows.get(noteId);
+  if (!child || child.closed) {
+    const opened = window.open('about:blank', `note-card:${noteId}`, 'popup=yes');
+    if (!opened) {
+      showReply('系统未能打开便签窗口', 2600);
+      return;
+    }
+    child = opened;
+    noteCardWindows.set(noteId, child);
+  }
+  void renderNoteCard(noteId, child);
+}
+
+function renderNoteStack() {
+  const child = noteStackWindow;
+  if (!child || child.closed) return;
+  const doc = child.document;
+  doc.title = '便签堆';
+  doc.head.replaceChildren();
+  const style = doc.createElement('style');
+  style.textContent = NOTE_WINDOW_CSS;
+  doc.head.append(style);
+  const sheet = doc.createElement('main');
+  sheet.className = 'sheet stack';
+  const bar = doc.createElement('div');
+  bar.className = 'bar';
+  const title = doc.createElement('strong');
+  title.textContent = `便签堆 · ${noteInbox.size}`;
+  bar.append(title, makeButton(doc, '写一张', () => petBridge.openNoteComposer()), makeButton(doc, '全部展开', () => {
+    for (const note of noteInbox.values()) openNoteCard(note.id);
+  }));
+  sheet.append(bar);
+  const notes = [...noteInbox.values()].filter((note) => !note.review);
+  if (!notes.length) {
+    const empty = doc.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = '这里暂时没有待批阅的便签';
+    sheet.append(empty);
+  }
+  for (const note of notes) {
+    const row = doc.createElement('div');
+    row.className = 'stack-row';
+    const copy = doc.createElement('div');
+    copy.className = 'copy';
+    const heading = doc.createElement('strong');
+    heading.textContent = `${note.noticedAt ? '' : '● '}${note.body || (note.media?.kind === 'image' ? '一张图片' : '一个链接')}`;
+    const date = doc.createElement('small');
+    date.textContent = new Date(note.createdAt).toLocaleString();
+    copy.append(heading, date);
+    row.append(copy, makeButton(doc, '展开', () => openNoteCard(note.id)));
+    sheet.append(row);
+  }
+  doc.body.replaceChildren(sheet);
+}
+
+function openNoteStack() {
+  if (noteGameMode) return;
+  if (!noteStackWindow || noteStackWindow.closed) {
+    noteStackWindow = window.open('about:blank', 'note-stack', 'popup=yes');
+    if (!noteStackWindow) return;
+  }
+  renderNoteStack();
+}
+
+function reconcileNote(note: DesktopNote, announce: boolean) {
+  const previous = noteInbox.get(note.id);
+  if (previous && previous.revision > note.revision) return;
+  if (note.recipientMemberId !== MEMBER_ID || note.review) {
+    noteInbox.delete(note.id);
+    if (collapsedNoteIds.delete(note.id)) persistCollapsedNotes();
+    releaseNoteImages(note.id);
+    const child = noteCardWindows.get(note.id);
+    if (child && !child.closed) child.close();
+    noteCardWindows.delete(note.id);
+  } else {
+    noteInbox.set(note.id, note);
+    const child = noteCardWindows.get(note.id);
+    if (child && !child.closed) void renderNoteCard(note.id, child);
+    else if (announce && !noteGameMode) openNoteCard(note.id);
+  }
+  syncNotesDock();
+  renderNoteStack();
+  if (announce && !previous && !note.review) {
+    setSpriteState('waiting', 4200);
+    showReply('收到一张新便签', 2600);
+  }
+}
+
+async function refreshNoteInbox(openCards = false) {
+  const response = await noteRequest('note:list', { view: 'inbox', limit: 500 });
+  if (!response.ok) return;
+  const ids = new Set((response.items || []).map((note) => note.id));
+  for (const id of noteInbox.keys()) {
+    if (!ids.has(id)) {
+      noteInbox.delete(id);
+      if (collapsedNoteIds.delete(id)) persistCollapsedNotes();
+      releaseNoteImages(id);
+    }
+  }
+  for (const note of response.items || []) reconcileNote(note, false);
+  syncNotesDock();
+  renderNoteStack();
+  if (openCards && !noteGameMode) {
+    for (const note of noteInbox.values()) if (!collapsedNoteIds.has(note.id)) openNoteCard(note.id);
+  }
+}
+
+notesDock.addEventListener('click', openNoteStack);
+notesDock.addEventListener('pointerenter', () => petBridge.setClickable(true));
+petBridge.isGameMode().then((enabled) => { noteGameMode = enabled; }).catch(() => {});
+petBridge.onGameModeChanged((enabled) => {
+  noteGameMode = enabled;
+  if (!enabled) renderNoteStack();
+});
+petBridge.onNoteWindowClosed((frameName) => {
+  if (frameName === 'note-stack') noteStackWindow = null;
+  else if (frameName.startsWith('note-card:')) noteCardWindows.delete(frameName.slice('note-card:'.length));
+});
+petBridge.onNoteWindowInteracted((frameName) => {
+  if (frameName.startsWith('note-card:')) markNoteNoticed(frameName.slice('note-card:'.length));
+});
+window.addEventListener('beforeunload', () => releaseNoteImages());
+syncNotesDock();
 
 // === 远程控制（M4a）===
 // A 端（controller）通过 Socket.IO 发指令，B 端（pet）路由到现有动作函数 / FBX 动作。
@@ -1742,6 +2204,7 @@ function connectRemote() {
         if (res?.ok) {
           remoteConnected = true;
           console.log('[remote] joined as pet');
+          void refreshNoteInbox(true);
         } else {
           remoteConnected = false;
           console.warn('[remote] join rejected:', res?.code || res?.error);
@@ -1764,6 +2227,20 @@ function connectRemote() {
   remoteSocket.on('pet:command', (cmd: RemoteCommand) => {
     console.log('[remote] cmd', cmd);
     handleRemoteCommand(cmd);
+  });
+  remoteSocket.on('note:changed', (payload: { reason?: string; note?: DesktopNote }) => {
+    if (payload?.note) reconcileNote(payload.note, payload.reason === 'created');
+  });
+  remoteSocket.on('note:removed', (payload: { noteId?: string }) => {
+    const noteId = String(payload?.noteId || '');
+    if (!noteId) return;
+    noteInbox.delete(noteId);
+    releaseNoteImages(noteId);
+    const child = noteCardWindows.get(noteId);
+    if (child && !child.closed) child.close();
+    noteCardWindows.delete(noteId);
+    syncNotesDock();
+    renderNoteStack();
   });
   remoteSocket.on('tts:play', (job: TtsPlay) => {
     void playTtsStream(job);

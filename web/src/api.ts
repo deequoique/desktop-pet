@@ -20,6 +20,30 @@ export type TtsStatus = { jobId: string; state: 'dispatched' | 'generating' | 'p
 export type TtsProvider = 'elevenlabs' | 'cosyvoice';
 export type TtsVoiceResponse = { ok: boolean; mode?: 'managed' | 'byok'; provider?: TtsProvider; code?: string; voices: TtsVoice[] };
 export type PersonalAudio = { id: string; name: string; mime: string; durationMs: number; size: number; createdAt: string };
+export type NoteAttachment = { id: string; mime: 'image/jpeg' | 'image/png'; extension: 'jpg' | 'png'; size: number; width: number; height: number; createdAt: string };
+export type NoteMedia =
+  | { kind: 'image'; attachment: NoteAttachment }
+  | { kind: 'song' | 'video'; url: string; source: string; title?: string; thumbnailUrl?: string };
+export type DesktopNote = {
+  id: string;
+  revision: number;
+  senderMemberId: 'a' | 'b';
+  recipientMemberId: 'a' | 'b';
+  body: string;
+  paperColor: 'yellow' | 'pink' | 'blue' | 'sage' | 'lavender';
+  media: NoteMedia | null;
+  createdAt: string;
+  noticedAt?: string;
+  review?: { reviewedAt: string; body?: string; imageAttachment?: NoteAttachment };
+  favorite: boolean;
+};
+export type NoteImageInput = { mime: 'image/jpeg' | 'image/png'; data: ArrayBuffer };
+export type NoteCreateInput = {
+  body: string;
+  paperColor: DesktopNote['paperColor'];
+  media?: { kind: 'image'; mime: NoteImageInput['mime']; data: ArrayBuffer } | { kind: 'song' | 'video'; url: string };
+};
+export type NoteResult = ActionResult & { note?: DesktopNote };
 
 export type Peers = {
   protocolVersion: 2;
@@ -60,6 +84,8 @@ export type Listeners = {
   onCallStart?: (callId: string, peerDeviceId?: string, cameraSenderDeviceId?: string) => void;
   onCallEnd?: (callId?: string, reason?: string) => void;
   onTtsStatus?: (status: TtsStatus) => void;
+  onNoteChanged?: (payload: { reason: string; note: DesktopNote }) => void;
+  onNoteRemoved?: (payload: { noteId: string; reason: string }) => void;
 };
 
 let socket: Socket | null = null;
@@ -131,6 +157,8 @@ export function connect(serverUrl: string, secret: string, identity: ConnectionI
     listeners.onCallEnd?.(payload?.callId, payload?.reason);
   });
   s.on('tts:status', (payload: TtsStatus) => listeners.onTtsStatus?.(payload));
+  s.on('note:changed', (payload: { reason: string; note: DesktopNote }) => listeners.onNoteChanged?.(payload));
+  s.on('note:removed', (payload: { noteId: string; reason: string }) => listeners.onNoteRemoved?.(payload));
 
   return s;
 }
@@ -313,6 +341,26 @@ export const playPersonalAudio = async (audioId: string, targetDeviceIds: string
   })))
 );
 export const getPersonalAudio = (audioId: string) => audioRequest('audio:get', { audioId });
+function noteRequest<T = ActionResult>(event: string, payload?: unknown): Promise<T> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' } as T);
+    socket.timeout(15_000).emit(event, payload, (err: Error | null, response: T) => {
+      resolve(err ? ({ ok: false, code: 'timeout' } as T) : response || ({ ok: false, code: 'note_request_failed' } as T));
+    });
+  });
+}
+export const createNote = (payload: NoteCreateInput) => noteRequest<NoteResult>('note:create', payload);
+export const listNotes = (view: 'inbox' | 'sent' | 'history' | 'favorites') => (
+  noteRequest<ActionResult & { items: DesktopNote[] }>('note:list', { view, limit: 500 })
+);
+export const markNoteNoticed = (noteId: string) => noteRequest<NoteResult>('note:mark-noticed', { noteId });
+export const reviewNote = (noteId: string, reply?: { body?: string; image?: NoteImageInput }) => (
+  noteRequest<NoteResult>('note:review', { noteId, ...(reply ? { reply } : {}) })
+);
+export const setNoteFavorite = (noteId: string, favorite: boolean) => noteRequest<NoteResult>('note:set-favorite', { noteId, favorite });
+export const getNoteAttachment = (noteId: string, attachmentId: string) => (
+  noteRequest<ActionResult & { mime?: string; data?: ArrayBuffer }>('note:get-attachment', { noteId, attachmentId })
+);
 export const renameMember = (memberId: 'a' | 'b', displayName: string) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId: string, deviceName: string) => audioRequest('device:reclaim', { deviceId, deviceName });
 export const changeMember = (targetMemberId: 'a' | 'b'): Promise<MemberChangeResult> => new Promise((resolve) => {

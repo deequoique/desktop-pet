@@ -68,6 +68,40 @@
       }
       #size button:active { transform: translateY(1px); }
 
+      #notes-dock {
+        position: absolute;
+        left: 50%;
+        bottom: 4px;
+        width: 38px;
+        height: 32px;
+        transform: translateX(-50%);
+        border: 1px solid rgba(255,255,255,.24);
+        border-radius: 15px;
+        background: rgba(24,20,31,.78);
+        color: #fff4c5;
+        box-shadow: 0 4px 16px rgba(0,0,0,.34);
+        backdrop-filter: blur(8px);
+        cursor: pointer;
+        font: 18px/1 system-ui;
+        opacity: .86;
+      }
+      #notes-dock:hover, #notes-dock.has-new { opacity: 1; background: rgba(52,42,62,.94); }
+      #notes-dock.has-new { animation: note-pulse 1.8s ease-in-out infinite; }
+      #notes-count {
+        position: absolute;
+        top: -7px;
+        right: -8px;
+        min-width: 17px;
+        height: 17px;
+        padding: 0 4px;
+        border-radius: 9px;
+        background: #e85c72;
+        color: white;
+        font: 700 10px/17px system-ui;
+      }
+      @keyframes note-pulse { 50% { transform: translateX(-50%) translateY(-3px); } }
+      @media (prefers-reduced-motion: reduce) { #notes-dock.has-new { animation: none; } }
+
       #pairing {
         position: absolute; inset: 0;
         display: flex; align-items: center; justify-content: center;
@@ -138,6 +172,9 @@
       <button id="size-down" type="button" title="缩小" aria-label="缩小">-</button>
       <button id="size-up" type="button" title="放大" aria-label="放大">+</button>
     </div>
+    <button id="notes-dock" type="button" title="打开便签堆" aria-label="打开便签堆">
+      ✉<span id="notes-count" class="hidden">0</span>
+    </button>
     <form id="pairing" class="hidden">
       <div id="pairing-panel">
         <h1>连接桌宠房间</h1>

@@ -35,6 +35,79 @@ server 对房间密钥做 hash，只保留 hash。一个房间固定两名成员
 
 需要成功或错误结果的操作使用 acknowledgement。payload 中保留稳定字符串错误码，由 UI 转换为面向用户的文本。
 
+## 场景：成员级异步桌面便签
+
+### 1. 适用范围与触发条件
+
+新增或修改持久便签、成员级私有状态、便签图片配额、批阅回执、桌面卡片或便签堆时使用本节。该功能跨 `PersistentStore → Socket.IO → web/pet renderer → Electron child window`，必须保持成员隐私、原子落盘和唯一 pet Socket 所有权。
+
+### 2. 签名
+
+```ts
+socket.emit('note:create', { body, paperColor, media? }, ack);
+socket.emit('note:list', { view: 'inbox' | 'sent' | 'history' | 'favorites', limit? }, ack);
+socket.emit('note:mark-noticed', { noteId }, ack);
+socket.emit('note:review', { noteId, reply?: { body?: string, image?: BinaryImage } }, ack);
+socket.emit('note:set-favorite', { noteId, favorite: boolean }, ack);
+socket.emit('note:get-attachment', { noteId, attachmentId }, ack);
+
+socket.on('note:changed', ({ reason, note }) => {});
+socket.on('note:removed', ({ reason, noteId }) => {});
+```
+
+registry 使用 `version: 2`；每个 room 增加 `notes`。附件位于 `PET_DATA_DIR/notes/<roomHash>/<attachmentId>.<jpg|png>`。Electron 只允许 `note-card:<uuid>` 与 `note-stack` 两种 `about:blank` 子窗口。
+
+### 3. 契约
+
+- 便签目标永远由发送 controller 的已认证 member 推导为另一 member，不接受目标设备或 socket。接收方离线不影响持久投递。
+- `noticedAt` 仅包含在 recipient snapshot 中；`noticed` 事件只发给 recipient member 的所有 endpoint。收藏同样只向执行收藏的 member endpoint 同步，不能通知另一成员。
+- review 是一次性 compare-and-set 终态；文字/emoji 与最多一张图片原子保存，失败时保持未批阅。
+- 普通已批阅历史保留 30 天；任一成员收藏时保留同一 record/附件引用，不复制文件。最后收藏取消且历史过期后才删除。
+- registry v1 原地迁移到 v2。未知版本、损坏 JSON 或迁移写入失败必须拒绝启动并保留原文件，禁止以空 registry 继续。
+- 图片只接受非动画 JPEG/PNG，默认单图 2 MiB、每成员 pending 500 张/500 MiB、收藏 500 张/500 MiB、每房间唯一图片 2 GiB。环境键为 `NOTE_IMAGE_MAX_BYTES`、`NOTE_PENDING_MAX`、`NOTE_PENDING_IMAGE_MAX_BYTES`、`NOTE_FAVORITE_MAX`、`NOTE_FAVORITE_IMAGE_MAX_BYTES`、`NOTE_ROOM_IMAGE_MAX_BYTES`、`NOTE_HISTORY_TTL_DAYS`。
+- pet renderer 是卡片和便签堆的唯一 Socket owner；子窗口只渲染受控 DOM。外链经 main 再校验 `http:`/`https:` 后用系统浏览器打开。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 行为 |
+| --- | --- |
+| pet 调用 `note:create` | `wrong_role` |
+| 空便签、正文超过 1,000 grapheme、回复超过 500 grapheme | `invalid_note` |
+| 伪装 MIME、动画 PNG、超尺寸/超 2 MiB 图片 | `invalid_image` |
+| pending 数量或图片容量达到上限 | `note_inbox_full` / `note_pending_image_limit` |
+| room 唯一图片达到上限 | 只拒绝新图片便签/图片回复，返回 `note_room_image_limit` |
+| 第二台设备重复批阅 | `note_already_reviewed`，不覆盖第一次回执 |
+| 非 sender/recipient 或已过期且本成员未收藏 | `note_not_found` |
+| 收藏数量或图片容量达到上限 | `favorite_limit_reached` / `favorite_image_limit` |
+| registry/附件落盘失败 | `note_storage_failed`；回滚内存 mutation 和新附件 |
+
+### 5. 正常、基准与错误案例
+
+- 正常：A 离线投递给 B；B 两台 pet 上线后都拉取 pending，任一设备点击只在 B 的端点清除 NEW，批阅后 A 收到 review 回执。
+- 基准：游戏模式期间新件只更新信封/便签堆；退出后不批量打开游戏期间的新卡片。纯文本和外部歌曲/视频链接不占图片配额。
+- 错误：向整个 room 广播 `noticed`/`favorite`，让发送方推断被动已读或对方收藏；每个卡片自建 Socket；写盘失败后仍保留内存 review。
+
+### 6. 必需测试
+
+- store unit：v1→v2 保留成员/设备/音频，未知或损坏 registry fail-closed，重启恢复，写盘失败回滚，orphan 清理，30 天/收藏引用和三层图片配额。
+- Socket.IO integration：成员多设备投递、noticed 不泄露给 sender、favorite 不通知另一 member、原子重复 review、附件越权、wrong role 和稳定 ack。
+- Electron source/unit：frameName allowlist、`contextIsolation:true`、`nodeIntegration:false`、置顶/最小尺寸、bounds 持久化、游戏模式隐藏恢复、外链协议和 preload listener cleanup。
+- 构建与手工：`npm test --prefix server`、`npm test --prefix pet`、`npm run build:web`、`npm run build:pet`；两个成员的隔离 Electron profile 完成投递→收堆→回复批阅→回执→收藏。
+
+### 7. 错误与正确写法
+
+```js
+// 错误：把 recipient 私有 noticed 状态广播给整个 room。
+emitNoteChanged(room, note, 'noticed');
+
+// 正确：snapshot 先按成员裁剪，再只同步该成员全部 endpoint。
+const snapshot = store.noteSnapshot(note, socket.data.memberId);
+emitToMemberEndpoints(room, socket.data.memberId, 'note:changed', {
+  reason: 'noticed',
+  note: snapshot,
+});
+```
+
 ### WebRTC
 
 Socket.IO 负责传递 `call:start`、`call:end`、`webrtc:signal`、`webrtc:hangup` 和 `webrtc:error`。server 协调 call ID，只在正确的远端角色之间转发 SDP/ICE。屏幕、麦克风和系统声音 track 通过 `RTCPeerConnection` 传输，不能通过 Express 或 Socket.IO 传输。

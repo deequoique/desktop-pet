@@ -58,6 +58,8 @@ export function connect(serverUrl, secret, identity) {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);
     });
     s.on('tts:status', (payload) => listeners.onTtsStatus?.(payload));
+    s.on('note:changed', (payload) => listeners.onNoteChanged?.(payload));
+    s.on('note:removed', (payload) => listeners.onNoteRemoved?.(payload));
     return s;
 }
 export function disconnect() {
@@ -252,6 +254,21 @@ export const playPersonalAudio = async (audioId, targetDeviceIds = []) => (Promi
     result: await audioRequest('audio:play', { audioId, targetDeviceId }),
 }))));
 export const getPersonalAudio = (audioId) => audioRequest('audio:get', { audioId });
+function noteRequest(event, payload) {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(15000).emit(event, payload, (err, response) => {
+            resolve(err ? { ok: false, code: 'timeout' } : response || { ok: false, code: 'note_request_failed' });
+        });
+    });
+}
+export const createNote = (payload) => noteRequest('note:create', payload);
+export const listNotes = (view) => (noteRequest('note:list', { view, limit: 500 }));
+export const markNoteNoticed = (noteId) => noteRequest('note:mark-noticed', { noteId });
+export const reviewNote = (noteId, reply) => (noteRequest('note:review', { noteId, ...(reply ? { reply } : {}) }));
+export const setNoteFavorite = (noteId, favorite) => noteRequest('note:set-favorite', { noteId, favorite });
+export const getNoteAttachment = (noteId, attachmentId) => (noteRequest('note:get-attachment', { noteId, attachmentId }));
 export const renameMember = (memberId, displayName) => audioRequest('room:rename-member', { memberId, displayName });
 export const reclaimDevice = (deviceId, deviceName) => audioRequest('device:reclaim', { deviceId, deviceName });
 export const changeMember = (targetMemberId) => new Promise((resolve) => {

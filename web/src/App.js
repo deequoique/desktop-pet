@@ -1,7 +1,7 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { connect, disconnect, listMotions, listTtsVoices, createTts, endCall, requestCall, requestRtcConfig, sendCommand, sendSignal, sendCameraSignal, sendMediaStatus, requestMediaControl, setListeners, setTtsCredentials, addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio, getPersonalAudio, renameMember, discoverPairing, changeMember, reclaimDevice, } from './api';
+import { connect, disconnect, listMotions, listTtsVoices, createTts, endCall, requestCall, requestRtcConfig, sendCommand, sendSignal, sendCameraSignal, sendMediaStatus, requestMediaControl, setListeners, setTtsCredentials, addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio, getPersonalAudio, createNote, listNotes, setNoteFavorite, getNoteAttachment, renameMember, discoverPairing, changeMember, reclaimDevice, } from './api';
 const LS_SERVER = 'pet.serverUrl';
 const LS_SECRET = 'pet.secret';
 const LS_PARTICIPANT = 'pet.participantId';
@@ -33,6 +33,13 @@ const CORNERS = [
     { corner: 'top-right', label: '右上' },
     { corner: 'bottom-left', label: '左下' },
     { corner: 'bottom-right', label: '右下' },
+];
+const NOTE_COLORS = [
+    { id: 'yellow', label: '奶油黄', value: '#F4D77D' },
+    { id: 'pink', label: '温柔粉', value: '#E8B7C8' },
+    { id: 'blue', label: '雾蓝', value: '#AFC9D8' },
+    { id: 'sage', label: '鼠尾草绿', value: '#B8C9A3' },
+    { id: 'lavender', label: '淡紫灰', value: '#C8B7D8' },
 ];
 const EMPTY_RTC_ROUTE = {
     candidateType: 'unknown',
@@ -87,6 +94,54 @@ function pairingErrorMessage(code) {
         disconnected: '当前未连接服务器',
     };
     return messages[code || ''] || '操作失败，请重试';
+}
+function noteErrorMessage(code) {
+    const messages = {
+        disconnected: '尚未连接服务器',
+        invalid_note: '便签内容或附件不符合要求',
+        invalid_image: '图片必须是 2 MB 内的 JPEG 或 PNG',
+        note_inbox_full: '对方便签箱已满',
+        note_pending_image_limit: '对方待批阅图片空间已满',
+        note_room_image_limit: '房间图片空间已满，可改发文字或链接',
+        favorite_limit_reached: '收藏数量已达上限',
+        favorite_image_limit: '收藏图片空间已满',
+        note_storage_failed: '服务器未能保存便签',
+        timeout: '服务器响应超时，请重试',
+    };
+    return messages[code || ''] || '便签操作失败';
+}
+function graphemeCount(value) {
+    const Segmenter = Intl.Segmenter;
+    if (Segmenter)
+        return [...new Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].length;
+    return [...value].length;
+}
+async function compressNoteImage(file) {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext('2d');
+    if (!context)
+        throw new Error('image_canvas_unavailable');
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    let quality = 0.9;
+    let blob = null;
+    do {
+        blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+        quality -= 0.1;
+    } while (blob && blob.size > 2 * 1024 * 1024 && quality >= 0.4);
+    if (!blob || blob.size > 2 * 1024 * 1024)
+        throw new Error('invalid_image');
+    return { mime: 'image/jpeg', data: await blob.arrayBuffer() };
+}
+function upsertNote(items, note) {
+    const current = items.find((item) => item.id === note.id);
+    if (current && current.revision > note.revision)
+        return items;
+    return [note, ...items.filter((item) => item.id !== note.id)];
 }
 function explainMediaDevicesUnavailable() {
     const protocol = window.location.protocol;
@@ -205,6 +260,17 @@ export default function App() {
     const [ttsVoices, setTtsVoices] = useState([]);
     const [ttsVoiceId, setTtsVoiceId] = useState(() => localStorage.getItem(LS_TTS_VOICE) || '');
     const [ttsState, setTtsState] = useState('等待发送');
+    const [noteSection, setNoteSection] = useState('compose');
+    const [noteBody, setNoteBody] = useState('');
+    const [noteColor, setNoteColor] = useState('yellow');
+    const [noteMediaKind, setNoteMediaKind] = useState('none');
+    const [noteLink, setNoteLink] = useState('');
+    const [noteImage, setNoteImage] = useState(null);
+    const [noteImageName, setNoteImageName] = useState('');
+    const [noteSending, setNoteSending] = useState(false);
+    const [sentNotes, setSentNotes] = useState([]);
+    const [noteHistory, setNoteHistory] = useState([]);
+    const [favoriteNotes, setFavoriteNotes] = useState([]);
     const [toast, setToast] = useState(null);
     const [petScale, setPetScaleState] = useState(1);
     const [callState, setCallState] = useState('idle');
@@ -246,6 +312,7 @@ export default function App() {
     const cameraPendingCandidatesRef = useRef([]);
     const cameraSenderDeviceIdRef = useRef('');
     const selfDeviceIdRef = useRef('');
+    const memberIdRef = useRef('');
     const cameraRouteIsP2PRef = useRef(false);
     const cameraRouteKnownRef = useRef(false);
     const cameraDesiredRef = useRef(false);
@@ -263,6 +330,9 @@ export default function App() {
         setToast({ msg, err });
         toastTimer.current = window.setTimeout(() => setToast(null), 2200);
     }, []);
+    useEffect(() => {
+        memberIdRef.current = memberId;
+    }, [memberId]);
     const stopLocalAudio = useCallback(() => {
         try {
             localAudioRef.current?.getTracks().forEach((track) => track.stop());
@@ -895,6 +965,23 @@ export default function App() {
                 if (payload.state === 'error')
                     showToast(label, true);
             },
+            onNoteChanged: ({ note }) => {
+                const self = memberIdRef.current;
+                if (note.senderMemberId === self) {
+                    setSentNotes((items) => upsertNote(items, note));
+                }
+                setNoteHistory((items) => note.review
+                    ? upsertNote(items, note)
+                    : items.filter((item) => item.id !== note.id));
+                setFavoriteNotes((items) => note.favorite
+                    ? upsertNote(items, note)
+                    : items.filter((item) => item.id !== note.id));
+            },
+            onNoteRemoved: ({ noteId }) => {
+                setSentNotes((items) => items.filter((item) => item.id !== noteId));
+                setNoteHistory((items) => items.filter((item) => item.id !== noteId));
+                setFavoriteNotes((items) => items.filter((item) => item.id !== noteId));
+            },
         });
         return () => {
             setListeners({});
@@ -937,6 +1024,15 @@ export default function App() {
         });
         bridge.onPairingChanged(applyConfig);
     }, [showToast]);
+    useEffect(() => {
+        const bridge = window.desktopPetControl;
+        if (!bridge)
+            return;
+        return bridge.onOpenNoteComposer(() => {
+            setActiveView('notes');
+            setNoteSection('compose');
+        });
+    }, []);
     useEffect(() => {
         const bridge = window.desktopPetControl;
         if (!bridge)
@@ -1240,6 +1336,69 @@ export default function App() {
         if (result?.ok)
             setPersonalAudio(result.items || []);
     }, []);
+    const refreshNotes = useCallback(async () => {
+        const [sent, history, favorites] = await Promise.all([listNotes('sent'), listNotes('history'), listNotes('favorites')]);
+        if (sent.ok)
+            setSentNotes(sent.items || []);
+        if (history.ok)
+            setNoteHistory(history.items || []);
+        if (favorites.ok)
+            setFavoriteNotes(favorites.items || []);
+    }, []);
+    useEffect(() => {
+        if (activeView === 'notes' && status === 'connected')
+            void refreshNotes();
+    }, [activeView, refreshNotes, status]);
+    const onSelectNoteImage = useCallback(async (file) => {
+        if (!file)
+            return;
+        try {
+            const image = await compressNoteImage(file);
+            setNoteImage(image);
+            setNoteImageName(file.name);
+        }
+        catch {
+            setNoteImage(null);
+            setNoteImageName('');
+            showToast('图片压缩后仍超过 2 MB，或格式无法读取', true);
+        }
+    }, [showToast]);
+    const onSendNote = useCallback(async () => {
+        const body = noteBody.trim();
+        if (graphemeCount(body) > 1000)
+            return showToast('便签正文最多 1000 个字符', true);
+        let media;
+        if (noteMediaKind === 'image') {
+            if (!noteImage)
+                return showToast('请选择一张图片', true);
+            media = { kind: 'image', mime: noteImage.mime, data: noteImage.data };
+        }
+        else if (noteMediaKind === 'song' || noteMediaKind === 'video') {
+            if (!noteLink.trim())
+                return showToast('请输入外部链接', true);
+            media = { kind: noteMediaKind, url: noteLink.trim() };
+        }
+        if (!body && !media)
+            return showToast('写点内容或添加一个媒体', true);
+        setNoteSending(true);
+        const result = await createNote({ body, paperColor: noteColor, ...(media ? { media } : {}) });
+        setNoteSending(false);
+        if (!result.ok)
+            return showToast(noteErrorMessage(result.code), true);
+        setNoteBody('');
+        setNoteMediaKind('none');
+        setNoteLink('');
+        setNoteImage(null);
+        setNoteImageName('');
+        showToast('便签已投递');
+        await refreshNotes();
+    }, [noteBody, noteColor, noteImage, noteLink, noteMediaKind, refreshNotes, showToast]);
+    const toggleNoteFavorite = useCallback(async (note) => {
+        const result = await setNoteFavorite(note.id, !note.favorite);
+        if (!result.ok)
+            return showToast(noteErrorMessage(result.code), true);
+        await refreshNotes();
+    }, [refreshNotes, showToast]);
     useEffect(() => {
         if (status === 'connected')
             void refreshPersonalAudio();
@@ -1507,6 +1666,7 @@ export default function App() {
     return (_jsxs("div", { className: "control-app", children: [_jsxs("aside", { className: "app-rail", "aria-label": "\u4E3B\u5BFC\u822A", children: [_jsx("div", { className: "brand-mark", "aria-hidden": "true", children: "\uD83D\uDC3E" }), [
                         ['control', '⌁', '控制'],
                         ['send', '✦', '发送'],
+                        ['notes', '✉', '便签'],
                         ['call', '◉', '通话'],
                     ].map(([view, icon, label]) => (_jsxs("button", { className: `rail-item ${activeView === view ? 'active' : ''}`, onClick: () => setActiveView(view), children: [_jsx("span", { "aria-hidden": "true", children: icon }), _jsx("b", { children: label }), view === 'call' && callActive && _jsx("i", {})] }, view))), _jsxs("button", { className: `rail-item settings ${activeView === 'settings' ? 'active' : ''}`, onClick: () => setActiveView('settings'), children: [_jsx("span", { "aria-hidden": "true", children: "\u2699" }), _jsx("b", { children: "\u8BBE\u7F6E" })] })] }), _jsxs("div", { className: "app-workspace", children: [_jsxs("header", { className: "app-topbar", children: [_jsxs("div", { className: "room-identity", children: [_jsx("div", { className: "room-avatar", children: "\u6211" }), _jsxs("div", { children: [_jsxs("strong", { children: [selfName, "\u548C", peerName] }), _jsx("small", { children: "\u684C\u5BA0\u8FDE\u63A5\u7A7A\u95F4" })] })] }), _jsxs("div", { className: "peer-target", children: [_jsxs("button", { className: `online-chip ${onlineDevices.length ? '' : 'offline'}`, disabled: onlineDevices.length < 2, "aria-expanded": targetMenuOpen, onClick: () => setTargetMenuOpen((open) => !open), children: [_jsx("span", { className: "status-dot" }), peerName, onlineDevices.length ? '在线' : '离线', onlineDevices.length > 1 && _jsxs("em", { children: ["\u00B7 ", onlineDevices.length, " \u53F0\u2304"] })] }), targetMenuOpen && onlineDevices.length > 1 && (_jsx("div", { className: "target-popover", children: onlineDevices.map((device) => (_jsxs("label", { className: "target-option", children: [_jsx("input", { type: "checkbox", checked: targetIds.includes(device.id), onChange: () => toggleTarget(device.id) }), _jsxs("span", { children: [_jsx("strong", { children: device.name }), _jsx("small", { children: targetIds.includes(device.id) ? '发送目标' : '在线' })] }), _jsx("i", {})] }, device.id))) }))] })] }), activeView === 'control' && (_jsxs("main", { className: "page control-page", children: [_jsxs("section", { className: "pet-hero card", children: [_jsx("div", { className: "pet-face", "aria-hidden": "true", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u60F3\u8BA9", peerName, "\u7684\u684C\u5BA0\u505A\u4EC0\u4E48\uFF1F"] })] }), _jsxs("section", { className: "card action-panel", children: [_jsx("div", { className: "section-title", children: _jsx("h2", { children: "\u5FEB\u6377\u4E92\u52A8" }) }), _jsxs("div", { className: "action-grid", children: [quickMotions.map((motion) => (_jsxs("button", { className: "action-tile", disabled: !canSend, onClick: () => send({ type: 'animation', name: motion.id }, motion.label), children: [_jsx("span", { children: QUICK_MOTION_ICONS[motion.id] || '↝' }), _jsx("b", { children: motion.label }), _jsx("small", { children: "\u52A8\u4F5C" })] }, motion.id))), !quickMotions.length && _jsx("p", { className: "action-empty", children: status === 'connected' ? '桌宠未提供可用动作' : '连接桌宠后显示可用动作' })] })] }), _jsxs("aside", { className: "control-side", children: [_jsxs("section", { className: "card compact-card", children: [_jsx("h2", { children: "\u79FB\u52A8\u4F4D\u7F6E" }), _jsx("div", { className: "corner-grid", children: CORNERS.map((item) => _jsx("button", { disabled: !canSend, onClick: () => send({ type: 'relocate', corner: item.corner }, `移动到${item.label}`), children: item.label }, item.corner)) })] }), _jsxs("section", { className: "card compact-card", children: [_jsxs("h2", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), _jsx("button", { className: "dark-button", onClick: () => setActiveView('call'), children: "\u6253\u5F00\u901A\u8BDD" })] }), window.desktopPetControl && _jsxs("section", { className: "card compact-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u684C\u5BA0" }), _jsxs("b", { children: [Math.round(petScale * 100), "%"] })] }), _jsx("input", { className: "scale-range", type: "range", min: "30", max: "150", step: "10", value: Math.round(petScale * 100), onChange: (event) => void changePetScale(Number(event.target.value) / 100), "aria-label": "\u8C03\u6574\u672C\u673A\u684C\u5BA0\u5927\u5C0F" })] })] })] })), activeView === 'send' && (_jsxs("main", { className: "page send-page", children: [_jsxs("div", { className: "page-heading", children: [_jsxs("h1", { children: ["\u53D1\u9001\u7ED9", peerName] }), _jsxs("div", { className: "segmented", children: [_jsx("button", { className: sendView === 'tts' ? 'active' : '', onClick: () => setSendView('tts'), children: "\u8BF4\u53E5\u8BDD" }), _jsx("button", { className: sendView === 'audio' ? 'active' : '', onClick: () => setSendView('audio'), children: "\u6211\u7684\u97F3\u9891" })] })] }), sendView === 'tts' ? (_jsx("section", { className: "card tts-compose", children: _jsxs("div", { className: "compose-main", children: [_jsx("textarea", { value: tts, maxLength: 200, onChange: (event) => setTts(event.target.value), placeholder: "\u8F93\u5165\u60F3\u8BA9\u684C\u5BA0\u8BF4\u7684\u8BDD\u2026", onKeyDown: (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                                                 event.preventDefault();
@@ -1517,7 +1677,11 @@ export default function App() {
                                                             audio.onended = () => URL.revokeObjectURL(url);
                                                             void audio.play();
                                                         } }, children: "\u25B6" }), editingAudioId === clip.id ? _jsx("input", { value: audioNameDraft, onChange: (event) => setAudioNameDraft(event.target.value) }) : _jsxs("div", { children: [_jsx("strong", { children: clip.name }), _jsxs("small", { children: [Math.round(clip.durationMs / 1000), " \u79D2"] })] }), _jsxs("div", { className: "audio-actions", children: [editingAudioId === clip.id ? _jsx("button", { onClick: async () => { if (audioNameDraft.trim())
-                                                                    await renamePersonalAudio(clip.id, audioNameDraft.trim()); setEditingAudioId(null); await refreshPersonalAudio(); }, children: "\u4FDD\u5B58" }) : _jsx("button", { onClick: () => { setEditingAudioId(clip.id); setAudioNameDraft(clip.name); }, children: "\u91CD\u547D\u540D" }), _jsx("button", { disabled: !canSend, onClick: () => void onPlayPersonalAudio(clip.id), children: "\u53D1\u9001" }), deleteAudioId === clip.id ? _jsxs(_Fragment, { children: [_jsx("button", { className: "danger", onClick: async () => { await deletePersonalAudio(clip.id); setDeleteAudioId(null); await refreshPersonalAudio(); }, children: "\u786E\u8BA4\u5220\u9664" }), _jsx("button", { onClick: () => setDeleteAudioId(null), children: "\u53D6\u6D88" })] }) : _jsx("button", { onClick: () => setDeleteAudioId(clip.id), children: "\u5220\u9664" })] })] }, clip.id))), !personalAudio.length && _jsx("button", { className: "audio-empty", onClick: () => void recordAudio(), children: "\uFF0B \u6DFB\u52A0\u7B2C\u4E00\u6BB5\u97F3\u9891" })] })] }))] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] }), isCameraSender && _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && _jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) }), _jsx("button", { disabled: cameraControlPending, onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsx("small", { children: "\u6536\u8D77\u9884\u89C8\u4E0D\u4F1A\u505C\u6B62\u53D1\u9001\uFF1B\u5173\u95ED\u4F1A\u771F\u6B63\u91CA\u653E\u786C\u4EF6\u3002" })] }), _jsxs("section", { className: "card connection-quality", children: [_jsx("span", { className: "status-dot" }), rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'] })] })] })) : (_jsxs("section", { className: "card call-idle", children: [_jsx("div", { className: "pet-face", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), callableDevices.length > 1 && _jsx("div", { className: "call-device-list", children: callableDevices.map((device) => _jsxs("label", { children: [_jsx("input", { type: "radio", name: "call-target", checked: callTargetId === device.id, onChange: () => setCallTargetId(device.id) }), device.name] }, device.id)) }), _jsx("button", { className: "primary-button large", disabled: !canCall, onClick: () => void onStartCall(), children: "\u5F00\u59CB\u901A\u8BDD" })] }))] })), activeView === 'settings' && (_jsxs("main", { className: "page settings-page", children: [_jsx("div", { className: "page-heading", children: _jsx("h1", { children: "\u8BBE\u7F6E" }) }), setupRequired ? (_jsxs("section", { className: "card settings-section setup-card", children: [_jsx("p", { className: "setup-step", children: setupStep === 'server' ? '第 1 步，共 2 步' : '第 2 步，共 2 步' }), _jsx("h2", { children: setupStep === 'server' ? '连接你的服务器' : '选择你的身份' }), setupStep === 'server' ? _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u5148\u9A8C\u8BC1\u670D\u52A1\u5668\u5730\u5740\u548C\u5BC6\u94A5\uFF0C\u518D\u9009\u62E9\u8EAB\u4EFD\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668\u5730\u5740", _jsx("input", { value: serverUrl, onChange: (event) => { setServerUrl(event.target.value); resetPairingVerification(); }, placeholder: "https://pet.example.com" })] }), _jsxs("label", { children: ["\u670D\u52A1\u5668\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => { setSecret(event.target.value); resetPairingVerification(); }, placeholder: "\u8F93\u5165\u670D\u52A1\u5668\u5BC6\u94A5" })] })] }), _jsx("div", { className: "settings-actions", children: _jsx("button", { className: "primary-button", disabled: verifyingPairing || !serverUrl.trim() || !secret.trim(), onClick: () => void verifyPairing(), children: verifyingPairing ? '验证中…' : '验证并继续' }) })] }) : _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u8BF7\u9009\u62E9\u8FD9\u53F0\u8BBE\u5907\u5C5E\u4E8E\u8C01\uFF1B\u5207\u6362\u8EAB\u4EFD\u540E\u4ECD\u53EF\u5728\u8BBE\u7F6E\u4E2D\u66F4\u6539\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u6211\u7684\u8EAB\u4EFD", _jsxs("select", { value: memberId, onChange: (event) => setMemberId(event.target.value), children: [_jsx("option", { value: "", children: "\u8BF7\u9009\u62E9\u8EAB\u4EFD" }), verifiedMembers?.map((member) => _jsx("option", { value: member.id, children: member.displayName }, member.id))] })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value) })] })] }), _jsxs("div", { className: "settings-actions", children: [_jsx("button", { onClick: () => { setSetupStage('server'); setMemberId(''); }, children: "\u4E0A\u4E00\u6B65" }), _jsx("button", { className: "primary-button", disabled: !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u4FDD\u5B58\u5E76\u8FDE\u63A5" })] })] })] })) : _jsxs(_Fragment, { children: [_jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8FDE\u63A5" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668", _jsx("input", { value: serverUrl, onChange: (event) => setServerUrl(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u623F\u95F4\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => setSecret(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u5F53\u524D\u8EAB\u4EFD", _jsx("strong", { className: "identity-summary", children: memberId ? knownMemberNames[memberId] : '未选择' }), window.desktopPetControl && _jsx("button", { disabled: status !== 'connected', onClick: () => { if (memberId) {
+                                                                    await renamePersonalAudio(clip.id, audioNameDraft.trim()); setEditingAudioId(null); await refreshPersonalAudio(); }, children: "\u4FDD\u5B58" }) : _jsx("button", { onClick: () => { setEditingAudioId(clip.id); setAudioNameDraft(clip.name); }, children: "\u91CD\u547D\u540D" }), _jsx("button", { disabled: !canSend, onClick: () => void onPlayPersonalAudio(clip.id), children: "\u53D1\u9001" }), deleteAudioId === clip.id ? _jsxs(_Fragment, { children: [_jsx("button", { className: "danger", onClick: async () => { await deletePersonalAudio(clip.id); setDeleteAudioId(null); await refreshPersonalAudio(); }, children: "\u786E\u8BA4\u5220\u9664" }), _jsx("button", { onClick: () => setDeleteAudioId(null), children: "\u53D6\u6D88" })] }) : _jsx("button", { onClick: () => setDeleteAudioId(clip.id), children: "\u5220\u9664" })] })] }, clip.id))), !personalAudio.length && _jsx("button", { className: "audio-empty", onClick: () => void recordAudio(), children: "\uFF0B \u6DFB\u52A0\u7B2C\u4E00\u6BB5\u97F3\u9891" })] })] }))] })), activeView === 'notes' && (_jsxs("main", { className: "page notes-page", children: [_jsxs("div", { className: "page-heading", children: [_jsxs("div", { children: [_jsx("h1", { children: "\u684C\u9762\u4FBF\u7B7E" }), _jsxs("p", { children: ["\u6295\u9012\u540E\u4F1A\u5728", peerName, "\u7684\u684C\u9762\u5C55\u5F00\uFF0C\u7B49\u5F85\u5BF9\u65B9\u660E\u786E\u6279\u9605\u3002"] })] }), _jsxs("div", { className: "segmented", children: [_jsx("button", { className: noteSection === 'compose' ? 'active' : '', onClick: () => setNoteSection('compose'), children: "\u5199\u4FBF\u7B7E" }), _jsx("button", { className: noteSection === 'sent' ? 'active' : '', onClick: () => setNoteSection('sent'), children: "\u5DF2\u53D1\u9001" }), _jsx("button", { className: noteSection === 'history' ? 'active' : '', onClick: () => setNoteSection('history'), children: "\u5386\u53F2" }), _jsx("button", { className: noteSection === 'favorites' ? 'active' : '', onClick: () => setNoteSection('favorites'), children: "\u6536\u85CF" })] })] }), noteSection === 'compose' && (_jsxs("section", { className: "card note-compose", children: [_jsxs("div", { className: "note-paper", style: { background: NOTE_COLORS.find((color) => color.id === noteColor)?.value }, children: [_jsx("textarea", { value: noteBody, onChange: (event) => setNoteBody(event.target.value), placeholder: "\u5199\u4E00\u5F20\u53EF\u4EE5\u7A0D\u540E\u770B\u7684\u4FBF\u7B7E\u2026" }), _jsxs("small", { className: graphemeCount(noteBody) > 1000 ? 'over' : '', children: [graphemeCount(noteBody), " / 1000"] }), noteMediaKind === 'image' && _jsxs("div", { className: "note-attachment-preview", children: ["\u25A7 ", noteImageName || '选择一张图片'] }), (noteMediaKind === 'song' || noteMediaKind === 'video') && _jsx("input", { type: "url", value: noteLink, onChange: (event) => setNoteLink(event.target.value), placeholder: noteMediaKind === 'song' ? '粘贴歌曲链接' : '粘贴视频链接' })] }), _jsxs("div", { className: "note-compose-tools", children: [_jsxs("fieldset", { children: [_jsx("legend", { children: "\u7EB8\u5F20\u989C\u8272" }), _jsx("div", { className: "note-color-row", children: NOTE_COLORS.map((color) => _jsx("button", { className: noteColor === color.id ? 'selected' : '', style: { background: color.value }, title: color.label, "aria-label": color.label, onClick: () => setNoteColor(color.id) }, color.id)) })] }), _jsxs("fieldset", { children: [_jsx("legend", { children: "\u9644\u52A0\u4E00\u79CD\u5185\u5BB9" }), _jsx("div", { className: "button-row", children: ['none', 'image', 'song', 'video'].map((kind) => _jsx("button", { className: noteMediaKind === kind ? 'selected' : '', onClick: () => { setNoteMediaKind(kind); if (kind !== 'image') {
+                                                                setNoteImage(null);
+                                                                setNoteImageName('');
+                                                            } if (kind === 'none' || kind === 'image')
+                                                                setNoteLink(''); }, children: ({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind] }, kind)) })] }), noteMediaKind === 'image' && _jsxs("label", { className: "button-like", children: ["\u9009\u62E9\u56FE\u7247", _jsx("input", { hidden: true, type: "file", accept: "image/jpeg,image/png", onChange: (event) => void onSelectNoteImage(event.target.files?.[0]) })] }), _jsx("button", { className: "primary-button large", disabled: status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000, onClick: () => void onSendNote(), children: noteSending ? '投递中…' : `投递给${peerName}` })] })] })), noteSection === 'sent' && _jsxs("section", { className: "note-record-grid", children: [sentNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !sentNotes.length && _jsx("div", { className: "card notes-empty", children: "\u8FD8\u6CA1\u6709\u53D1\u51FA\u7684\u4FBF\u7B7E\u3002" })] }), noteSection === 'history' && _jsxs("section", { className: "note-record-grid", children: [noteHistory.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !noteHistory.length && _jsx("div", { className: "card notes-empty", children: "\u6279\u9605\u540E\u7684\u4FBF\u7B7E\u4F1A\u5728\u8FD9\u91CC\u4FDD\u7559 30 \u5929\u3002" })] }), noteSection === 'favorites' && _jsxs("section", { className: "note-record-grid", children: [favoriteNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !favoriteNotes.length && _jsx("div", { className: "card notes-empty", children: "\u6536\u85CF\u4F1A\u540C\u6B65\u5230\u4F60\u7684\u6240\u6709\u8BBE\u5907\u3002" })] })] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] }), isCameraSender && _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && _jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) }), _jsx("button", { disabled: cameraControlPending, onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsx("small", { children: "\u6536\u8D77\u9884\u89C8\u4E0D\u4F1A\u505C\u6B62\u53D1\u9001\uFF1B\u5173\u95ED\u4F1A\u771F\u6B63\u91CA\u653E\u786C\u4EF6\u3002" })] }), _jsxs("section", { className: "card connection-quality", children: [_jsx("span", { className: "status-dot" }), rtcRoute.relayed ? '仅音频连接' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'] })] })] })) : (_jsxs("section", { className: "card call-idle", children: [_jsx("div", { className: "pet-face", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), callableDevices.length > 1 && _jsx("div", { className: "call-device-list", children: callableDevices.map((device) => _jsxs("label", { children: [_jsx("input", { type: "radio", name: "call-target", checked: callTargetId === device.id, onChange: () => setCallTargetId(device.id) }), device.name] }, device.id)) }), _jsx("button", { className: "primary-button large", disabled: !canCall, onClick: () => void onStartCall(), children: "\u5F00\u59CB\u901A\u8BDD" })] }))] })), activeView === 'settings' && (_jsxs("main", { className: "page settings-page", children: [_jsx("div", { className: "page-heading", children: _jsx("h1", { children: "\u8BBE\u7F6E" }) }), setupRequired ? (_jsxs("section", { className: "card settings-section setup-card", children: [_jsx("p", { className: "setup-step", children: setupStep === 'server' ? '第 1 步，共 2 步' : '第 2 步，共 2 步' }), _jsx("h2", { children: setupStep === 'server' ? '连接你的服务器' : '选择你的身份' }), setupStep === 'server' ? _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u5148\u9A8C\u8BC1\u670D\u52A1\u5668\u5730\u5740\u548C\u5BC6\u94A5\uFF0C\u518D\u9009\u62E9\u8EAB\u4EFD\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668\u5730\u5740", _jsx("input", { value: serverUrl, onChange: (event) => { setServerUrl(event.target.value); resetPairingVerification(); }, placeholder: "https://pet.example.com" })] }), _jsxs("label", { children: ["\u670D\u52A1\u5668\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => { setSecret(event.target.value); resetPairingVerification(); }, placeholder: "\u8F93\u5165\u670D\u52A1\u5668\u5BC6\u94A5" })] })] }), _jsx("div", { className: "settings-actions", children: _jsx("button", { className: "primary-button", disabled: verifyingPairing || !serverUrl.trim() || !secret.trim(), onClick: () => void verifyPairing(), children: verifyingPairing ? '验证中…' : '验证并继续' }) })] }) : _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u8BF7\u9009\u62E9\u8FD9\u53F0\u8BBE\u5907\u5C5E\u4E8E\u8C01\uFF1B\u5207\u6362\u8EAB\u4EFD\u540E\u4ECD\u53EF\u5728\u8BBE\u7F6E\u4E2D\u66F4\u6539\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u6211\u7684\u8EAB\u4EFD", _jsxs("select", { value: memberId, onChange: (event) => setMemberId(event.target.value), children: [_jsx("option", { value: "", children: "\u8BF7\u9009\u62E9\u8EAB\u4EFD" }), verifiedMembers?.map((member) => _jsx("option", { value: member.id, children: member.displayName }, member.id))] })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value) })] })] }), _jsxs("div", { className: "settings-actions", children: [_jsx("button", { onClick: () => { setSetupStage('server'); setMemberId(''); }, children: "\u4E0A\u4E00\u6B65" }), _jsx("button", { className: "primary-button", disabled: !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u4FDD\u5B58\u5E76\u8FDE\u63A5" })] })] })] })) : _jsxs(_Fragment, { children: [_jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8FDE\u63A5" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668", _jsx("input", { value: serverUrl, onChange: (event) => setServerUrl(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u623F\u95F4\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => setSecret(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u5F53\u524D\u8EAB\u4EFD", _jsx("strong", { className: "identity-summary", children: memberId ? knownMemberNames[memberId] : '未选择' }), window.desktopPetControl && _jsx("button", { disabled: status !== 'connected', onClick: () => { if (memberId) {
                                                                     setIdentityChangeTarget(memberId === 'a' ? 'b' : 'a');
                                                                     setIdentityChangeOpen(true);
                                                                 } }, children: "\u66F4\u6539\u8EAB\u4EFD" })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value), disabled: status === 'connecting' || status === 'connected' })] })] }), identityChangeOpen && _jsxs("div", { className: "identity-change", children: [_jsx("strong", { children: "\u66F4\u6539\u8EAB\u4EFD\u4F1A\u8BA9\u684C\u5BA0\u548C\u63A7\u5236\u7AEF\u77ED\u6682\u91CD\u65B0\u8FDE\u63A5\u3002" }), _jsxs("select", { value: identityChangeTarget, onChange: (event) => setIdentityChangeTarget(event.target.value), children: [_jsx("option", { value: "a", children: knownMemberNames.a }), _jsx("option", { value: "b", children: knownMemberNames.b })] }), _jsx("button", { className: "primary-button", disabled: identityChanging || identityChangeTarget === memberId, onClick: () => void confirmIdentityChange(), children: identityChanging ? '正在更改…' : '确认并重新连接' }), _jsx("button", { disabled: identityChanging, onClick: () => setIdentityChangeOpen(false), children: "\u53D6\u6D88" })] }), _jsxs("div", { className: "settings-actions", children: [_jsx(StatusPill, { status: status }), status === 'connected' || status === 'connecting' ? _jsx("button", { onClick: onDisconnect, children: "\u65AD\u5F00" }) : _jsx("button", { className: "primary-button", disabled: !serverUrl.trim() || !secret.trim() || !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u8FDE\u63A5" })] })] }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u6210\u5458\u540D\u79F0" }), peers.members.map((member) => _jsxs("div", { className: "member-row", children: [_jsx("span", { children: member.id === peers.self.memberId ? '我' : '对方' }), editingMemberId === member.id ? _jsxs(_Fragment, { children: [_jsx("input", { value: memberNameDraft, onChange: (event) => setMemberNameDraft(event.target.value) }), _jsx("button", { onClick: async () => { if (memberNameDraft.trim())
@@ -1533,4 +1697,34 @@ function StatusPill({ status }) {
     };
     const m = map[status];
     return _jsxs("span", { className: `pill ${m.cls}`, children: [_jsx("span", { className: "dot" }), " ", m.text] });
+}
+function NoteAttachmentImage({ noteId, attachment }) {
+    const [url, setUrl] = useState('');
+    useEffect(() => {
+        let active = true;
+        let objectUrl = '';
+        void getNoteAttachment(noteId, attachment.id).then((result) => {
+            if (!active || !result.ok || !result.data)
+                return;
+            objectUrl = URL.createObjectURL(new Blob([result.data], { type: result.mime || attachment.mime }));
+            setUrl(objectUrl);
+        });
+        return () => {
+            active = false;
+            if (objectUrl)
+                URL.revokeObjectURL(objectUrl);
+        };
+    }, [attachment.id, attachment.mime, noteId]);
+    return url ? _jsx("img", { className: "note-record-image", src: url, alt: "\u4FBF\u7B7E\u56FE\u7247" }) : _jsx("span", { className: "note-media-pill", children: "\u6B63\u5728\u52A0\u8F7D\u56FE\u7247\u2026" });
+}
+function NoteRecordCard({ note, onFavorite }) {
+    const color = NOTE_COLORS.find((item) => item.id === note.paperColor)?.value || '#F4D77D';
+    const linkMedia = note.media?.kind === 'song' || note.media?.kind === 'video' ? note.media : null;
+    const openExternal = (event, url) => {
+        if (!window.desktopPetControl)
+            return;
+        event.preventDefault();
+        void window.desktopPetControl.openExternal(url);
+    };
+    return (_jsxs("article", { className: "card note-record", style: { '--note-paper': color }, children: [_jsxs("div", { className: "note-record-head", children: [_jsx("small", { children: new Date(note.createdAt).toLocaleString() }), _jsx("button", { "aria-label": note.favorite ? '取消收藏' : '收藏', onClick: () => onFavorite(note), children: note.favorite ? '★' : '☆' })] }), _jsx("p", { children: note.body || (note.media?.kind === 'image' ? '图片便签' : '分享了一个链接') }), note.media?.kind === 'image' && _jsx(NoteAttachmentImage, { noteId: note.id, attachment: note.media.attachment }), linkMedia?.thumbnailUrl && _jsx("img", { className: "note-record-image", src: linkMedia.thumbnailUrl, alt: "", referrerPolicy: "no-referrer" }), linkMedia && _jsxs("a", { href: linkMedia.url, target: "_blank", rel: "noreferrer", onClick: (event) => openExternal(event, linkMedia.url), children: [linkMedia.kind === 'song' ? '♫' : '▶', " ", linkMedia.source] }), _jsx("div", { className: `note-review-state ${note.review ? 'done' : ''}`, children: note.review ? _jsxs(_Fragment, { children: [_jsxs("strong", { children: ["\u5DF2\u6279\u9605 \u00B7 ", new Date(note.review.reviewedAt).toLocaleString()] }), note.review.body && _jsx("p", { children: note.review.body }), note.review.imageAttachment && _jsx(NoteAttachmentImage, { noteId: note.id, attachment: note.review.imageAttachment })] }) : _jsx("strong", { children: "\u7B49\u5F85\u5BF9\u65B9\u6279\u9605" }) })] }));
 }

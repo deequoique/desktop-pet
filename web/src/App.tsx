@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import {
   connect,
@@ -18,6 +18,7 @@ import {
   setTtsCredentials,
   addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
   getPersonalAudio,
+  createNote, listNotes, setNoteFavorite, getNoteAttachment,
   renameMember, discoverPairing, changeMember,
   reclaimDevice,
   type Command,
@@ -28,12 +29,12 @@ import {
   type TtsVoice,
   type WebRtcSignal,
   type MediaStatus,
-  type PersonalAudio, type PairingMember,
+  type PersonalAudio, type PairingMember, type DesktopNote, type NoteImageInput,
 } from './api';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
 type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
-type ActiveView = 'control' | 'send' | 'call' | 'settings';
+type ActiveView = 'control' | 'send' | 'notes' | 'call' | 'settings';
 type SendView = 'tts' | 'audio';
 type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown' | 'failed';
 type MemberId = 'a' | 'b';
@@ -73,7 +74,9 @@ declare global {
       resetPetScale: () => Promise<PetScaleResult>;
       onPetScaleChanged: (cb: (scale: number) => void) => () => void;
       exportDiagnostics: () => Promise<DiagnosticsExportResult>;
+      openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
       onMediaFloatClosed: (cb: () => void) => () => void;
+      onOpenNoteComposer: (cb: () => void) => () => void;
     };
   }
 }
@@ -104,6 +107,13 @@ const CORNERS: { corner: Corner; label: string }[] = [
   { corner: 'top-right', label: '右上' },
   { corner: 'bottom-left', label: '左下' },
   { corner: 'bottom-right', label: '右下' },
+];
+const NOTE_COLORS: Array<{ id: DesktopNote['paperColor']; label: string; value: string }> = [
+  { id: 'yellow', label: '奶油黄', value: '#F4D77D' },
+  { id: 'pink', label: '温柔粉', value: '#E8B7C8' },
+  { id: 'blue', label: '雾蓝', value: '#AFC9D8' },
+  { id: 'sage', label: '鼠尾草绿', value: '#B8C9A3' },
+  { id: 'lavender', label: '淡紫灰', value: '#C8B7D8' },
 ];
 
 const EMPTY_RTC_ROUTE: RtcRoute = {
@@ -162,6 +172,58 @@ function pairingErrorMessage(code?: string) {
     disconnected: '当前未连接服务器',
   };
   return messages[code || ''] || '操作失败，请重试';
+}
+
+function noteErrorMessage(code?: string) {
+  const messages: Record<string, string> = {
+    disconnected: '尚未连接服务器',
+    invalid_note: '便签内容或附件不符合要求',
+    invalid_image: '图片必须是 2 MB 内的 JPEG 或 PNG',
+    note_inbox_full: '对方便签箱已满',
+    note_pending_image_limit: '对方待批阅图片空间已满',
+    note_room_image_limit: '房间图片空间已满，可改发文字或链接',
+    favorite_limit_reached: '收藏数量已达上限',
+    favorite_image_limit: '收藏图片空间已满',
+    note_storage_failed: '服务器未能保存便签',
+    timeout: '服务器响应超时，请重试',
+  };
+  return messages[code || ''] || '便签操作失败';
+}
+
+function graphemeCount(value: string) {
+  const Segmenter = (Intl as typeof Intl & {
+    Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => {
+      segment(input: string): Iterable<unknown>;
+    };
+  }).Segmenter;
+  if (Segmenter) return [...new Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].length;
+  return [...value].length;
+}
+
+async function compressNoteImage(file: File): Promise<NoteImageInput> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('image_canvas_unavailable');
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  let quality = 0.9;
+  let blob: Blob | null = null;
+  do {
+    blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+    quality -= 0.1;
+  } while (blob && blob.size > 2 * 1024 * 1024 && quality >= 0.4);
+  if (!blob || blob.size > 2 * 1024 * 1024) throw new Error('invalid_image');
+  return { mime: 'image/jpeg', data: await blob.arrayBuffer() };
+}
+
+function upsertNote(items: DesktopNote[], note: DesktopNote) {
+  const current = items.find((item) => item.id === note.id);
+  if (current && current.revision > note.revision) return items;
+  return [note, ...items.filter((item) => item.id !== note.id)];
 }
 
 function explainMediaDevicesUnavailable(): string {
@@ -290,6 +352,17 @@ export default function App() {
   const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>([]);
   const [ttsVoiceId, setTtsVoiceId] = useState(() => localStorage.getItem(LS_TTS_VOICE) || '');
   const [ttsState, setTtsState] = useState('等待发送');
+  const [noteSection, setNoteSection] = useState<'compose' | 'sent' | 'history' | 'favorites'>('compose');
+  const [noteBody, setNoteBody] = useState('');
+  const [noteColor, setNoteColor] = useState<DesktopNote['paperColor']>('yellow');
+  const [noteMediaKind, setNoteMediaKind] = useState<'none' | 'image' | 'song' | 'video'>('none');
+  const [noteLink, setNoteLink] = useState('');
+  const [noteImage, setNoteImage] = useState<NoteImageInput | null>(null);
+  const [noteImageName, setNoteImageName] = useState('');
+  const [noteSending, setNoteSending] = useState(false);
+  const [sentNotes, setSentNotes] = useState<DesktopNote[]>([]);
+  const [noteHistory, setNoteHistory] = useState<DesktopNote[]>([]);
+  const [favoriteNotes, setFavoriteNotes] = useState<DesktopNote[]>([]);
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
   const [petScale, setPetScaleState] = useState(1);
   const [callState, setCallState] = useState<CallState>('idle');
@@ -331,6 +404,7 @@ export default function App() {
   const cameraPendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const cameraSenderDeviceIdRef = useRef('');
   const selfDeviceIdRef = useRef('');
+  const memberIdRef = useRef<MemberId | ''>('');
   const cameraRouteIsP2PRef = useRef(false);
   const cameraRouteKnownRef = useRef(false);
   const cameraDesiredRef = useRef(false);
@@ -348,6 +422,10 @@ export default function App() {
     setToast({ msg, err });
     toastTimer.current = window.setTimeout(() => setToast(null), 2200);
   }, []);
+
+  useEffect(() => {
+    memberIdRef.current = memberId;
+  }, [memberId]);
 
   const stopLocalAudio = useCallback(() => {
     try { localAudioRef.current?.getTracks().forEach((track) => track.stop()); } catch {}
@@ -919,6 +997,23 @@ export default function App() {
         setTtsState(label);
         if (payload.state === 'error') showToast(label, true);
       },
+      onNoteChanged: ({ note }) => {
+        const self = memberIdRef.current;
+        if (note.senderMemberId === self) {
+          setSentNotes((items) => upsertNote(items, note));
+        }
+        setNoteHistory((items) => note.review
+          ? upsertNote(items, note)
+          : items.filter((item) => item.id !== note.id));
+        setFavoriteNotes((items) => note.favorite
+          ? upsertNote(items, note)
+          : items.filter((item) => item.id !== note.id));
+      },
+      onNoteRemoved: ({ noteId }) => {
+        setSentNotes((items) => items.filter((item) => item.id !== noteId));
+        setNoteHistory((items) => items.filter((item) => item.id !== noteId));
+        setFavoriteNotes((items) => items.filter((item) => item.id !== noteId));
+      },
     });
     return () => {
       setListeners({});
@@ -957,6 +1052,15 @@ export default function App() {
     });
     bridge.onPairingChanged(applyConfig);
   }, [showToast]);
+
+  useEffect(() => {
+    const bridge = window.desktopPetControl;
+    if (!bridge) return;
+    return bridge.onOpenNoteComposer(() => {
+      setActiveView('notes');
+      setNoteSection('compose');
+    });
+  }, []);
 
   useEffect(() => {
     const bridge = window.desktopPetControl;
@@ -1248,6 +1352,61 @@ export default function App() {
     const result = await listPersonalAudio();
     if (result?.ok) setPersonalAudio(result.items || []);
   }, []);
+
+  const refreshNotes = useCallback(async () => {
+    const [sent, history, favorites] = await Promise.all([listNotes('sent'), listNotes('history'), listNotes('favorites')]);
+    if (sent.ok) setSentNotes(sent.items || []);
+    if (history.ok) setNoteHistory(history.items || []);
+    if (favorites.ok) setFavoriteNotes(favorites.items || []);
+  }, []);
+
+  useEffect(() => {
+    if (activeView === 'notes' && status === 'connected') void refreshNotes();
+  }, [activeView, refreshNotes, status]);
+
+  const onSelectNoteImage = useCallback(async (file?: File) => {
+    if (!file) return;
+    try {
+      const image = await compressNoteImage(file);
+      setNoteImage(image);
+      setNoteImageName(file.name);
+    } catch {
+      setNoteImage(null);
+      setNoteImageName('');
+      showToast('图片压缩后仍超过 2 MB，或格式无法读取', true);
+    }
+  }, [showToast]);
+
+  const onSendNote = useCallback(async () => {
+    const body = noteBody.trim();
+    if (graphemeCount(body) > 1000) return showToast('便签正文最多 1000 个字符', true);
+    let media: Parameters<typeof createNote>[0]['media'];
+    if (noteMediaKind === 'image') {
+      if (!noteImage) return showToast('请选择一张图片', true);
+      media = { kind: 'image', mime: noteImage.mime, data: noteImage.data };
+    } else if (noteMediaKind === 'song' || noteMediaKind === 'video') {
+      if (!noteLink.trim()) return showToast('请输入外部链接', true);
+      media = { kind: noteMediaKind, url: noteLink.trim() };
+    }
+    if (!body && !media) return showToast('写点内容或添加一个媒体', true);
+    setNoteSending(true);
+    const result = await createNote({ body, paperColor: noteColor, ...(media ? { media } : {}) });
+    setNoteSending(false);
+    if (!result.ok) return showToast(noteErrorMessage(result.code), true);
+    setNoteBody('');
+    setNoteMediaKind('none');
+    setNoteLink('');
+    setNoteImage(null);
+    setNoteImageName('');
+    showToast('便签已投递');
+    await refreshNotes();
+  }, [noteBody, noteColor, noteImage, noteLink, noteMediaKind, refreshNotes, showToast]);
+
+  const toggleNoteFavorite = useCallback(async (note: DesktopNote) => {
+    const result = await setNoteFavorite(note.id, !note.favorite);
+    if (!result.ok) return showToast(noteErrorMessage(result.code), true);
+    await refreshNotes();
+  }, [refreshNotes, showToast]);
 
   useEffect(() => {
     if (status === 'connected') void refreshPersonalAudio();
@@ -1545,6 +1704,7 @@ export default function App() {
         {([
           ['control', '⌁', '控制'],
           ['send', '✦', '发送'],
+          ['notes', '✉', '便签'],
           ['call', '◉', '通话'],
         ] as const).map(([view, icon, label]) => (
           <button key={view} className={`rail-item ${activeView === view ? 'active' : ''}`} onClick={() => setActiveView(view)}>
@@ -1644,6 +1804,39 @@ export default function App() {
           </main>
         )}
 
+        {activeView === 'notes' && (
+          <main className="page notes-page">
+            <div className="page-heading">
+              <div><h1>桌面便签</h1><p>投递后会在{peerName}的桌面展开，等待对方明确批阅。</p></div>
+              <div className="segmented">
+                <button className={noteSection === 'compose' ? 'active' : ''} onClick={() => setNoteSection('compose')}>写便签</button>
+                <button className={noteSection === 'sent' ? 'active' : ''} onClick={() => setNoteSection('sent')}>已发送</button>
+                <button className={noteSection === 'history' ? 'active' : ''} onClick={() => setNoteSection('history')}>历史</button>
+                <button className={noteSection === 'favorites' ? 'active' : ''} onClick={() => setNoteSection('favorites')}>收藏</button>
+              </div>
+            </div>
+            {noteSection === 'compose' && (
+              <section className="card note-compose">
+                <div className="note-paper" style={{ background: NOTE_COLORS.find((color) => color.id === noteColor)?.value }}>
+                  <textarea value={noteBody} onChange={(event) => setNoteBody(event.target.value)} placeholder="写一张可以稍后看的便签…" />
+                  <small className={graphemeCount(noteBody) > 1000 ? 'over' : ''}>{graphemeCount(noteBody)} / 1000</small>
+                  {noteMediaKind === 'image' && <div className="note-attachment-preview">▧ {noteImageName || '选择一张图片'}</div>}
+                  {(noteMediaKind === 'song' || noteMediaKind === 'video') && <input type="url" value={noteLink} onChange={(event) => setNoteLink(event.target.value)} placeholder={noteMediaKind === 'song' ? '粘贴歌曲链接' : '粘贴视频链接'} />}
+                </div>
+                <div className="note-compose-tools">
+                  <fieldset><legend>纸张颜色</legend><div className="note-color-row">{NOTE_COLORS.map((color) => <button key={color.id} className={noteColor === color.id ? 'selected' : ''} style={{ background: color.value }} title={color.label} aria-label={color.label} onClick={() => setNoteColor(color.id)} />)}</div></fieldset>
+                  <fieldset><legend>附加一种内容</legend><div className="button-row">{(['none', 'image', 'song', 'video'] as const).map((kind) => <button key={kind} className={noteMediaKind === kind ? 'selected' : ''} onClick={() => { setNoteMediaKind(kind); if (kind !== 'image') { setNoteImage(null); setNoteImageName(''); } if (kind === 'none' || kind === 'image') setNoteLink(''); }}>{({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind]}</button>)}</div></fieldset>
+                  {noteMediaKind === 'image' && <label className="button-like">选择图片<input hidden type="file" accept="image/jpeg,image/png" onChange={(event) => void onSelectNoteImage(event.target.files?.[0])} /></label>}
+                  <button className="primary-button large" disabled={status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000} onClick={() => void onSendNote()}>{noteSending ? '投递中…' : `投递给${peerName}`}</button>
+                </div>
+              </section>
+            )}
+            {noteSection === 'sent' && <section className="note-record-grid">{sentNotes.map((note) => <NoteRecordCard key={note.id} note={note} onFavorite={toggleNoteFavorite} />)}{!sentNotes.length && <div className="card notes-empty">还没有发出的便签。</div>}</section>}
+            {noteSection === 'history' && <section className="note-record-grid">{noteHistory.map((note) => <NoteRecordCard key={note.id} note={note} onFavorite={toggleNoteFavorite} />)}{!noteHistory.length && <div className="card notes-empty">批阅后的便签会在这里保留 30 天。</div>}</section>}
+            {noteSection === 'favorites' && <section className="note-record-grid">{favoriteNotes.map((note) => <NoteRecordCard key={note.id} note={note} onFavorite={toggleNoteFavorite} />)}{!favoriteNotes.length && <div className="card notes-empty">收藏会同步到你的所有设备。</div>}</section>}
+          </main>
+        )}
+
         {activeView === 'call' && (
           <main className={`page call-page ${callActive ? 'active-call' : ''}`}>
             <audio ref={remoteMicAudioRef} autoPlay muted={remoteMicMuted} /><audio ref={remoteSystemAudioRef} autoPlay muted={remoteSystemMuted} />
@@ -1696,4 +1889,44 @@ function StatusPill({ status }: { status: Status }) {
   };
   const m = map[status];
   return <span className={`pill ${m.cls}`}><span className="dot" /> {m.text}</span>;
+}
+
+function NoteAttachmentImage({ noteId, attachment }: { noteId: string; attachment: { id: string; mime: string } }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void getNoteAttachment(noteId, attachment.id).then((result) => {
+      if (!active || !result.ok || !result.data) return;
+      objectUrl = URL.createObjectURL(new Blob([result.data], { type: result.mime || attachment.mime }));
+      setUrl(objectUrl);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [attachment.id, attachment.mime, noteId]);
+  return url ? <img className="note-record-image" src={url} alt="便签图片" /> : <span className="note-media-pill">正在加载图片…</span>;
+}
+
+function NoteRecordCard({ note, onFavorite }: { note: DesktopNote; onFavorite: (note: DesktopNote) => void }) {
+  const color = NOTE_COLORS.find((item) => item.id === note.paperColor)?.value || '#F4D77D';
+  const linkMedia = note.media?.kind === 'song' || note.media?.kind === 'video' ? note.media : null;
+  const openExternal = (event: ReactMouseEvent<HTMLAnchorElement>, url: string) => {
+    if (!window.desktopPetControl) return;
+    event.preventDefault();
+    void window.desktopPetControl.openExternal(url);
+  };
+  return (
+    <article className="card note-record" style={{ '--note-paper': color } as CSSProperties}>
+      <div className="note-record-head"><small>{new Date(note.createdAt).toLocaleString()}</small><button aria-label={note.favorite ? '取消收藏' : '收藏'} onClick={() => onFavorite(note)}>{note.favorite ? '★' : '☆'}</button></div>
+      <p>{note.body || (note.media?.kind === 'image' ? '图片便签' : '分享了一个链接')}</p>
+      {note.media?.kind === 'image' && <NoteAttachmentImage noteId={note.id} attachment={note.media.attachment} />}
+      {linkMedia?.thumbnailUrl && <img className="note-record-image" src={linkMedia.thumbnailUrl} alt="" referrerPolicy="no-referrer" />}
+      {linkMedia && <a href={linkMedia.url} target="_blank" rel="noreferrer" onClick={(event) => openExternal(event, linkMedia.url)}>{linkMedia.kind === 'song' ? '♫' : '▶'} {linkMedia.source}</a>}
+      <div className={`note-review-state ${note.review ? 'done' : ''}`}>
+        {note.review ? <><strong>已批阅 · {new Date(note.review.reviewedAt).toLocaleString()}</strong>{note.review.body && <p>{note.review.body}</p>}{note.review.imageAttachment && <NoteAttachmentImage noteId={note.id} attachment={note.review.imageAttachment} />}</> : <strong>等待对方批阅</strong>}
+      </div>
+    </article>
+  );
 }

@@ -21,4 +21,22 @@ contextBridge.exposeInMainWorld('pet', {
   savePairingConfig: (config) => ipcRenderer.invoke('pet:save-pairing-config', config),
   onPairingChanged: (cb) => ipcRenderer.on('pet:pairing-changed', (_e, config) => cb(config)),
   getDesktopSourceId: () => ipcRenderer.invoke('pet:desktop-source-id'),
+  openExternal: (url) => ipcRenderer.invoke('note:open-external', url),
+  isGameMode: () => ipcRenderer.invoke('note:is-game-mode'),
+  openNoteComposer: () => ipcRenderer.send('note:open-composer'),
+  onGameModeChanged: (cb) => {
+    const handler = (_event, enabled) => cb(enabled);
+    ipcRenderer.on('note:game-mode-changed', handler);
+    return () => ipcRenderer.removeListener('note:game-mode-changed', handler);
+  },
+  onNoteWindowClosed: (cb) => {
+    const handler = (_event, frameName) => cb(frameName);
+    ipcRenderer.on('note-window:closed', handler);
+    return () => ipcRenderer.removeListener('note-window:closed', handler);
+  },
+  onNoteWindowInteracted: (cb) => {
+    const handler = (_event, frameName) => cb(frameName);
+    ipcRenderer.on('note-window:interacted', handler);
+    return () => ipcRenderer.removeListener('note-window:interacted', handler);
+  },
 });

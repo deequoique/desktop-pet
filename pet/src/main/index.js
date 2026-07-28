@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage, session } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage, session, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -188,6 +188,8 @@ function defaultBottomRight() {
 let win = null;
 let controlWin = null;
 let mediaFloatWin = null;
+const noteWindows = new Map();
+const noteWindowsHiddenForGame = new Set();
 let tray = null;
 let gameMode = false;
 let petDragging = false;
@@ -209,6 +211,124 @@ function displaySnapshot(display) {
     scaleFactor: display.scaleFactor,
     rotation: display.rotation,
   };
+}
+
+function isNoteFrameName(frameName) {
+  return frameName === 'note-stack' || /^note-card:[0-9a-f-]{36}$/i.test(frameName);
+}
+
+function noteWindowKey(frameName) {
+  return frameName === 'note-stack' ? 'stack' : frameName.slice('note-card:'.length);
+}
+
+function defaultNoteBounds(frameName) {
+  const saved = loadState()?.noteLayouts?.[noteWindowKey(frameName)];
+  const display = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
+    ? screen.getDisplayMatching(saved)
+    : screen.getDisplayMatching(win?.getBounds() || screen.getPrimaryDisplay().workArea);
+  const fallbackWidth = frameName === 'note-stack' ? 360 : 320;
+  const fallbackHeight = frameName === 'note-stack' ? 500 : 380;
+  const petBounds = win?.getBounds() || display.workArea;
+  const offset = noteWindows.size * 24;
+  const requested = saved && Number.isFinite(saved.width) && Number.isFinite(saved.height)
+    ? { ...saved, width: Math.max(260, saved.width), height: Math.max(220, saved.height) }
+    : {
+        x: petBounds.x - fallbackWidth - 16 + offset,
+        y: petBounds.y + petBounds.height - fallbackHeight - offset,
+        width: fallbackWidth,
+        height: fallbackHeight,
+      };
+  return clampBoundsToWorkArea(requested, display.workArea);
+}
+
+function persistNoteWindowBounds(frameName, child) {
+  if (!child || child.isDestroyed()) return;
+  const state = loadState() || {};
+  patchState({
+    noteLayouts: {
+      ...(state.noteLayouts || {}),
+      [noteWindowKey(frameName)]: child.getBounds(),
+    },
+  });
+}
+
+function clampNoteWindowsToVisibleArea() {
+  for (const [frameName, child] of noteWindows) {
+    if (child.isDestroyed()) continue;
+    const bounds = child.getBounds();
+    const display = screen.getDisplayMatching(bounds);
+    child.setBounds(clampBoundsToWorkArea(bounds, display.workArea));
+    persistNoteWindowBounds(frameName, child);
+  }
+}
+
+function closeNoteWindows() {
+  for (const child of noteWindows.values()) {
+    if (!child.isDestroyed()) child.close();
+  }
+  noteWindows.clear();
+  noteWindowsHiddenForGame.clear();
+}
+
+function setupNoteWindowManager() {
+  win.webContents.setWindowOpenHandler(({ url, frameName }) => {
+    if (url !== 'about:blank' || !isNoteFrameName(frameName)) return { action: 'deny' };
+    const bounds = defaultNoteBounds(frameName);
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        ...bounds,
+        minWidth: 260,
+        minHeight: 220,
+        frame: false,
+        transparent: true,
+        hasShadow: true,
+        resizable: true,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        show: !gameMode,
+        backgroundColor: '#00000000',
+        title: frameName === 'note-stack' ? '便签堆' : '桌面便签',
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+        },
+      },
+    };
+  });
+  win.webContents.on('did-create-window', (child, details) => {
+    const frameName = details.frameName;
+    if (!isNoteFrameName(frameName)) {
+      child.close();
+      return;
+    }
+    const previous = noteWindows.get(frameName);
+    if (previous && !previous.isDestroyed() && previous !== child) previous.close();
+    noteWindows.set(frameName, child);
+    child.setAlwaysOnTop(true, 'floating');
+    child.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    child.setFullScreenable(false);
+    const reportInteraction = () => {
+      if (frameName.startsWith('note-card:') && win && !win.isDestroyed()) {
+        win.webContents.send('note-window:interacted', frameName);
+      }
+    };
+    child.on('move', () => persistNoteWindowBounds(frameName, child));
+    child.on('resize', () => persistNoteWindowBounds(frameName, child));
+    child.on('will-move', reportInteraction);
+    child.on('will-resize', reportInteraction);
+    child.on('closed', () => {
+      noteWindows.delete(frameName);
+      noteWindowsHiddenForGame.delete(frameName);
+      if (win && !win.isDestroyed()) win.webContents.send('note-window:closed', frameName);
+    });
+    if (gameMode) {
+      noteWindowsHiddenForGame.add(frameName);
+      child.hide();
+    } else {
+      child.showInactive();
+    }
+  });
 }
 
 function allDisplaySnapshots() {
@@ -426,6 +546,22 @@ function setGameMode(enabled) {
     // any part of the pet clickable while the user is playing. When leaving
     // game mode, start from pass-through until the next renderer hit-test.
     win.setIgnoreMouseEvents(true);
+    win.webContents.send('note:game-mode-changed', gameMode);
+  }
+  if (gameMode) {
+    noteWindowsHiddenForGame.clear();
+    for (const [frameName, child] of noteWindows) {
+      if (!child.isDestroyed() && child.isVisible()) {
+        noteWindowsHiddenForGame.add(frameName);
+        child.hide();
+      }
+    }
+  } else {
+    for (const frameName of noteWindowsHiddenForGame) {
+      const child = noteWindows.get(frameName);
+      if (child && !child.isDestroyed()) child.showInactive();
+    }
+    noteWindowsHiddenForGame.clear();
   }
   rebuildTrayMenu();
 }
@@ -535,6 +671,7 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  setupNoteWindowManager();
 
   // 默认整窗穿透；渲染层 raycast 命中模型时再切换。
   // 注意：macOS 上 forward:true 不可靠，所以我们用主进程轮询 cursor，不依赖 OS 转发。
@@ -563,9 +700,16 @@ function createWindow() {
     actualBounds: win.getBounds(),
     display: displaySnapshot(initialDisplay),
   });
-  win.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
+  win.webContents.on('did-finish-load', () => {
+    broadcastScaleChanged(currentScale());
+    win.webContents.send('note:game-mode-changed', gameMode);
+  });
   win.webContents.on('render-process-gone', (_event, details) => {
+    closeNoteWindows();
     diagnostic('pet-render-process-gone', details);
+  });
+  win.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
+    if (isMainFrame) closeNoteWindows();
   });
   win.on('unresponsive', () => diagnostic('pet-window-unresponsive', currentWindowSnapshot()));
 
@@ -588,6 +732,15 @@ function showControlWindow() {
     controlWin.show();
     controlWin.focus();
   }
+}
+
+function showNoteComposer() {
+  showControlWindow();
+  const send = () => {
+    if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('note:open-composer');
+  };
+  if (controlWin.webContents.isLoading()) controlWin.once('ready-to-show', send);
+  else send();
 }
 
 function createControlWindow() {
@@ -805,6 +958,18 @@ ipcMain.handle('pet:server-url', () => configuredServerUrl());
 
 // 房间密钥：必须存在于 server 的 ROOM_SECRETS / ROOM_SECRET 中。真实密钥不要提交进 Git。
 ipcMain.handle('pet:room-secret', () => configuredRoomSecret());
+ipcMain.handle('note:is-game-mode', () => gameMode);
+ipcMain.handle('note:open-external', async (_event, rawUrl) => {
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (!['http:', 'https:'].includes(url.protocol)) return { ok: false, error: 'unsupported_protocol' };
+    await shell.openExternal(url.toString());
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'invalid_url' };
+  }
+});
+ipcMain.on('note:open-composer', () => showNoteComposer());
 
 ipcMain.handle('pet:pairing-config', () => pairingSnapshot());
 ipcMain.handle('pet:save-pairing-config', (_e, config) => {
@@ -861,16 +1026,19 @@ function onDisplayMetricsChanged(_event, display, changedMetrics) {
     petWindow: currentWindowSnapshot(),
   });
   clampMediaFloatToVisibleArea();
+  clampNoteWindowsToVisibleArea();
 }
 
 function onDisplayAdded(_event, display) {
   diagnostic('display-added', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
   clampMediaFloatToVisibleArea();
+  clampNoteWindowsToVisibleArea();
 }
 
 function onDisplayRemoved(_event, display) {
   diagnostic('display-removed', { display: displaySnapshot(display), displays: allDisplaySnapshots() });
   clampMediaFloatToVisibleArea();
+  clampNoteWindowsToVisibleArea();
 }
 
 function onUncaughtException(error, origin) {
@@ -923,6 +1091,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   app.isQuiting = true;
+  closeNoteWindows();
 });
 
 app.on('will-quit', () => {
