@@ -36,6 +36,10 @@ test('note bridge limits external navigation and cleans up lifecycle listeners',
 
 test('pet renderer exposes the stack, explicit review, reply media, and no note sound', () => {
   assert.match(rendererHtml, /id="notes-dock"/);
+  assert.match(rendererSource, /function toggleNoteStack\(\)[\s\S]*?noteStackWindow\.close\(\);[\s\S]*?noteStackWindow = null;[\s\S]*?return;/);
+  assert.match(rendererSource, /notesDock\.addEventListener\('click', toggleNoteStack\)/);
+  assert.match(rendererSource, /renderNoteStack\(true\)/);
+  assert.match(rendererSource, /sheet\.scrollHeight \+ 16[\s\S]*?child\.screen\.availHeight - 40[\s\S]*?child\.resizeTo/);
   assert.match(rendererSource, /note:list/);
   assert.match(rendererSource, /note:mark-noticed/);
   assert.match(rendererSource, /note:review/);

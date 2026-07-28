@@ -1609,7 +1609,7 @@ function openNoteCard(noteId: string) {
   void renderNoteCard(noteId, child);
 }
 
-function renderNoteStack() {
+function renderNoteStack(fitToContent = false) {
   const child = noteStackWindow;
   if (!child || child.closed) return;
   const doc = child.document;
@@ -1649,15 +1649,28 @@ function renderNoteStack() {
     sheet.append(row);
   }
   doc.body.replaceChildren(sheet);
+  if (fitToContent) {
+    sheet.style.height = 'auto';
+    const contentHeight = Math.ceil(sheet.scrollHeight + 16);
+    const maxHeight = Math.max(220, child.screen.availHeight - 40);
+    child.resizeTo(
+      Math.max(260, child.outerWidth),
+      Math.min(maxHeight, Math.max(220, contentHeight)),
+    );
+    sheet.style.height = '';
+  }
 }
 
-function openNoteStack() {
+function toggleNoteStack() {
   if (noteGameMode) return;
-  if (!noteStackWindow || noteStackWindow.closed) {
-    noteStackWindow = window.open('about:blank', 'note-stack', 'popup=yes');
-    if (!noteStackWindow) return;
+  if (noteStackWindow && !noteStackWindow.closed) {
+    noteStackWindow.close();
+    noteStackWindow = null;
+    return;
   }
-  renderNoteStack();
+  noteStackWindow = window.open('about:blank', 'note-stack', 'popup=yes');
+  if (!noteStackWindow) return;
+  renderNoteStack(true);
 }
 
 function reconcileNote(note: DesktopNote, announce: boolean) {
@@ -1703,7 +1716,7 @@ async function refreshNoteInbox(openCards = false) {
   }
 }
 
-notesDock.addEventListener('click', openNoteStack);
+notesDock.addEventListener('click', toggleNoteStack);
 notesDock.addEventListener('pointerenter', () => petBridge.setClickable(true));
 petBridge.isGameMode().then((enabled) => { noteGameMode = enabled; }).catch(() => {});
 petBridge.onGameModeChanged((enabled) => {
