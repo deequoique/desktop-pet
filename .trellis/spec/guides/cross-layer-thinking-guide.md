@@ -54,6 +54,8 @@ Electron IPC：renderer → preload bridge → Electron main → OS/文件系统
 - [ ] signal 带 call ID，并拒绝过期 call。
 - [ ] `remoteDescription` 之前收到的 ICE candidate 被暂存。
 - [ ] offer/answer 和 candidate 的处理在 controller/pet 两端保持兼容。
+- [ ] React listener effect 的 cleanup 只移除它安装的 listener；依赖变化重绑 listener 时不会 teardown 仍活跃的 call。
+- [ ] 跨 `await` 的 WebRTC continuation 用 call ID/peer identity 丢弃过期结果；并发初始化复用同一个 in-flight Promise。
 - [ ] teardown 关闭 peer connection，停止本地 track，清空 stream、candidate 和 call ID。
 - [ ] disconnect、hangup、call end、track end、connection failure 都能进入清理路径。
 

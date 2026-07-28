@@ -1130,7 +1130,7 @@ io.on('connection', (socket) => {
       return;
     }
     const media = String(payload?.media || '');
-    if (!['screen', 'camera'].includes(media) || typeof payload?.enabled !== 'boolean') {
+    if (media !== 'screen' || typeof payload?.enabled !== 'boolean') {
       reject('invalid_media');
       return;
     }
@@ -1138,17 +1138,9 @@ io.on('connection', (socket) => {
       reject('not_allowed');
       return;
     }
-    let targetId = null;
-    if (media === 'screen') {
-      const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
-        ? call.targetDeviceId : call.initiatorDeviceId;
-      targetId = room.participants.get(targetDeviceId)?.pet;
-    } else if (socket.data.participantId === call.initiatorDeviceId) {
-      targetId = room.participants.get(call.targetDeviceId)?.controller;
-    } else {
-      reject('not_allowed');
-      return;
-    }
+    const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
+      ? call.targetDeviceId : call.initiatorDeviceId;
+    const targetId = room.participants.get(targetDeviceId)?.pet;
     if (!targetId) {
       reject('peer_unavailable');
       return;
@@ -1177,8 +1169,11 @@ io.on('connection', (socket) => {
     if (!['available', 'paused', 'unavailable'].includes(state)) return;
     let targetId = null;
     if (media === 'camera') {
-      if (socket.data?.role !== 'controller' || socket.data.participantId !== room.call.targetDeviceId) return;
-      targetId = room.participants.get(room.call.initiatorDeviceId)?.controller;
+      if (socket.data?.role !== 'controller') return;
+      if (![room.call.initiatorDeviceId, room.call.targetDeviceId].includes(socket.data.participantId)) return;
+      const peerDeviceId = socket.data.participantId === room.call.initiatorDeviceId
+        ? room.call.targetDeviceId : room.call.initiatorDeviceId;
+      targetId = room.participants.get(peerDeviceId)?.controller;
     } else {
       if (socket.data?.role !== 'pet') return;
       if (![room.call.initiatorDeviceId, room.call.targetDeviceId].includes(socket.data.participantId)) return;
@@ -1193,7 +1188,9 @@ io.on('connection', (socket) => {
     ]);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
     io.to(targetId).emit('webrtc:media-status', {
-      callId: room.callId, media, state, ...(reason ? { reason } : {}),
+      callId: room.callId, media, state,
+      ...(media === 'camera' ? { sourceDeviceId: socket.data.participantId } : {}),
+      ...(reason ? { reason } : {}),
     });
   });
 
@@ -1221,6 +1218,7 @@ io.on('connection', (socket) => {
       io.to(participant.controller).emit('call:start', {
         callId: room.callId,
         peerDeviceId: participant.id === self.id ? peer.id : self.id,
+        cameraOffererDeviceId: room.call.initiatorDeviceId,
         cameraSenderDeviceId: room.call.targetDeviceId,
       });
     }

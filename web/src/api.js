@@ -44,15 +44,15 @@ export function connect(serverUrl, secret, identity) {
     });
     s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));
     s.on('webrtc:camera-signal', (signal) => listeners.onCameraSignal?.(signal));
-    s.on('webrtc:media-control', (control) => listeners.onMediaControl?.(control));
     s.on('webrtc:hangup', () => listeners.onHangup?.());
     s.on('webrtc:error', (payload) => {
         listeners.onRtcError?.(payload?.message || '通话出错');
     });
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('call:start', (payload) => {
-        if (payload?.callId)
-            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraSenderDeviceId);
+        if (payload?.callId) {
+            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraOffererDeviceId, payload.cameraSenderDeviceId);
+        }
     });
     s.on('call:end', (payload) => {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);

@@ -33,3 +33,14 @@ test('media permission is scoped to application webContents and macOS declares u
   assert.equal(typeof packageConfig.build.mac.extendInfo.NSMicrophoneUsageDescription, 'string');
   assert.equal(packageConfig.build.mac.extendInfo.NSCameraUseContinuityCameraDeviceType, true);
 });
+
+test('controller camera is bidirectional, locally controlled, and listener refresh does not tear down calls', () => {
+  assert.match(appSource, /addTransceiver\('video', \{ direction: 'sendrecv' \}\)/);
+  assert.match(appSource, /videoTransceiver\.direction = 'sendrecv'/);
+  assert.match(appSource, /cameraSenderRef\.current = videoTransceiver\.sender/);
+  assert.match(appSource, /const toggleCamera = useCallback[\s\S]*?await setLocalCameraEnabled\(enabled\)/);
+  assert.doesNotMatch(appSource, /requestMediaControl\(\{ callId, media: 'camera'/);
+  assert.match(appSource, /return \(\) => setListeners\(\{\}\);/);
+  assert.doesNotMatch(appSource, /return \(\) => \{\s*setListeners\(\{\}\);\s*teardownCall/);
+  assert.doesNotMatch(appSource, /isCameraSender/);
+});

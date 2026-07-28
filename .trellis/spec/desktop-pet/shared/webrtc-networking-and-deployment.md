@@ -61,35 +61,53 @@ screen/microphone/system-audio status 只能由当前 call 的 pet 发出；came
 
 正确：server 短期签发、host-only 降级、relay audio-only、非致命屏幕状态、一次 ICE restart，以及外部 allocation/带宽验收。
 
-## 8. Scenario: call-scoped screen authority and one-way camera
+## 8. Scenario: call-scoped screen authority and bidirectional camera
 
 ### 1. Scope / Trigger
 
 - Trigger：修改通话媒体开关、摄像头信令、摄像头采集、统一媒体视图或系统浮窗时。
-- 屏幕共享的开关权只属于观看端 controller；pet 只执行，不能提供本地停止入口。摄像头是单向 sender→viewer 媒体，但 sender 和 viewer 双方都可开关。
+- 屏幕共享的开关权属于观看端 controller；pet 只执行，不能提供本地停止入口。摄像头是 controller↔controller 双向媒体，每端只能开关和采集自己的摄像头。
 
 ### 2. Signatures
 
 ```ts
-type CallStart = { callId:string; peerDeviceId:string; cameraSenderDeviceId:string };
-type MediaControl = { callId:string; media:'screen'|'camera'; enabled:boolean };
+type CallStart = {
+  callId:string;
+  peerDeviceId:string;
+  cameraOffererDeviceId:string;
+  cameraSenderDeviceId:string; // 过渡兼容字段，新逻辑不得用于限制发送方
+};
+type MediaControl = { callId:string; media:'screen'; enabled:boolean };
 type CameraSignal = {
   callId:string;
   description?:RTCSessionDescriptionInit|null;
   candidate?:RTCIceCandidateInit|null;
 };
+type CameraStatus = {
+  callId:string;
+  media:'camera';
+  state:'available'|'paused'|'unavailable';
+  reason?:'relay_audio_only'|'controller_disabled'|'capture_failed'|
+    'permission_denied'|'device_lost'|'track_ended';
+  sourceDeviceId?:string; // server 转发时从已认证 socket 注入
+};
 
 socket.emit('webrtc:media-control', control, ack);
 socket.emit('webrtc:camera-signal', signal);
+socket.emit('webrtc:media-status', cameraStatus);
 ```
 
-Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera sender answer 后保存对应 `RTCRtpSender`，开启使用 `replaceTrack(track)`，关闭必须先 `replaceTrack(null)` 再 `track.stop()`。
+Call initiator 是固定 camera offerer，创建一个 `sendrecv` video transceiver 并保存 sender。Answerer 在 `setRemoteDescription(offer)` 后把对应 transceiver 设为 `sendrecv` 并保存 sender。双方开启都使用自己的 `replaceTrack(track)`；关闭必须先 `replaceTrack(null)` 再 `track.stop()`。
 
 ### 3. Contracts
 
-- `call:start` 的 target device 是 `cameraSenderDeviceId`，initiator 是 camera viewer。
-- `screen` control 从任一 call controller 路由到另一 call device 的 pet；`camera` control 只允许 initiator controller 路由到 target controller。
-- sender 本地 camera UI 调用相同本地状态转换，不通过 server 请求自身授权。
+- `call:start.cameraOffererDeviceId` 固定为 call initiator。过渡期保留 `cameraSenderDeviceId = targetDeviceId`，但新客户端只把它用于推导旧 server 的 offerer，不能据此禁止任一方发送。
+- `webrtc:camera-signal` 只在当前 call 的两个 controller 之间双向路由。双方各自保存 sender、local desired/status、local stream；remote status/stream 必须独立保存。
+- 任一 call controller 都可上报自己的 camera status。server 忽略客户端伪造的 `sourceDeviceId`，以 `socket.data.participantId` 覆盖后只发给另一 controller。
+- `webrtc:media-control` 只接受 screen。旧客户端发送 camera control 时返回 `invalid_media` 且不得转发；camera UI 直接调用本地采集状态转换。
+- camera 默认关闭。权限拒绝、设备丢失、camera ICE 失败或协议不兼容只能关闭/暂停 camera path，不能 teardown 主屏幕/音频通话。
+- React Socket listener effect 的 cleanup 只执行 `setListeners({})`；整通话 teardown 只属于挂断、call end/error 和组件卸载。依赖变化导致 listener 重绑时不得停止 tracks 或关闭 peer connections。
+- 所有跨 `await` 的主通话和 camera 初始化/信令 continuation 都要用 `callId` 与当前 PC identity 做 generation guard。并发 offer/candidate 初始化必须复用同一个 in-flight camera PC Promise。
 - pet 保存 `screenRequestedByController`，实际 enabled 必须为 `screenRequestedByController && routeIsConfirmedP2P`。
 - Electron 浮窗只允许 `about:blank` + frame name `media-float`，可自由调整宽高、置顶、持久化并 clamp bounds；不得调用 `setAspectRatio` 锁定比例，原生关闭只返回控制面板，不结束 call。
 - 系统浮窗是纯媒体画布：portal/detached 状态不得挂载 `.media-controls`、surface label、状态或占位内容；屏幕/摄像头主画面铺满 client area，视频统一 `object-fit: contain` 以完整显示且不裁切。所有操作只留在嵌入式控制面板，并使用一致的紧凑按钮尺寸。
@@ -101,7 +119,7 @@ Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera s
 | --- | --- |
 | 未加入、错误/过期 call ID | `not_in_call` 或静默丢弃 fire-and-forget signal/status |
 | media/`enabled` 非法 | `invalid_media` |
-| camera sender 尝试远控 camera | `not_allowed` |
+| 任一 controller 尝试通过 media-control 远控 camera | `invalid_media`，不转发 |
 | 目标 endpoint 离线 | `peer_unavailable` |
 | 非 call device、错误 role、其他 room | 不转发任何 signal/control/status |
 | camera permission denied/device lost | `unavailable/permission_denied` 或 `unavailable/device_lost`，原 call 保持 |
@@ -109,32 +127,40 @@ Camera viewer 是固定 offerer，创建 `recvonly` video transceiver；camera s
 
 ### 5. Good/Base/Bad Cases
 
-- Good：viewer 开 camera，sender 只采集一次并显示本地预览，P2P 确认后同一 track 发送；任一方关闭后硬件灯熄灭。系统浮窗只显示媒体，可自由改变宽高，并以 `contain` 完整显示画面。
-- Base：camera off、screen on；关闭浮窗后媒体视图回嵌入页，call 和 tracks 不重建。
-- Bad：pet 暴露屏幕停止按钮；客户端传 socket ID；camera 合并进稳定的 screen/audio PC；relay route 未确认就 attach video；只隐藏 preview DOM 却不释放 camera；浮窗内继续渲染按钮/状态、使用 `cover` 裁切内容或锁定固定宽高比。
+- Good：A 发起后 A、B 分别打开自己的 camera；两端各采集一次、显示本地预览并向对端发送，同一按钮只释放本机硬件。系统浮窗只显示远端媒体。
+- Base：双方 camera 默认 off、screen on；关闭浮窗后媒体视图回嵌入页，call 和 tracks 不重建。camera 单侧失败时另一方向及主音频保持。
+- Bad：listener effect 因 camera state 变化执行 teardown；A 的按钮远程打开 B 的摄像头；双方同时 create offer 产生 glare；客户端伪造 camera status source；只隐藏 preview DOM 却不释放硬件。
 
 ### 6. Tests Required
 
-- Server integration：断言 screen control 只到配对 pet，camera control/signal 只到指定 sender controller，camera status 只到 viewer；wrong role、stale call、非 call device 无泄漏。
-- Pet/Web build：TypeScript 通过，生成 `web/src/*.js` 与 TS 同步；teardown 停止 tracks、关闭两个 PC、清 candidate 与 DOM `srcObject`。
+- Server integration：断言 screen control 只到配对 pet；camera signal/status 双向到另一 controller；status source 不能伪造；camera control 双方均为 `invalid_media`；wrong role、stale call、非 call device和其他 room 无泄漏。
+- Web source/runtime：断言 offerer/answerer 均为 `sendrecv`、双方保存 sender、camera 开关只调用本地转换；listener cleanup 不调用 teardown；async continuation 有 call generation guard。
+- Pet/Web build：TypeScript 通过，生成 `web/src/*.js` 与 TS 同步；teardown 停止双方本地 tracks、关闭两个 PC、清 in-flight init/candidate 与 DOM `srcObject`。
 - Electron test/package：断言 window allowlist、topmost/resizable/bounds persistence、无 aspect-ratio lock、preload listener cleanup；检查成品 Info.plist 三个 camera/microphone key。
 - Renderer source regression：断言 float portal 不挂载 controls/label/placeholder，主 surface 填满 client area，视频为 `object-fit: contain`，嵌入式按钮采用统一紧凑尺寸。
-- 双机手工：双方 camera 开关、设备切换/热拔插、屏幕远停/恢复、TURN audio-only、浮窗移动/任意宽高缩放/完整无裁切显示/关闭/显示器变化。
+- 双机手工：A/B 分别发起；双方按不同顺序及同时开启 camera；任一方关闭、设备切换/热拔插/拒权不影响另一方向与主通话；屏幕远停/恢复、TURN audio-only、浮窗移动/缩放/关闭。
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```ts
-cameraVideo.hidden = true; // hardware and RTP keep running
+return () => {
+  setListeners({});
+  teardownCall(); // state change rebinds listeners and destroys the active call
+};
+requestMediaControl({ callId, media: 'camera', enabled: true }); // controls peer hardware
+pc.addTransceiver('video', { direction: 'recvonly' }); // preserves one-way camera
 screenTrack.enabled = true; // selected route is still unknown/relay
-mediaFloatWin.setAspectRatio(16 / 9);
-video.style.objectFit = 'cover'; // crops shared content
 ```
 
 #### Correct
 
 ```ts
+return () => setListeners({});
+useEffect(() => () => teardownCall(), [teardownCall]); // unmount ownership
+const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+cameraSenderRef.current = transceiver.sender;
 await cameraSender.replaceTrack(null);
 cameraTrack.stop();
 screenTrack.enabled = screenRequestedByController && routeIsConfirmedP2P;
