@@ -415,3 +415,37 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: 实现异步桌面便签
+
+**Date**: 2026-07-28
+**Task**: 实现异步桌面便签
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+实现成员级异步便签、桌面卡片与便签堆、显式批阅回复、跨设备收藏、持久化配额与历史清理，并完成 Electron 端到端验收。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b21daf4` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
