@@ -20,7 +20,10 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Main Changes
 
-- Detailed change bullets were not supplied; see the summary above.
+- Camera negotiation now uses a fixed offerer and bidirectional `sendrecv`; each controller captures, previews, toggles, and releases only its own camera.
+- Socket listener cleanup no longer tears down an active call; async call/camera continuations use generation guards and serialized sender mutation.
+- TURN relay applies fixed screen 640×360/5fps/240 kbit/s and camera 320×180/10fps/120 kbit/s limits, with machine-readable media quality and fail-closed video behavior.
+- Server routing tests, profile unit tests, UI status, Trellis contracts, troubleshooting, release, and coturn capacity docs were updated.
 
 ### Git Commits
 
@@ -30,7 +33,11 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Testing
 
-- Validation was not recorded for this session.
+- `npm test --prefix server` — 11 passed.
+- `npm test --prefix pet` — 26 passed.
+- `npm run build:web` and `npm run build:pet` — passed.
+- `bash -n server/deploy/install-coturn-ubuntu.sh` and `git diff --check` — passed.
+- Electron control-panel smoke test through CDP — no runtime/console errors.
 
 ### Status
 
@@ -38,7 +45,7 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Next Steps
 
-- None - task complete
+- Run the documented two-device forced-relay 10-minute matrix against the real coturn host and record outbound RTP/coturn throughput evidence.
 
 
 ## Session 2: 双栈 WebRTC 与 TURN 音频兜底
@@ -437,6 +444,42 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 | Hash | Message |
 |------|---------|
 | `b21daf4` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 14: 双向摄像头与 TURN 低清视频
+
+**Date**: 2026-07-29
+**Task**: 双向摄像头与 TURN 低清视频
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+修复通话 listener cleanup 误 teardown，升级为双方仅控制本机的双向摄像头，并为 TURN 屏幕与摄像头增加固定 relay-low profile、质量状态、测试和部署说明。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e13dfa6` | (see git log) |
+| `596f6eb` | (see git log) |
+| `5d7d964` | (see git log) |
 
 ### Testing
 
