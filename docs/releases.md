@@ -2,6 +2,16 @@
 
 正式发布由 `v*` tag 触发 GitHub Actions。流程构建 Windows NSIS、macOS x64/arm64 包，以及带生产依赖的 Linux server 压缩包。`PET_SERVER_URL` 从 GitHub Secret 生成客户端生产配置，房间密钥、ElevenLabs Key 和 DashScope Key 不进入安装包。
 
+## v1.6.1-beta.3
+
+这是用于复测 P2P 长时间卡顿和 5fps 自锁的测试版。服务器协议没有变化，参与测试的双方客户端应同时升级。
+
+- 修复健康 IPv4/IPv6 P2P 因 Chromium 初始 `availableOutgoingBitrate` 偏低而被永久锁在 1 档、5fps 的问题；该估算现在只作为延长升档观察的软信号。
+- P2P 屏幕共享改为独立调整清晰度与帧率，内部按 `480p30 → 720p30 → 720p45 → 1080p45 → 1080p60 → 2K60 → 2K90` 逐级试探。
+- P2P 编码器优先维持帧率；普通拥塞沿状态表逐级回退，严重 RTT、丢包或抖动可立即回到 480p30。
+- TURN 继续固定为 640×360、5fps、240 kbit/s，不增加中继服务器流量。
+- 诊断包新增帧率目标、网络健康目标、带宽估算档位和状态变化原因，便于区分真实拥塞与恢复试探。
+
 ## v1.6.1-beta.2
 
 这是用于真实 IPv4/TURN 网络复测的自适应画质 Beta，服务器和参与测试的双方客户端需要同时升级。
