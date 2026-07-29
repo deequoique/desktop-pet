@@ -2,6 +2,16 @@
 
 正式发布由 `v*` tag 触发 GitHub Actions。流程构建 Windows NSIS、macOS x64/arm64 包，以及带生产依赖的 Linux server 压缩包。`PET_SERVER_URL` 从 GitHub Secret 生成客户端生产配置，房间密钥、ElevenLabs Key 和 DashScope Key 不进入安装包。
 
+## v1.6.1-beta.2
+
+这是用于真实 IPv4/TURN 网络复测的自适应画质 Beta，服务器和参与测试的双方客户端需要同时升级。
+
+- 通话侧栏实时显示网络等级、有效路径、RTT、接收码率、帧率和当前视频档位。
+- 屏幕共享和双方摄像头改为五档画质，根据 RTT、带宽、丢包、抖动和 RTP 状态快速降档、稳定后逐档恢复；TURN 始终锁定最低档以优先保证声音与画面连续。
+- 修复 coturn 私网 allocation 经公网 NAT 后显示为 `prflx` 而被误判为 P2P 的问题；TURN host、`relayProtocol` 和 relay alias 现在使用统一判定。
+- 周期诊断改为有界的 selected-pair/RTP 摘要，常见的 ICE 600/701 网卡探测失败不再制造 incident 写入风暴。
+- coturn 部署验证新增 `external-ip`、`relay-ip` 与 relay 端口范围检查；公网/私网双地址服务器必须配置精确映射。
+
 ## v1.6.1-beta.1
 
 这是用于真实网络故障复盘的诊断 Beta，服务器和参与测试的双方客户端需要同时升级。
