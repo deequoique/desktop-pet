@@ -2,6 +2,16 @@
 
 正式发布由 `v*` tag 触发 GitHub Actions。流程构建 Windows NSIS、macOS x64/arm64 包，以及带生产依赖的 Linux server 压缩包。`PET_SERVER_URL` 从 GitHub Secret 生成客户端生产配置，房间密钥、ElevenLabs Key 和 DashScope Key 不进入安装包。
 
+## v1.6.1-beta.1
+
+这是用于真实网络故障复盘的诊断 Beta，服务器和参与测试的双方客户端需要同时升级。
+
+- 设置页新增“诊断与故障”，由用户主动导出单个 JSON 诊断包；应用不会后台上传。
+- 自动记录 renderer/main 异常、崩溃 metadata、异常退出、Socket、媒体权限和稳定错误码，并在用户下次打开控制面板时显示持久 fatal 提示。
+- WebRTC 记录 ICE gathering、候选生成/排队/添加结果、STUN 错误和 selected candidate pair；保留 IPv4/IPv6 地址、端口、协议与 RTT 以定位直连失败。
+- 服务端输出可按 `callId` 对齐的结构化 JSON，并在通话结束时汇总主通话/摄像头的 offer、answer、candidate 类型和转发结果。
+- 新增 PM2 20 MB × 7 份压缩轮转配置和服务器诊断操作说明；诊断中不会包含密钥、完整 SDP、原始 candidate、便签/TTS 正文或媒体内容。
+
 ## v1.6.0
 
 这是一次需要服务器和双方客户端同步升级的异步桌面便签版本。
