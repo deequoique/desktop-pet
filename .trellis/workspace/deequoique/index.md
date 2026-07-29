@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
-- **Last Active**: 2026-07-29
+- **Total Sessions**: 17
+- **Last Active**: 2026-07-30
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~563 | Active |
+| `journal-1.md` | ~597 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-07-30 | 修复服务器更新后的持久数据丢失 | `e9d3ad7` | `codex/call-video-reliability` |
 | 16 | 2026-07-29 | 修复 WebRTC P2P 带宽估算自锁 | `e0af588` | `codex/call-video-reliability` |
 | 15 | 2026-07-29 | WebRTC 五档自适应与有效 TURN 判路 | `ef0048f`, `440b9e2` | `codex/call-video-reliability` |
 | 14 | 2026-07-29 | 双向摄像头与 TURN 低清视频 | `e13dfa6`, `596f6eb`, `5d7d964` | `codex/call-video-reliability` |

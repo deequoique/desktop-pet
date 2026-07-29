@@ -561,3 +561,37 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 17: 修复服务器更新后的持久数据丢失
+
+**Date**: 2026-07-30
+**Task**: 修复服务器更新后的持久数据丢失
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+将 Linux 生产数据默认迁移到 /var/lib/desktop-pet，新增 legacy 数据冲突保护、完整目录迁移回归测试，以及 Git pull/备份/恢复部署文档。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e9d3ad7` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
