@@ -1183,14 +1183,16 @@ io.on('connection', (socket) => {
     }
     if (!targetId) return;
     const allowedReasons = new Set([
-      'relay_audio_only', 'controller_disabled', 'capture_failed',
-      'permission_denied', 'device_lost', 'track_ended',
+      'controller_disabled', 'capture_failed', 'permission_denied',
+      'device_lost', 'track_ended', 'profile_failed',
     ]);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
+    const quality = ['normal', 'relay-low'].includes(payload?.quality) ? payload.quality : undefined;
     io.to(targetId).emit('webrtc:media-status', {
       callId: room.callId, media, state,
       ...(media === 'camera' ? { sourceDeviceId: socket.data.participantId } : {}),
       ...(reason ? { reason } : {}),
+      ...(quality ? { quality } : {}),
     });
   });
 

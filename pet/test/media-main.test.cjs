@@ -7,6 +7,7 @@ const mainSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'in
 const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'control-preload.js'), 'utf8');
 const packageConfig = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
 const appSource = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'src', 'App.tsx'), 'utf8');
+const petRendererSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'main.ts'), 'utf8');
 const controlStyles = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'src', 'control-panel.css'), 'utf8');
 
 test('media floating window is allowlisted, resizable, topmost, and reports native close', () => {
@@ -43,4 +44,16 @@ test('controller camera is bidirectional, locally controlled, and listener refre
   assert.match(appSource, /return \(\) => setListeners\(\{\}\);/);
   assert.doesNotMatch(appSource, /return \(\) => \{\s*setListeners\(\{\}\);\s*teardownCall/);
   assert.doesNotMatch(appSource, /isCameraSender/);
+});
+
+test('TURN keeps bounded low-resolution screen and camera video with fail-closed profiles', () => {
+  assert.match(petRendererSource, /applyVideoSenderProfile\(sender, screenTrack, profile, 'screen'\)/);
+  assert.match(petRendererSource, /screenProfileApplyChain\.catch\(\(\) => \{\}\)\.then/);
+  assert.match(petRendererSource, /screenTrack\.enabled = false;[\s\S]*?if \(!applied\.ok\)[\s\S]*?screenTrack\.enabled = true/);
+  assert.match(appSource, /applyVideoSenderProfile\(sender, track, profile, 'camera'\)/);
+  assert.match(appSource, /cameraProfileApplyChainRef\.current\.catch\(\(\) => \{\}\)\.then/);
+  assert.match(appSource, /await sender\.replaceTrack\(null\);[\s\S]*?if \(!applied\.ok\)[\s\S]*?await sender\.replaceTrack\(track\)/);
+  assert.match(appSource, /TURN 低清视频/);
+  assert.doesNotMatch(appSource, /TURN 音频兜底|relay_audio_only/);
+  assert.doesNotMatch(petRendererSource, /screenRouteIsP2P|relay_audio_only/);
 });

@@ -8,8 +8,8 @@
 
 - Server 验证房间、call ID和角色，签发 TURN REST 临时凭据。
 - Controller 是唯一 ICE restart offerer；一次失败周期最多 restart 一次，等待15秒。
-- Pet 采集媒体并根据 selected pair 决定是否启用 screen track。
-- coturn 提供 STUN 与最终 relay；relay 只保证音频。
+- Pet 采集媒体并根据 selected pair 对 screen sender 应用 normal 或 relay-low profile。
+- Controller 对本机 camera sender 应用同样的 route profile；coturn 提供 STUN 与最终受限低清 relay。
 
 ## 3. Configuration contract
 
@@ -28,24 +28,27 @@ type MediaStatus = {
   callId: string;
   media: 'screen'|'camera'|'microphone'|'system-audio';
   state: 'available'|'paused'|'unavailable';
-  reason?: 'relay_audio_only'|'controller_disabled'|'capture_failed'|
-    'permission_denied'|'device_lost'|'track_ended';
+  quality?: 'normal'|'relay-low';
+  reason?: 'controller_disabled'|'capture_failed'|'permission_denied'|
+    'device_lost'|'track_ended'|'profile_failed';
 };
 ```
 
-screen/microphone/system-audio status 只能由当前 call 的 pet 发出；camera status 只能由 `cameraSenderDeviceId` 对应 controller 发出。事件只路由给该媒体的观看 controller。事件名、枚举和类型副本必须同步。
+screen/microphone/system-audio status 只能由当前 call 的 pet 发出；camera status 可由当前 call 任一 controller 发出，并由 server 注入真实 source。事件只路由给该媒体的观看 controller。事件名、枚举和类型副本必须同步。
 
 ## 5. Route and media invariants
 
 - 每次创建 peer connection 前请求 server config；失败时 host-only，不恢复 Google STUN。
 - selected pair 同时兼容 transport `selectedCandidatePairId` 与 nominated/succeeded pair。
-- Screen track 初始禁用。只有明确判定非 relay 后启用；unknown 不能启用。
-- relay 时 screen 保持禁用并上报 `paused/relay_audio_only`，麦克风继续。
+- Screen/camera video track 初始禁用或保持 null。只有 selected pair 明确为 normal/relay-low 且对应 sender profile 成功应用后才能启用/attach；unknown/failed 不能发送。
+- relay-low screen 固定不超过 640×360、5fps、240 kbit/s；每路 camera 固定不超过 320×180、10fps、120 kbit/s。scale 按采集尺寸等比计算且不得放大小源。
+- P2P 恢复 normal profile，撤销 relay bitrate/framerate cap 并恢复 scale 1；route 切换不得重新捕获或改变用户 desired。
+- 同一 sender 的 profile mutation 必须串行执行，并在执行前后检查 route generation；只做异步结果 guard 不够，因为过期的 `setParameters()` 仍可能覆盖最新硬上限。
+- relay profile `setParameters()` 失败时对应视频 fail closed 并上报 `profile_failed`，麦克风/系统声音继续。
 - 屏幕拒绝或 track ended 只上报媒体状态，不能结束可用的音频连接。
 - disconnected/failed 时 pet 不 hangup；controller restart一次，恢复清 timer并重新判路，15秒超时后才结束 call。
 - call ID过滤、candidate 暂存与集中幂等 teardown 必须保留。
-- camera 使用独立 controller↔controller peer connection；发送端 controller 独占 camera track，同一 track 同时供本地预览和远端 sender。
-- camera 和 screen 均不得通过 relay 发送；camera 选中 relay 时 sender 保持 null track，本地预览可以继续。
+- camera 使用独立 controller↔controller peer connection；每端 controller 独占自己的 camera track，同一 track 同时供本地预览和自己的远端 sender。
 
 ## 6. Deployment contract
 
@@ -59,7 +62,7 @@ screen/microphone/system-audio status 只能由当前 call 的 pet 发出；came
 
 错误：客户端硬编码公共 STUN；route 未确认就启用视频；任何 disconnected 立即 `call:end`；把 shared secret 发给客户端；部署脚本静默开放云安全组。
 
-正确：server 短期签发、host-only 降级、relay audio-only、非致命屏幕状态、一次 ICE restart，以及外部 allocation/带宽验收。
+正确：server 短期签发、host-only 降级、relay-low 硬上限、profile 失败时单视频 fail closed、一次 ICE restart，以及外部 allocation/带宽验收。
 
 ## 8. Scenario: call-scoped screen authority and bidirectional camera
 
@@ -87,8 +90,9 @@ type CameraStatus = {
   callId:string;
   media:'camera';
   state:'available'|'paused'|'unavailable';
-  reason?:'relay_audio_only'|'controller_disabled'|'capture_failed'|
-    'permission_denied'|'device_lost'|'track_ended';
+  quality?:'normal'|'relay-low';
+  reason?:'controller_disabled'|'capture_failed'|'permission_denied'|
+    'device_lost'|'track_ended'|'profile_failed';
   sourceDeviceId?:string; // server 转发时从已认证 socket 注入
 };
 
@@ -108,7 +112,7 @@ Call initiator 是固定 camera offerer，创建一个 `sendrecv` video transcei
 - camera 默认关闭。权限拒绝、设备丢失、camera ICE 失败或协议不兼容只能关闭/暂停 camera path，不能 teardown 主屏幕/音频通话。
 - React Socket listener effect 的 cleanup 只执行 `setListeners({})`；整通话 teardown 只属于挂断、call end/error 和组件卸载。依赖变化导致 listener 重绑时不得停止 tracks 或关闭 peer connections。
 - 所有跨 `await` 的主通话和 camera 初始化/信令 continuation 都要用 `callId` 与当前 PC identity 做 generation guard。并发 offer/candidate 初始化必须复用同一个 in-flight camera PC Promise。
-- pet 保存 `screenRequestedByController`，实际 enabled 必须为 `screenRequestedByController && routeIsConfirmedP2P`。
+- pet 保存 `screenRequestedByController`，实际 enabled 必须为 desired、route profile 明确且 sender profile 应用成功三者同时成立。
 - Electron 浮窗只允许 `about:blank` + frame name `media-float`，可自由调整宽高、置顶、持久化并 clamp bounds；不得调用 `setAspectRatio` 锁定比例，原生关闭只返回控制面板，不结束 call。
 - 系统浮窗是纯媒体画布：portal/detached 状态不得挂载 `.media-controls`、surface label、状态或占位内容；屏幕/摄像头主画面铺满 client area，视频统一 `object-fit: contain` 以完整显示且不裁切。所有操作只留在嵌入式控制面板，并使用一致的紧凑按钮尺寸。
 - 摄像头/麦克风权限只允许 pet/control app webContents；macOS 包必须声明 camera、microphone 与 Continuity Camera usage。
@@ -123,7 +127,8 @@ Call initiator 是固定 camera offerer，创建一个 `sendrecv` video transcei
 | 目标 endpoint 离线 | `peer_unavailable` |
 | 非 call device、错误 role、其他 room | 不转发任何 signal/control/status |
 | camera permission denied/device lost | `unavailable/permission_denied` 或 `unavailable/device_lost`，原 call 保持 |
-| selected pair 为 relay | screen/camera null或disabled，`paused/relay_audio_only`，音频保持 |
+| selected pair 为 relay | 成功应用固定 relay-low 参数后发送并上报 `available/relay-low` |
+| relay-low 参数缺少尺寸或 `setParameters()` 失败 | 对应视频 null/disabled，`unavailable/profile_failed`，音频保持 |
 
 ### 5. Good/Base/Bad Cases
 
@@ -138,7 +143,7 @@ Call initiator 是固定 camera offerer，创建一个 `sendrecv` video transcei
 - Pet/Web build：TypeScript 通过，生成 `web/src/*.js` 与 TS 同步；teardown 停止双方本地 tracks、关闭两个 PC、清 in-flight init/candidate 与 DOM `srcObject`。
 - Electron test/package：断言 window allowlist、topmost/resizable/bounds persistence、无 aspect-ratio lock、preload listener cleanup；检查成品 Info.plist 三个 camera/microphone key。
 - Renderer source regression：断言 float portal 不挂载 controls/label/placeholder，主 surface 填满 client area，视频为 `object-fit: contain`，嵌入式按钮采用统一紧凑尺寸。
-- 双机手工：A/B 分别发起；双方按不同顺序及同时开启 camera；任一方关闭、设备切换/热拔插/拒权不影响另一方向与主通话；屏幕远停/恢复、TURN audio-only、浮窗移动/缩放/关闭。
+- 双机手工：A/B 分别发起；双方按不同顺序及同时开启 camera；任一方关闭、设备切换/热拔插/拒权不影响另一方向与主通话；屏幕远停/恢复、TURN relay-low 上限与恢复、浮窗移动/缩放/关闭。
 
 ### 7. Wrong vs Correct
 
@@ -163,7 +168,8 @@ const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
 cameraSenderRef.current = transceiver.sender;
 await cameraSender.replaceTrack(null);
 cameraTrack.stop();
-screenTrack.enabled = screenRequestedByController && routeIsConfirmedP2P;
+const applied = await applyVideoSenderProfile(screenSender, screenTrack, routeProfile, 'screen');
+screenTrack.enabled = screenRequestedByController && applied.ok;
 const controls = !floatContainer && <div className="media-controls">...</div>;
 // .media-float-root .media-surface.primary { inset: 0 }
 // video { object-fit: contain }

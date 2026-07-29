@@ -1,6 +1,6 @@
 # Ubuntu 24.04 coturn 部署手册
 
-本手册面向执行部署的 agent：从一台具有公网 IPv4 的 Ubuntu Server 24.04 LTS 64-bit 开始，为 desktop-pet 部署自建 STUN/TURN。媒体仍优先 P2P；只有打洞失败才走 TURN，且应用在 relay 路径上只保留音频。
+本手册面向执行部署的 agent：从一台具有公网 IPv4 的 Ubuntu Server 24.04 LTS 64-bit 开始，为 desktop-pet 部署自建 STUN/TURN。媒体仍优先 P2P；只有打洞失败才走 TURN，relay 路径使用固定最低清屏幕与摄像头 profile 并优先保证音频。
 
 ## 输入契约与停止条件
 
@@ -49,7 +49,7 @@ sudo server/deploy/install-coturn-ubuntu.sh --verify --config /root/desktop-pet-
 
 生成 secret 可用 `openssl rand -base64 48`，只写入 mode 600 的配置文件，不能作为命令行参数、聊天内容或日志输出。脚本将安装 coturn、备份原配置到 `/var/lib/desktop-pet-coturn/backup/`、写入 `/etc/turnserver.conf`、按需增加带 `desktop-pet-coturn` 注释的 UFW 规则，并更新应用 `.env`。重启应用 server 后，新通话才会取得配置。
 
-默认限制 `max-bps=64000` bytes/s、`bps-capacity=250000` bytes/s、每用户4个 allocation、总计8个；应用同时把每条音频 sender 限到约64 kbit/s，适合3 Mbps小实例上的两人音频兜底。视频在 TURN 上会被应用禁用；这些限制不是多人容量承诺。
+默认限制 `max-bps=64000` bytes/s（约 512 kbit/s）、`bps-capacity=250000` bytes/s（约 2 Mbit/s）、每用户4个 allocation、总计8个。应用把每条音频 sender 限到约64 kbit/s，relay 屏幕固定不超过 240 kbit/s，每路摄像头不超过 120 kbit/s。单个 screen+双音频方向的媒体上限约 368 kbit/s，低于单 allocation 限制；双向 screen、双向 camera 与音频的批准 payload 总上限约 976 kbit/s，仍需为 RTP/RTCP、重传和网络开销保留余量。这些限制只面向一组两人通话，不是多人容量承诺。
 
 ## 配置映射
 
@@ -73,7 +73,8 @@ turnutils_stunclient -p 3478 127.0.0.1
 - STUN 能返回 srflx 地址。
 - 用 server 签发的正确临时凭据可 allocation；错误或过期凭据必须失败。
 - `all` 下可直连时 UI 显示 host/srflx，TURN 出网不增长。
-- `relay` 下双方音频可用、屏幕显示“仅音频”且不持续发送视频。
+- `relay` 下双方音频连续可懂，UI 显示“TURN 低清视频”；outbound RTP 证明 screen 不超过 640×360/5fps/240 kbit/s，每路 camera 不超过 320×180/10fps/120 kbit/s。
+- screen、双向 camera 和音频同时持续 10 分钟，观察 packet loss、RTT、audio concealment、coturn allocation 与主机出网；不能持续触发限流或音频断续。
 - 断网少于15秒可经一次 ICE restart 恢复；超时才挂断。
 - 用 `nload`、`iftop` 或云监控观察出网，确认未突破实例带宽。
 
@@ -93,7 +94,7 @@ sudo server/deploy/install-coturn-ubuntu.sh --rollback --config /root/desktop-pe
 
 ## 腾讯云附录
 
-在腾讯云 CVM 的实例详情核对公网 IPv4、内网 IPv4和带宽上限；在关联安全组增加上述四组入站规则，并在云监控观察公网出带宽。当前3 Mbps实例应保持默认音频限速，TURN只作最终兜底。腾讯云按带宽购买且上限不高于10 Mbps的常见实例，公网入带宽通常高于购买的出带宽，但必须以实例控制台显示的实际策略为准；容量判断以出方向3 Mbps为硬约束。
+在腾讯云 CVM 的实例详情核对公网 IPv4、内网 IPv4和带宽上限；在关联安全组增加上述四组入站规则，并在云监控观察公网出带宽。当前3 Mbps实例必须保持默认音频限速和批准的 relay-low 视频上限，TURN只作最终兜底。腾讯云按带宽购买且上限不高于10 Mbps的常见实例，公网入带宽通常高于购买的出带宽，但必须以实例控制台显示的实际策略为准；容量判断以出方向3 Mbps为硬约束。
 
 ## Agent 验收报告模板
 
@@ -107,7 +108,10 @@ coturn active/listening：
 本机STUN：
 外部STUN与TURN allocation：
 错误/过期credential拒绝：
-Electron强制relay音频/视频结果：
+Electron强制relay音频/低清视频结果：
+Outbound RTP屏幕尺寸/fps/bitrate：
+Outbound RTP摄像头尺寸/fps/bitrate：
+Packet loss/RTT/audio concealment：
 带宽峰值：
 回滚验证：
 未完成项或风险：

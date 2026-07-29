@@ -68,7 +68,8 @@ export type MediaStatus = {
   callId: string;
   media: 'screen' | 'camera' | 'microphone' | 'system-audio';
   state: 'available' | 'paused' | 'unavailable';
-  reason?: 'relay_audio_only' | 'controller_disabled' | 'capture_failed' | 'permission_denied' | 'device_lost' | 'track_ended';
+  quality?: 'normal' | 'relay-low';
+  reason?: 'controller_disabled' | 'capture_failed' | 'permission_denied' | 'device_lost' | 'track_ended' | 'profile_failed';
   sourceDeviceId?: string;
 };
 
