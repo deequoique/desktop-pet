@@ -42,7 +42,14 @@ function emitAck(socket, event, payload) {
 
 server = spawn(process.execPath, ['src/index.js'], {
   cwd: new URL('..', import.meta.url),
-  env: { ...process.env, PORT: String(port), ROOM_SECRETS: 'alpha,beta', ROOM_GRACE_MS: '40', PET_DATA_DIR: dataDir },
+  env: {
+    ...process.env,
+    NODE_ENV: 'test',
+    PORT: String(port),
+    ROOM_SECRETS: 'alpha,beta',
+    ROOM_GRACE_MS: '40',
+    PET_DATA_DIR: dataDir,
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 await new Promise((resolve, reject) => {

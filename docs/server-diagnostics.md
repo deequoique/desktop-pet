@@ -22,4 +22,4 @@ tail -f /var/log/desktop-pet/server.log
 jq 'select(.correlation.callId == "要检查的 callId")' /var/log/desktop-pet/server.log
 ```
 
-启动后应同时看到 `server.started` JSON 事件和兼容旧运维检查的 `pet server listening` 文本。`server.started.context.rtc` 会显示 STUN/TURN 数量和 ICE policy，但不会输出 shared secret。
+启动后应同时看到 `server.started` JSON 事件和兼容旧运维检查的 `pet server listening` 文本。`server.started.context.dataDir` 显示本次进程实际使用的持久目录；生产环境默认应为 `/var/lib/desktop-pet`。`server.started.context.rtc` 会显示 STUN/TURN 数量和 ICE policy，但不会输出 shared secret。

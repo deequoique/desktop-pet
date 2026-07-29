@@ -19,24 +19,42 @@ function withTempDir(run) {
   finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 
-test('registry persists names, devices, and member-private audio', () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pet-store-'));
+test('complete data directory migration preserves names, devices, audio, notes, and attachments', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pet-store-migration-'));
+  const legacyDirectory = path.join(root, 'legacy');
+  const persistentDirectory = path.join(root, 'persistent');
   let now = Date.UTC(2026, 0, 1);
   try {
-    const store = new PersistentStore(directory, () => now);
+    const store = new PersistentStore(legacyDirectory, () => now);
     store.renameMember('room', 'a', 'Alice');
     store.touchDevice('room', 'a', 'device-1', 'Laptop');
     const audio = store.addAudio('room', 'a', {
       name: 'Hello', mime: 'audio/mpeg', extension: 'mp3', durationMs: 1000, data: Buffer.from('audio'),
     });
-    const reloaded = new PersistentStore(directory, () => now);
+    const noteImage = png();
+    const createdNote = store.createNote('room', 'a', {
+      body: 'Persistent note',
+      paperColor: 'yellow',
+      media: { kind: 'image', image: { mime: 'image/png', data: noteImage } },
+    });
+    assert.equal(createdNote.ok, true);
+    fs.cpSync(legacyDirectory, persistentDirectory, { recursive: true });
+    const reloaded = new PersistentStore(persistentDirectory, () => now);
     assert.equal(reloaded.room('room').members.a.displayName, 'Alice');
     assert.equal(reloaded.devices('room', 'a')[0].name, 'Laptop');
     assert.equal(reloaded.audio('room', 'a')[0].id, audio.id);
     assert.equal(reloaded.audio('room', 'b').length, 0);
     assert.equal(fs.readFileSync(reloaded.audioPath('room', 'a', audio.id).file, 'utf8'), 'audio');
+    const notes = reloaded.listNotes('room', 'b', 'inbox');
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].body, 'Persistent note');
+    const attachment = notes[0].media.attachment;
+    assert.deepEqual(
+      fs.readFileSync(reloaded.noteAttachmentPath('room', 'b', notes[0].id, attachment.id).file),
+      noteImage
+    );
   } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

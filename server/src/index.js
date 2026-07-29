@@ -7,6 +7,7 @@ import { Readable } from 'stream';
 import fs from 'node:fs';
 import { Server as SocketIOServer } from 'socket.io';
 import WebSocket from 'ws';
+import { prepareDataDirectory } from './data-directory.js';
 import { PersistentStore } from './persistent-store.js';
 import { createServerDiagnostics, normalizeHttpRoute } from './diagnostics.js';
 
@@ -114,8 +115,9 @@ const NOTE_LIMITS = {
   roomImageMaxBytes: boundedIntEnv('NOTE_ROOM_IMAGE_MAX_BYTES', 2 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024),
   historyTtlMs: boundedIntEnv('NOTE_HISTORY_TTL_DAYS', 30, 3650) * 24 * 60 * 60 * 1000,
 };
+const STORE_DATA_DIR = prepareDataDirectory();
 const store = new PersistentStore(
-  process.env.PET_DATA_DIR || new URL('../data', import.meta.url).pathname,
+  STORE_DATA_DIR,
   () => Date.now(),
   NOTE_LIMITS,
 );
@@ -1503,6 +1505,7 @@ httpServer.listen(PORT, () => {
       ttsReady: managedTtsReady(),
       socketReady: true,
       configuredRooms: ROOM_SECRET_HASHES.size,
+      dataDir: STORE_DATA_DIR,
       rtc: {
         stunCount: RTC_STUN_URLS.length,
         turnCount: RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET ? RTC_TURN_URLS.length : 0,
@@ -1514,5 +1517,6 @@ httpServer.listen(PORT, () => {
   console.log(`pet server listening on :${PORT}`);
   console.log(`  tts:    ${managedTtsReady() ? `${TTS_PROVIDER} managed (${managedTtsModel()}, voices=${ALLOWED_VOICES.length})` : `${TTS_PROVIDER} managed disabled`}${TTS_PROVIDER === 'elevenlabs' ? '; BYOK available' : ''}`);
   console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
+  console.log(`  data:   ${STORE_DATA_DIR}`);
   console.log(`  rtc:    stun=${RTC_STUN_URLS.length} turn=${RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET ? RTC_TURN_URLS.length : 0} policy=${RTC_ICE_TRANSPORT_POLICY}${RTC_TURN_REALM ? ` realm=${RTC_TURN_REALM}` : ''}`);
 });

@@ -58,7 +58,7 @@ bash deploy/configure-pm2-logs.sh
 pm2 save
 ```
 
-启动日志中的 `server.started.context.rtc` 必须显示预期的 STUN/TURN 数量和 `iceTransportPolicy`。完整的结构化日志、轮转和按 `callId` 提取方法见 [服务端诊断日志](server-diagnostics.md)。
+启动日志中的 `server.started.context.dataDir` 必须指向预期的外部持久目录（默认 `/var/lib/desktop-pet`），`server.started.context.rtc` 必须显示预期的 STUN/TURN 数量和 `iceTransportPolicy`。完整的结构化日志、轮转和按 `callId` 提取方法见 [服务端诊断日志](server-diagnostics.md)。
 
 默认限制 `max-bps=64000` bytes/s（约 512 kbit/s）、`bps-capacity=250000` bytes/s（约 2 Mbit/s）、每用户4个 allocation、总计8个。应用把每条音频 sender 限到约64 kbit/s，relay 屏幕固定不超过 240 kbit/s，每路摄像头不超过 120 kbit/s。单个 screen+双音频方向的媒体上限约 368 kbit/s，低于单 allocation 限制；双向 screen、双向 camera 与音频的批准 payload 总上限约 976 kbit/s，仍需为 RTP/RTCP、重传和网络开销保留余量。这些限制只面向一组两人通话，不是多人容量承诺。
 
