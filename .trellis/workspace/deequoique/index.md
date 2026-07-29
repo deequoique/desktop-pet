@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
+- **Total Sessions**: 15
 - **Last Active**: 2026-07-29
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~487 | Active |
+| `journal-1.md` | ~529 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-07-29 | WebRTC 五档自适应与有效 TURN 判路 | `ef0048f`, `440b9e2` | `codex/call-video-reliability` |
 | 14 | 2026-07-29 | 双向摄像头与 TURN 低清视频 | `e13dfa6`, `596f6eb`, `5d7d964` | `codex/call-video-reliability` |
 | 13 | 2026-07-28 | 实现异步桌面便签 | `b21daf4` | `master` |
 | 12 | 2026-07-22 | Simplify floating media UI | `bbc3c94` | `master` |

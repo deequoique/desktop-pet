@@ -492,3 +492,38 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: WebRTC 五档自适应与有效 TURN 判路
+
+**Date**: 2026-07-29
+**Task**: WebRTC 五档自适应与有效 TURN 判路
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+根据 A/B 诊断确认 NAT 后 TURN prflx 被误判为 P2P；实现统一 effective relay 判定、五档快降慢升画质、实时 RTT/码率/帧率 UI、有界 RTP 诊断和 coturn external-ip 验证，并准备 v1.6.1-beta.2。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef0048f` | (see git log) |
+| `440b9e2` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
