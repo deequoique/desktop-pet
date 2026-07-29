@@ -141,7 +141,7 @@ try {
   const cameraStatus = once(aController.socket, 'webrtc:media-status');
   bController1.socket.emit('webrtc:media-status', {
     callId: started.callId, media: 'camera', state: 'unavailable',
-    reason: 'controller_disabled', sourceDeviceId: 'a-laptop', quality: 'ultra',
+    reason: 'controller_disabled', sourceDeviceId: 'a-laptop', quality: 'ultra', qualityLevel: 9,
   });
   assert.deepEqual(await cameraStatus, {
     callId: started.callId, media: 'camera', state: 'unavailable',
@@ -151,11 +151,11 @@ try {
   const reverseCameraStatus = once(bController1.socket, 'webrtc:media-status');
   aController.socket.emit('webrtc:media-status', {
     callId: started.callId, media: 'camera', state: 'available',
-    sourceDeviceId: 'b-pc', quality: 'relay-low',
+    sourceDeviceId: 'b-pc', quality: 'relay-low', qualityLevel: 1,
   });
   assert.deepEqual(await reverseCameraStatus, {
     callId: started.callId, media: 'camera', state: 'available',
-    sourceDeviceId: 'a-laptop', quality: 'relay-low',
+    sourceDeviceId: 'a-laptop', quality: 'relay-low', qualityLevel: 1,
   });
 
   let thirdDeviceCameraLeak = false;
@@ -192,11 +192,11 @@ try {
   const screenStatus = once(aController.socket, 'webrtc:media-status');
   bPet1.socket.emit('webrtc:media-status', {
     callId: started.callId, media: 'screen', state: 'paused',
-    reason: 'controller_disabled', quality: 'normal',
+    reason: 'controller_disabled', quality: 'normal', qualityLevel: 3,
   });
   assert.deepEqual(await screenStatus, {
     callId: started.callId, media: 'screen', state: 'paused',
-    reason: 'controller_disabled', quality: 'normal',
+    reason: 'controller_disabled', quality: 'normal', qualityLevel: 3,
   });
 
   let unrelatedStatusReceived = false;

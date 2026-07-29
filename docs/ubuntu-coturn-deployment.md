@@ -77,7 +77,13 @@ sudo systemctl status coturn --no-pager
 sudo ss -lnutp | grep 3478
 sudo journalctl -u coturn -n 100 --no-pager
 turnutils_stunclient -p 3478 127.0.0.1
+sudo grep -E '^(external-ip|relay-ip|min-port|max-port)=' /etc/turnserver.conf
 ```
+
+公网与私网不同时，输出必须同时包含
+`relay-ip=<私网>`、`external-ip=<公网>/<私网>` 和批准的 relay 端口范围。
+如果客户端生成的 relay candidate 仍是 `10.x`、`172.16-31.x` 或
+`192.168.x`，配置没有真正生效，不能仅凭 coturn active 判定部署成功。
 
 必须再从云外网络测试 `turn.example.com:3478`，因为本机测试无法证明云防火墙和公网 NAT 正确。验收矩阵：
 
@@ -90,6 +96,11 @@ turnutils_stunclient -p 3478 127.0.0.1
 - 用 `nload`、`iftop` 或云监控观察出网，确认未突破实例带宽。
 
 常见原因：`401 Unauthorized` 多为 realm/secret/时钟不一致；有 allocation 但无媒体多为 relay UDP 范围未开或 `external-ip` 错；TCP 可用而 UDP 不通通常是安全组/UFW；一直只有 host candidate 则客户端没有取得 RTC 配置或 STUN 不可达。
+
+Chromium 在错误的 `external-ip` 配置下，可能把经公网 NAT 学到的 TURN
+allocation 显示为 `prflx`。若 selected candidate 同时出现 TURN 公网地址、
+私网 `relatedAddress` 或 `relayProtocol`，它仍是 TURN，不是真正 P2P。
+新客户端会按 TURN 兜底处理，但服务器仍必须修正配置。
 
 ## 轮换、升级与回滚
 

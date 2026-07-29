@@ -29,6 +29,7 @@ type MediaStatus = {
   media: 'screen'|'camera'|'microphone'|'system-audio';
   state: 'available'|'paused'|'unavailable';
   quality?: 'normal'|'relay-low';
+  qualityLevel?: 1|2|3|4|5;
   reason?: 'controller_disabled'|'capture_failed'|'permission_denied'|
     'device_lost'|'track_ended'|'profile_failed';
 };
@@ -173,4 +174,98 @@ screenTrack.enabled = screenRequestedByController && applied.ok;
 const controls = !floatContainer && <div className="media-controls">...</div>;
 // .media-float-root .media-surface.primary { inset: 0 }
 // video { object-fit: contain }
+```
+
+## 9. Scenario: effective relay and five-tier adaptive video
+
+### 1. Scope / Trigger
+
+- Trigger：修改 candidate-pair 判路、RTC stats、屏幕/摄像头 sender profile、实时网络 UI、`MediaStatus` 档位或 coturn 公私网映射时。
+- NAT 后的 coturn allocation 可能在 Chromium stats 中表现为 `candidateType=prflx`；路径真相必须综合 candidate 类型、TURN 属性、配置地址和 relay alias，不能只看 selected candidate 的类型。
+
+### 2. Signatures
+
+```ts
+type VideoQualityLevel = 1|2|3|4|5;
+type RtcNetworkSample = {
+  selectedPair?: {
+    effectiveRelayed: boolean;
+    currentRoundTripTime?: number;
+    availableOutgoingBitrate?: number;
+  };
+  outboundVideo?: RtcOutboundRtpSummary;
+  remoteInboundVideo?: RtcInboundRtpSummary;
+  inboundVideo?: RtcInboundRtpSummary;
+};
+
+collectRtcNetworkSample(
+  pc: RTCPeerConnection,
+  configuration?: RTCConfiguration,
+  baseline?: RateBaseline,
+): Promise<RtcNetworkSample>;
+
+recommendVideoQualityLevel(
+  metrics: AdaptiveVideoMetrics,
+  kind: 'screen'|'camera',
+): VideoQualityLevel;
+
+applyVideoSenderProfile(
+  sender: RTCRtpSender,
+  track: MediaStreamTrack,
+  route: 'normal'|'relay-low',
+  kind: 'screen'|'camera',
+  level: VideoQualityLevel,
+): Promise<{ok:true; level:VideoQualityLevel}|{ok:false; reason:string}>;
+```
+
+### 3. Contracts
+
+- Effective relay 为以下任一条件成立：candidate 是 `relay`；存在 `relayProtocol`；candidate address 命中 `RTC_TURN_URLS` host；selected `prflx` 与同一 report 中的 relay candidate 共享 port 和 username fragment。
+- screen 档位 1→5 分别为 `640×360/5/240k`、`854×480/7/450k`、`1280×720/10/900k`、`1600×900/12/1.5m`、`2560×1440/15/3.5m`。
+- camera 档位 1→5 分别为 `320×180/10/120k`、`480×270/12/240k`、`640×360/15/500k`、`960×540/20/900k`、`1280×720/24/1.5m`。
+- 每 2 秒读取 compact selected pair/RTP stats。严重恶化或档位 1 立即下降；普通恶化连续 2 次下降；连续稳定 6 次才逐档上升。effective relay 始终锁定 1 档。
+- `webrtc:media-status.qualityLevel` 是可选整数 1..5。server 仅校验并转发当前 call 的合法来源；旧 `quality` 字段继续兼容。
+- coturn 在公网 IP 不等于私网 IP 时必须配置精确的 `external-ip=<PUBLIC_IP>/<PRIVATE_IP>`，同时固定 `relay-ip` 与 relay 端口范围。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 结果 |
+| --- | --- |
+| `qualityLevel` 非整数或不在 1..5 | server 丢弃该可选字段，其他合法 status 可继续转发 |
+| selected `prflx` 命中 TURN host/relay alias | UI 和 sender 一律按 TURN、1 档处理 |
+| selected pair unknown/failed | 对应视频 fail closed，音频保持 |
+| stats 暂缺 RTT/带宽/RTP | 使用已有指标保守判级，不抛错、不结束 call |
+| `setParameters()` 失败 | null/disable 对应视频并上报 `profile_failed` |
+| coturn 缺少/错误 external-ip、relay-ip 或端口范围 | `install-coturn-ubuntu.sh --verify` 非零退出 |
+
+### 5. Good/Base/Bad Cases
+
+- Good：真实 IPv4 P2P 显示公网两端地址，网络稳定后每约 12 秒最多升一档；拥堵时快速下降且不重捕获。
+- Base：TURN 或 NAT 后伪 `prflx` 始终显示 TURN/1档，声音连续，UI 每约 2 秒更新 RTT、接收码率与帧率。
+- Bad：只以 `candidateType !== relay` 宣称 P2P；在一次高延迟 TURN 上发送 1440p；每次档位变化都 stop/reacquire track；把周期 stats 发到 server。
+
+### 6. Tests Required
+
+- 纯函数：五档参数、比例不放大、严重/连续降档、六次稳定逐档升级、TURN 锁 1 档。
+- RTC stats：覆盖 `relayProtocol`、TURN host、同 port+ufrag alias、delta bitrate/loss、selected pair 与最多 8 个 alternatives。
+- Server integration：合法 `qualityLevel` 定向转发，非法值、伪造 source、过期 call 与错误 role 不泄漏。
+- 构建/部署：server/pet tests、web/pet build、两份 profile/diagnostics 镜像一致、`bash -n` 与 coturn verify 现场检查。
+- 双机：真实 IPv4 P2P、IPv6 P2P、强制 relay、网络切换和“一开始流畅后卡顿”复现路径。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+const relayed = selectedCandidate.candidateType === 'relay';
+await sender.replaceTrack(null); // every quality transition
+await sender.setParameters({ encodings: [{ maxBitrate: 3_500_000 }] }); // TURN
+```
+
+#### Correct
+
+```ts
+const relayed = isEffectiveRelayCandidate(selectedCandidate, allCandidates, configuration);
+const next = controller.update(sample, mediaKind);
+await applyVideoSenderProfile(sender, track, relayed ? 'relay-low' : 'normal', mediaKind, next.level);
 ```

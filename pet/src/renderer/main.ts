@@ -3,9 +3,19 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
 import { createVRMAnimationClip, VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation';
 import { io, type Socket } from 'socket.io-client';
-import { applyVideoSenderProfile, type VideoRouteProfile } from './video-profile';
+import {
+  AdaptiveVideoQualityController,
+  applyVideoSenderProfile,
+  type VideoQualityLevel,
+  type VideoRouteProfile,
+} from './video-profile';
 import { installPetGlobalDiagnostics, normalizeDiagnosticError, recordPetDiagnostic, type RendererDiagnosticInput } from './diagnostics';
-import { attachRtcDiagnostics, type RtcDiagnosticHandle } from './rtc-diagnostics';
+import {
+  attachRtcDiagnostics,
+  isEffectiveRelayCandidate,
+  type RtcDiagnosticHandle,
+  type RtcNetworkSample,
+} from './rtc-diagnostics';
 
 declare global {
   interface Window {
@@ -1760,6 +1770,8 @@ let rtcRemoteAudioStream: MediaStream | null = null;
 const rtcPendingCandidates: RTCIceCandidateInit[] = [];
 let screenRequestedByController = true;
 let screenRouteProfile: VideoRouteProfile = 'unknown';
+let screenQualityLevel: VideoQualityLevel = 3;
+const screenQualityController = new AdaptiveVideoQualityController(screenQualityLevel);
 let rtcScreenSender: RTCRtpSender | null = null;
 let screenProfileGeneration = 0;
 let screenProfileApplyChain: Promise<void> = Promise.resolve();
@@ -1853,12 +1865,14 @@ function emitMediaStatus(
   state: 'available' | 'paused' | 'unavailable',
   reason?: 'controller_disabled' | 'capture_failed' | 'track_ended' | 'profile_failed',
   quality?: 'normal' | 'relay-low',
+  qualityLevel?: VideoQualityLevel,
 ) {
   if (!activeCallId) return;
   remoteSocket?.emit('webrtc:media-status', {
     callId: activeCallId, media, state,
     ...(reason ? { reason } : {}),
     ...(quality ? { quality } : {}),
+    ...(qualityLevel ? { qualityLevel } : {}),
   });
 }
 
@@ -1869,12 +1883,13 @@ async function applyRequestedScreenState() {
     emitMediaStatus('screen', 'unavailable', 'capture_failed');
     return;
   }
-  screenTrack.enabled = false;
   if (!screenRequestedByController) {
+    screenTrack.enabled = false;
     emitMediaStatus('screen', 'paused', 'controller_disabled');
     return;
   }
   if (screenRouteProfile === 'unknown' || screenRouteProfile === 'failed') {
+    screenTrack.enabled = false;
     emitMediaStatus('screen', 'paused');
     return;
   }
@@ -1886,15 +1901,22 @@ async function applyRequestedScreenState() {
   const profile = screenRouteProfile;
   const operation = screenProfileApplyChain.catch(() => {}).then(async () => {
     if (generation !== screenProfileGeneration || !screenRequestedByController) return;
-    const applied = await applyVideoSenderProfile(sender, screenTrack, profile, 'screen');
+    const applied = await applyVideoSenderProfile(sender, screenTrack, profile, 'screen', screenQualityLevel);
     if (generation !== screenProfileGeneration || !screenRequestedByController) return;
     if (!applied.ok) {
       console.warn('[webrtc] screen video profile unavailable:', applied.error);
+      screenTrack.enabled = false;
       emitMediaStatus('screen', 'unavailable', 'profile_failed');
       return;
     }
     screenTrack.enabled = true;
-    emitMediaStatus('screen', 'available', undefined, profile);
+    emitMediaStatus(
+      'screen',
+      'available',
+      undefined,
+      profile === 'relay-low' ? 'relay-low' : 'normal',
+      applied.level,
+    );
   });
   screenProfileApplyChain = operation;
   await operation;
@@ -1903,8 +1925,10 @@ async function applyRequestedScreenState() {
 async function selectedPairVideoProfile(pc: RTCPeerConnection): Promise<VideoRouteProfile> {
   const stats = await pc.getStats();
   let pair: any;
+  const candidates: any[] = [];
   stats.forEach((report: any) => {
     if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId);
+    if (report.type === 'local-candidate' || report.type === 'remote-candidate') candidates.push(report);
   });
   if (!pair) stats.forEach((report: any) => {
     if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.selected || report.nominated)) pair = report;
@@ -1913,7 +1937,49 @@ async function selectedPairVideoProfile(pc: RTCPeerConnection): Promise<VideoRou
   const local = stats.get(pair.localCandidateId);
   const remote = stats.get(pair.remoteCandidateId);
   if (!local || !remote) return 'unknown';
-  return local.candidateType === 'relay' || remote.candidateType === 'relay' ? 'relay-low' : 'normal';
+  return isEffectiveRelayCandidate(local, undefined, candidates)
+    || isEffectiveRelayCandidate(remote, undefined, candidates)
+    ? 'relay-low' : 'normal';
+}
+
+function handleScreenNetworkSample(sample: RtcNetworkSample) {
+  if (!activeCallId || !sample.connected) return;
+  const nextProfile: VideoRouteProfile = sample.effectiveRelayed ? 'relay-low' : 'normal';
+  const routeChanged = screenRouteProfile !== nextProfile;
+  if (routeChanged) {
+    screenRouteProfile = nextProfile;
+    screenQualityLevel = screenQualityController.reset(sample.effectiveRelayed ? 1 : 3);
+  }
+  const decision = screenQualityController.update({
+    connected: sample.connected,
+    roundTripTimeMs: sample.roundTripTimeMs,
+    availableOutgoingBitrate: sample.availableOutgoingBitrate,
+    lossRatio: sample.lossRatio,
+    jitterMs: sample.jitterMs,
+    qualityLimitationReason: sample.outboundVideo?.qualityLimitationReason,
+  }, 'screen', sample.effectiveRelayed);
+  if (!routeChanged && !decision.changed) return;
+  screenQualityLevel = decision.level;
+  recordPetDiagnostic({
+    event: 'webrtc.quality-changed',
+    domain: 'webrtc',
+    correlation: { callId: activeCallId },
+    context: {
+      mediaKind: 'screen',
+      qualityLevel: decision.level,
+      targetLevel: decision.targetLevel,
+      reason: routeChanged ? (sample.effectiveRelayed ? 'relay' : 'route-recovered') : decision.reason,
+      effectiveRelayed: sample.effectiveRelayed,
+      roundTripTimeMs: sample.roundTripTimeMs,
+      availableOutgoingBitrate: sample.availableOutgoingBitrate,
+      lossRatio: sample.lossRatio,
+      jitterMs: sample.jitterMs,
+      outboundBitrateKbps: sample.outboundVideo?.bitrateKbps,
+      framesPerSecond: sample.outboundVideo?.framesPerSecond,
+      qualityLimitationReason: sample.outboundVideo?.qualityLimitationReason,
+    },
+  });
+  void applyRequestedScreenState();
 }
 
 async function capAudioSender(sender: RTCRtpSender) {
@@ -1995,6 +2061,7 @@ function cleanupRtc(sendHangup = false) {
   rtcAudioEl.srcObject = null;
   screenRequestedByController = true;
   screenRouteProfile = 'unknown';
+  screenQualityLevel = screenQualityController.reset(3);
   screenProfileGeneration += 1;
   screenProfileApplyChain = Promise.resolve();
   activeCallId = '';
@@ -2155,6 +2222,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     mediaKind: 'main',
     getCallId: () => activeCallId,
     configuration: rtcConfig,
+    onSample: handleScreenNetworkSample,
   });
 
   for (const track of media.getTracks()) {
@@ -2206,6 +2274,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
       noteRemote('call on');
       selectedPairVideoProfile(pc).then((profile) => {
         screenRouteProfile = profile;
+        screenQualityLevel = screenQualityController.reset(profile === 'relay-low' ? 1 : 3);
         void applyRequestedScreenState();
       }).catch((error) => {
         console.warn('[webrtc] route inspection failed:', error);

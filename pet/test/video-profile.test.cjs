@@ -29,14 +29,14 @@ for (const [runtime, profile] of modules) {
     assert.equal(profile.calculateScaleResolutionDownBy({}, screen), null);
   });
 
-  test(`${runtime} relay video profile preserves encodings and restores normal parameters`, async () => {
+  test(`${runtime} five-tier video profile preserves encodings and applies bounded parameters`, async () => {
     let applied;
     const sender = {
       getParameters: () => ({ encodings: [{ rid: 'main', active: true }] }),
       setParameters: async (parameters) => { applied = parameters; },
     };
     const track = { getSettings: () => ({ width: 1280, height: 720 }) };
-    assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'camera'), { ok: true });
+    assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'camera'), { ok: true, level: 1 });
     assert.equal(applied.encodings[0].rid, 'main');
     assert.equal(applied.encodings[0].active, true);
     assert.equal(applied.encodings[0].maxBitrate, 120_000);
@@ -44,10 +44,10 @@ for (const [runtime, profile] of modules) {
     assert.equal(applied.encodings[0].scaleResolutionDownBy, 4);
 
     sender.getParameters = () => ({ encodings: [{ ...applied.encodings[0] }] });
-    assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'normal', 'camera'), { ok: true });
-    assert.equal(applied.encodings[0].maxBitrate, undefined);
-    assert.equal(applied.encodings[0].maxFramerate, undefined);
-    assert.equal(applied.encodings[0].scaleResolutionDownBy, 1);
+    assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'normal', 'camera', 3), { ok: true, level: 3 });
+    assert.equal(applied.encodings[0].maxBitrate, 500_000);
+    assert.equal(applied.encodings[0].maxFramerate, 15);
+    assert.equal(applied.encodings[0].scaleResolutionDownBy, 2);
   });
 
   test(`${runtime} relay video profile fails closed when dimensions or setParameters are unavailable`, async () => {
@@ -67,5 +67,47 @@ for (const [runtime, profile] of modules) {
       await profile.applyVideoSenderProfile(rejected, { getSettings: () => ({ width: 640, height: 360 }) }, 'relay-low', 'screen'),
       { ok: false, error: 'unsupported' },
     );
+  });
+
+  test(`${runtime} adaptive quality drops quickly and upgrades one level after stable samples`, () => {
+    assert.equal(profile.recommendVideoQualityLevel({
+      connected: true,
+      roundTripTimeMs: 724,
+      availableOutgoingBitrate: 300_000,
+    }, 'screen'), 1);
+    assert.equal(profile.recommendVideoQualityLevel({
+      connected: true,
+      roundTripTimeMs: 40,
+      availableOutgoingBitrate: 4_000_000,
+      lossRatio: 0,
+      jitterMs: 5,
+    }, 'screen'), 4);
+
+    const controller = new profile.AdaptiveVideoQualityController(3);
+    const degraded = controller.update({
+      connected: true,
+      roundTripTimeMs: 724,
+      availableOutgoingBitrate: 300_000,
+    }, 'screen');
+    assert.deepEqual(degraded, {
+      level: 1, targetLevel: 1, changed: true, reason: 'degrade',
+    });
+
+    const stable = {
+      connected: true,
+      roundTripTimeMs: 40,
+      availableOutgoingBitrate: 5_000_000,
+      lossRatio: 0,
+      jitterMs: 4,
+    };
+    for (let index = 0; index < 5; index += 1) {
+      assert.equal(controller.update(stable, 'screen').changed, false);
+    }
+    assert.deepEqual(controller.update(stable, 'screen'), {
+      level: 2, targetLevel: 5, changed: true, reason: 'upgrade',
+    });
+    assert.deepEqual(controller.update(stable, 'screen', true), {
+      level: 1, targetLevel: 1, changed: true, reason: 'relay',
+    });
   });
 }

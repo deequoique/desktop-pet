@@ -1345,11 +1345,15 @@ io.on('connection', (socket) => {
     ]);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
     const quality = ['normal', 'relay-low'].includes(payload?.quality) ? payload.quality : undefined;
+    const qualityLevel = Number.isInteger(payload?.qualityLevel)
+      && payload.qualityLevel >= 1 && payload.qualityLevel <= 5
+      ? payload.qualityLevel : undefined;
     io.to(targetId).emit('webrtc:media-status', {
       callId: room.callId, media, state,
       ...(media === 'camera' ? { sourceDeviceId: socket.data.participantId } : {}),
       ...(reason ? { reason } : {}),
       ...(quality ? { quality } : {}),
+      ...(qualityLevel ? { qualityLevel } : {}),
     });
   });
 

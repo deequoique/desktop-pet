@@ -101,9 +101,16 @@ verify() {
   ss -H -lnut | awk '{print $5}' | grep -Eq "(^|:)$LISTENER_PORT$" || die "coturn is not listening on $LISTENER_PORT"
   [[ "$(stat -c '%a' /etc/turnserver.conf)" == 600 ]] || die '/etc/turnserver.conf must be mode 600'
   grep -Fqx "realm=$TURN_REALM" /etc/turnserver.conf || die 'realm mismatch'
+  grep -Fqx "relay-ip=$PRIVATE_IP" /etc/turnserver.conf || die 'relay-ip mismatch'
+  grep -Fqx "min-port=$RELAY_MIN_PORT" /etc/turnserver.conf || die 'relay min-port mismatch'
+  grep -Fqx "max-port=$RELAY_MAX_PORT" /etc/turnserver.conf || die 'relay max-port mismatch'
+  if [[ "$PUBLIC_IP" != "$PRIVATE_IP" ]]; then
+    grep -Fqx "external-ip=$PUBLIC_IP/$PRIVATE_IP" /etc/turnserver.conf \
+      || die 'external-ip mapping missing or mismatched'
+  fi
   grep -Fqx "RTC_TURN_SHARED_SECRET=$TURN_SHARED_SECRET" "$APP_ENV_FILE" || die 'application secret mismatch'
   if command -v turnutils_stunclient >/dev/null; then turnutils_stunclient -p "$LISTENER_PORT" 127.0.0.1 >/dev/null || die 'local STUN check failed'; fi
-  info 'verify ok; external TURN allocation and cloud firewall still require remote verification'
+  info 'verify ok; remote allocation must return the public relay IP and stay inside the configured relay port range'
 }
 
 rollback() {
