@@ -114,8 +114,8 @@ jobs:
         run: |
           mkdir -p release-server/desktop-pet-server
           cp -R server/src server/deploy server/node_modules release-server/desktop-pet-server/
-          cp server/package.json server/package-lock.json server/.env.example server/start-linux.sh release-server/desktop-pet-server/
-          chmod +x release-server/desktop-pet-server/start-linux.sh release-server/desktop-pet-server/deploy/install-coturn-ubuntu.sh
+          cp server/package.json server/package-lock.json server/.env.example server/start-linux.sh server/ecosystem.config.cjs release-server/desktop-pet-server/
+          chmod +x release-server/desktop-pet-server/start-linux.sh release-server/desktop-pet-server/deploy/install-coturn-ubuntu.sh release-server/desktop-pet-server/deploy/configure-pm2-logs.sh
           tar -C release-server -czf "desktop-pet-server-${GITHUB_REF_NAME}-linux-x64.tar.gz" desktop-pet-server
 
       - name: Upload Linux server bundle

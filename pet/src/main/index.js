@@ -1,15 +1,23 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage, session, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, globalShortcut, desktopCapturer, dialog, safeStorage, session, shell, crashReporter } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { randomUUID } = require('crypto');
 const { shouldShowControlOnStartup } = require('./pairing-config');
 const {
-  appendDiagnostic,
+  acknowledgeIncidents,
+  appendDiagnosticEntry,
+  beginDiagnosticSession,
   clampBoundsToWorkArea,
   clampScale,
+  completeDiagnosticSession,
+  createDiagnosticEntry,
+  readCrashArtifactMetadata,
   readDiagnosticLogs,
+  readIncidents,
+  recordIncident,
   redactDiagnosticValue,
+  validateRendererDiagnosticInput,
 } = require('./diagnostics');
 
 const DEV_URL = 'http://localhost:5173';
@@ -24,6 +32,11 @@ try {
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 if (process.platform === 'win32') app.setAppUserModelId('com.deequoique.desktop-pet');
+try {
+  crashReporter.start({ uploadToServer: false });
+} catch (error) {
+  console.warn('[diagnostics] crash reporter unavailable:', error?.message || error);
+}
 
 const TASKBAR_ICON = path.join(__dirname, 'assets', process.platform === 'win32' ? 'taskbar.ico' : 'taskbar.png');
 
@@ -38,9 +51,62 @@ const stateFile = () => path.join(app.getPath('userData'), 'pet-state.json');
 const pairingFile = () => path.join(app.getPath('userData'), 'pairing.json');
 const ttsCredentialsFile = () => path.join(app.getPath('userData'), 'tts-credentials.bin');
 const diagnosticLogFile = () => path.join(app.getPath('userData'), 'logs', 'diagnostic.jsonl');
+const diagnosticIncidentFile = () => path.join(app.getPath('userData'), 'logs', 'incidents.json');
+const diagnosticSessionFile = () => path.join(app.getPath('userData'), 'logs', 'runtime-session.json');
+const diagnosticRuntimeSessionId = randomUUID();
+const diagnosticBreadcrumbs = [];
 
-function diagnostic(event, payload = {}) {
-  appendDiagnostic(diagnosticLogFile(), event, payload);
+function safeDiagnosticSnapshot() {
+  try { return diagnosticSnapshot(); }
+  catch (error) { return { snapshotError: error?.message || String(error) }; }
+}
+
+function diagnostic(event, payload = {}, options = {}) {
+  const entry = createDiagnosticEntry({
+    event,
+    context: payload,
+    level: options.level,
+    domain: options.domain,
+    errorCode: options.errorCode,
+    recoverability: options.recoverability,
+    correlation: options.correlation,
+    exception: options.exception,
+  }, {}, {
+    source: options.source || 'electron-main',
+    appVersion: app.getVersion(),
+    runtimeSessionId: diagnosticRuntimeSessionId,
+  });
+  if (!appendDiagnosticEntry(diagnosticLogFile(), entry)) return null;
+  diagnosticBreadcrumbs.push(entry);
+  if (diagnosticBreadcrumbs.length > 200) diagnosticBreadcrumbs.splice(0, diagnosticBreadcrumbs.length - 200);
+  if (options.incident || entry.level === 'error' || entry.level === 'fatal') {
+    recordIncident(
+      diagnosticIncidentFile(),
+      entry,
+      diagnosticBreadcrumbs,
+      options.snapshot === false ? {} : safeDiagnosticSnapshot(),
+    );
+  }
+  return entry;
+}
+
+function pendingDiagnosticIncidents() {
+  return readIncidents(diagnosticIncidentFile())
+    .filter((incident) => incident.status === 'pending' && incident.level === 'fatal')
+    .map((incident) => ({
+      id: incident.id,
+      timestamp: incident.lastSeenAt,
+      errorCode: incident.errorCode,
+      message: incident.message,
+      count: incident.count,
+      level: incident.level,
+    }));
+}
+
+function sourceForDiagnosticSender(sender) {
+  if (sender === win?.webContents) return 'pet-renderer';
+  if (sender === controlWin?.webContents) return 'control-renderer';
+  return null;
 }
 
 function loadState() {
@@ -427,6 +493,7 @@ function applyPetScale(rawScale, source = 'unknown') {
 function diagnosticSnapshot() {
   return redactDiagnosticValue({
     generatedAt: new Date().toISOString(),
+    runtimeSessionId: diagnosticRuntimeSessionId,
     app: {
       name: app.getName(),
       version: app.getVersion(),
@@ -444,30 +511,55 @@ function diagnosticSnapshot() {
     displays: allDisplaySnapshots(),
     petWindow: currentWindowSnapshot(),
     petState: loadState(),
+    crashArtifacts: readCrashArtifactMetadata(app.getPath('crashDumps')),
   });
 }
 
 async function exportDiagnostics(parentWindow = controlWin?.isVisible() ? controlWin : win) {
   try {
+    const owner = parentWindow && !parentWindow.isDestroyed() ? parentWindow : undefined;
+    const confirmation = await dialog.showMessageBox(owner, {
+      type: 'info',
+      title: '导出诊断包',
+      message: '诊断包包含 IP、端口等网络地址信息',
+      detail: '不会包含房间密钥、API Key、便签/TTS 正文、音频、视频或完整 WebRTC SDP。文件只会保存到你选择的位置，不会自动上传。',
+      buttons: ['继续导出', '取消'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (confirmation.response !== 0) {
+      diagnostic('app.diagnostics-export-canceled', { stage: 'privacy-confirmation' }, { domain: 'app' });
+      return { ok: false, canceled: true };
+    }
     const defaultName = `desktop-pet-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    const result = await dialog.showSaveDialog(parentWindow && !parentWindow.isDestroyed() ? parentWindow : undefined, {
-      title: 'Export Desktop Pet Diagnostics',
+    const result = await dialog.showSaveDialog(owner, {
+      title: '导出桌宠诊断包',
       defaultPath: path.join(app.getPath('documents'), defaultName),
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
     if (result.canceled || !result.filePath) {
-      diagnostic('diagnostics-export-canceled');
+      diagnostic('app.diagnostics-export-canceled', { stage: 'save-dialog' }, { domain: 'app' });
       return { ok: false, canceled: true };
     }
     const bundle = redactDiagnosticValue({
+      schemaVersion: 2,
       ...diagnosticSnapshot(),
       logs: readDiagnosticLogs(diagnosticLogFile()),
+      incidents: readIncidents(diagnosticIncidentFile()),
     });
     fs.writeFileSync(result.filePath, `${JSON.stringify(bundle, null, 2)}\n`, 'utf8');
-    diagnostic('diagnostics-exported');
+    acknowledgeIncidents(diagnosticIncidentFile(), null, 'exported');
+    diagnostic('app.diagnostics-exported', { extension: path.extname(result.filePath) }, { domain: 'app' });
     return { ok: true, canceled: false, path: result.filePath };
   } catch (error) {
-    diagnostic('diagnostics-export-failed', { error: error?.message || String(error) });
+    diagnostic('storage.diagnostics-export-failed', {}, {
+      level: 'error',
+      domain: 'storage',
+      errorCode: 'storage_diagnostic_export_failed',
+      recoverability: 'retryable',
+      exception: error,
+    });
     return { ok: false, canceled: false, error: error?.message || 'export_failed' };
   }
 }
@@ -706,12 +798,39 @@ function createWindow() {
   });
   win.webContents.on('render-process-gone', (_event, details) => {
     closeNoteWindows();
-    diagnostic('pet-render-process-gone', details);
+    const clean = details?.reason === 'clean-exit';
+    diagnostic('app.pet-renderer-gone', details, clean ? {
+      level: 'info',
+      domain: 'app',
+    } : {
+      level: 'fatal',
+      domain: 'app',
+      errorCode: 'app_pet_renderer_crashed',
+      recoverability: 'fatal',
+      incident: true,
+      correlation: { renderer: 'pet' },
+    });
+  });
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    diagnostic('app.pet-renderer-load-failed', { errorCode, errorDescription, validatedURL }, {
+      level: 'error',
+      domain: 'app',
+      errorCode: 'app_pet_renderer_load_failed',
+      recoverability: 'retryable',
+      correlation: { renderer: 'pet' },
+    });
   });
   win.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
     if (isMainFrame) closeNoteWindows();
   });
-  win.on('unresponsive', () => diagnostic('pet-window-unresponsive', currentWindowSnapshot()));
+  win.on('unresponsive', () => diagnostic('app.pet-window-unresponsive', currentWindowSnapshot(), {
+    level: 'error',
+    domain: 'app',
+    errorCode: 'app_pet_window_unresponsive',
+    recoverability: 'automatic',
+    correlation: { renderer: 'pet' },
+  }));
 
   win.on('moved', () => {
     const [x, y] = win.getPosition();
@@ -723,14 +842,15 @@ function createWindow() {
 
 function showControlWindow() {
   if (!controlWin || controlWin.isDestroyed()) createControlWindow();
-  if (controlWin.webContents.isLoading()) {
-    controlWin.once('ready-to-show', () => {
-      controlWin.show();
-      controlWin.focus();
-    });
-  } else {
+  const showAndRefresh = () => {
     controlWin.show();
     controlWin.focus();
+    controlWin.webContents.send('diagnostics:refresh');
+  };
+  if (controlWin.webContents.isLoading()) {
+    controlWin.once('ready-to-show', showAndRefresh);
+  } else {
+    showAndRefresh();
   }
 }
 
@@ -791,8 +911,20 @@ function createControlWindow() {
     mediaFloatWin.setFullScreenable(false);
     mediaFloatWin.on('move', persistMediaFloatBounds);
     mediaFloatWin.on('resize', persistMediaFloatBounds);
-    mediaFloatWin.on('unresponsive', () => diagnostic('media-float-unresponsive'));
-    mediaFloatWin.webContents.on('render-process-gone', (_event, info) => diagnostic('media-float-render-process-gone', info));
+    mediaFloatWin.on('unresponsive', () => diagnostic('app.media-float-unresponsive', {}, {
+      level: 'error',
+      domain: 'app',
+      errorCode: 'app_media_float_unresponsive',
+      recoverability: 'automatic',
+    }));
+    mediaFloatWin.webContents.on('render-process-gone', (_event, info) => diagnostic('app.media-float-renderer-gone', info, {
+      level: info?.reason === 'clean-exit' ? 'info' : 'fatal',
+      domain: 'app',
+      errorCode: info?.reason === 'clean-exit' ? undefined : 'app_media_float_renderer_crashed',
+      recoverability: info?.reason === 'clean-exit' ? undefined : 'fatal',
+      incident: info?.reason !== 'clean-exit',
+      correlation: { renderer: 'media-float' },
+    }));
     mediaFloatWin.on('closed', () => {
       mediaFloatWin = null;
       if (controlWin && !controlWin.isDestroyed()) {
@@ -806,9 +938,36 @@ function createControlWindow() {
   else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
   controlWin.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
   controlWin.webContents.on('render-process-gone', (_event, details) => {
-    diagnostic('control-render-process-gone', details);
+    const clean = details?.reason === 'clean-exit';
+    diagnostic('app.control-renderer-gone', details, clean ? {
+      level: 'info',
+      domain: 'app',
+    } : {
+      level: 'fatal',
+      domain: 'app',
+      errorCode: 'app_control_renderer_crashed',
+      recoverability: 'fatal',
+      incident: true,
+      correlation: { renderer: 'control' },
+    });
   });
-  controlWin.on('unresponsive', () => diagnostic('control-window-unresponsive'));
+  controlWin.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    diagnostic('app.control-renderer-load-failed', { errorCode, errorDescription, validatedURL }, {
+      level: 'error',
+      domain: 'app',
+      errorCode: 'app_control_renderer_load_failed',
+      recoverability: 'retryable',
+      correlation: { renderer: 'control' },
+    });
+  });
+  controlWin.on('unresponsive', () => diagnostic('app.control-window-unresponsive', {}, {
+    level: 'error',
+    domain: 'app',
+    errorCode: 'app_control_window_unresponsive',
+    recoverability: 'automatic',
+    correlation: { renderer: 'control' },
+  }));
   controlWin.on('close', (event) => {
     if (app.isQuiting) return;
     event.preventDefault();
@@ -904,8 +1063,43 @@ ipcMain.handle('pet:reset-scale', (event) => {
   return applyPetScale(1, source);
 });
 ipcMain.handle('diagnostics:export', (event) => {
+  if (!sourceForDiagnosticSender(event.sender)) return { ok: false, canceled: false, error: 'untrusted_sender' };
   const parentWindow = BrowserWindow.fromWebContents(event.sender);
   return exportDiagnostics(parentWindow);
+});
+ipcMain.on('diagnostics:record', (event, input) => {
+  const source = sourceForDiagnosticSender(event.sender);
+  if (!source) return;
+  const validated = validateRendererDiagnosticInput(input);
+  if (!validated.ok) {
+    diagnostic('app.renderer-diagnostic-rejected', { reason: validated.error }, {
+      level: 'warn',
+      domain: 'app',
+      errorCode: 'app_renderer_diagnostic_rejected',
+      recoverability: 'automatic',
+      correlation: { renderer: source },
+    });
+    return;
+  }
+  diagnostic(validated.value.event, validated.value.context, {
+    source,
+    level: validated.value.level,
+    domain: validated.value.domain,
+    errorCode: validated.value.errorCode,
+    recoverability: validated.value.recoverability,
+    correlation: validated.value.correlation,
+    exception: validated.value.exception,
+  });
+});
+ipcMain.handle('diagnostics:status', (event) => {
+  if (!sourceForDiagnosticSender(event.sender)) return { pendingIncidents: [] };
+  return { pendingIncidents: pendingDiagnosticIncidents() };
+});
+ipcMain.handle('diagnostics:dismiss', (event, rawId) => {
+  if (!sourceForDiagnosticSender(event.sender)) return { ok: false, error: 'untrusted_sender' };
+  const id = String(rawId || '').slice(0, 128);
+  if (!id) return { ok: false, error: 'invalid_incident' };
+  return { ok: acknowledgeIncidents(diagnosticIncidentFile(), id, 'dismissed') };
 });
 
 // 60Hz 轮询光标位置 → 推给渲染层做 hit-test
@@ -1042,24 +1236,41 @@ function onDisplayRemoved(_event, display) {
 }
 
 function onUncaughtException(error, origin) {
-  diagnostic('uncaught-exception', {
-    origin,
-    name: error?.name,
-    message: error?.message || String(error),
-    stack: error?.stack,
+  diagnostic('app.main-uncaught-exception', { origin }, {
+    level: 'fatal',
+    domain: 'app',
+    errorCode: 'app_main_uncaught_exception',
+    recoverability: 'fatal',
+    exception: error,
+    incident: true,
   });
 }
 
 function onUnhandledRejection(reason) {
-  diagnostic('unhandled-rejection', {
-    name: reason?.name,
-    message: reason?.message || String(reason),
-    stack: reason?.stack,
+  diagnostic('app.main-unhandled-rejection', {}, {
+    level: 'error',
+    domain: 'app',
+    errorCode: 'app_main_unhandled_rejection',
+    recoverability: 'retryable',
+    exception: reason,
   });
 }
 
 app.whenReady().then(() => {
   ensureDeviceId();
+  const previousSession = beginDiagnosticSession(diagnosticSessionFile(), {
+    runtimeSessionId: diagnosticRuntimeSessionId,
+    appVersion: app.getVersion(),
+  });
+  if (previousSession) {
+    diagnostic('app.previous-session-abnormal-exit', { previousSession }, {
+      level: 'fatal',
+      domain: 'app',
+      errorCode: 'app_previous_session_abnormal_exit',
+      recoverability: 'fatal',
+      incident: true,
+    });
+  }
   ensureDefaultLaunchAtStartup();
   createWindow();
   createControlWindow();
@@ -1072,7 +1283,7 @@ app.whenReady().then(() => {
   screen.on('display-removed', onDisplayRemoved);
   process.on('uncaughtExceptionMonitor', onUncaughtException);
   process.on('unhandledRejection', onUnhandledRejection);
-  diagnostic('app-started', diagnosticSnapshot());
+  diagnostic('app.started', diagnosticSnapshot(), { domain: 'app' });
   setTimeout(() => checkForPetUpdates(false), 3000);
   if (shouldShowControlOnStartup(pairingSnapshot())) showControlWindow();
 
@@ -1095,6 +1306,7 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
+  completeDiagnosticSession(diagnosticSessionFile(), diagnosticRuntimeSessionId);
   petDragging = false;
   stopCursorPoll();
   screen.removeListener('display-metrics-changed', onDisplayMetricsChanged);
@@ -1103,4 +1315,19 @@ app.on('will-quit', () => {
   process.removeListener('uncaughtExceptionMonitor', onUncaughtException);
   process.removeListener('unhandledRejection', onUnhandledRejection);
   globalShortcut.unregisterAll();
+});
+
+app.on('child-process-gone', (_event, details) => {
+  const clean = details?.reason === 'clean-exit';
+  diagnostic('app.child-process-gone', details, clean ? {
+    level: 'info',
+    domain: 'app',
+  } : {
+    level: 'fatal',
+    domain: 'app',
+    errorCode: 'app_child_process_crashed',
+    recoverability: 'fatal',
+    incident: true,
+    correlation: { processType: details?.type },
+  });
 });

@@ -4,6 +4,8 @@ import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
 import { createVRMAnimationClip, VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation';
 import { io, type Socket } from 'socket.io-client';
 import { applyVideoSenderProfile, type VideoRouteProfile } from './video-profile';
+import { installPetGlobalDiagnostics, normalizeDiagnosticError, recordPetDiagnostic, type RendererDiagnosticInput } from './diagnostics';
+import { attachRtcDiagnostics, type RtcDiagnosticHandle } from './rtc-diagnostics';
 
 declare global {
   interface Window {
@@ -24,6 +26,7 @@ declare global {
       savePairingConfig: (config: PairingConfig) => Promise<{ ok: boolean; error?: string; config?: PairingConfig }>;
       onPairingChanged: (cb: (config: PairingConfig) => void) => void;
       getDesktopSourceId: () => Promise<string | null>;
+      recordDiagnostic: (event: RendererDiagnosticInput) => void;
       openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
       isGameMode: () => Promise<boolean>;
       openNoteComposer: () => void;
@@ -61,6 +64,7 @@ const browserPetBridge: PetBridge = {
   savePairingConfig: async (config) => ({ ok: true, config }),
   onPairingChanged: () => {},
   getDesktopSourceId: async () => null,
+  recordDiagnostic: () => {},
   openExternal: async (url) => {
     window.open(url, '_blank', 'noopener,noreferrer');
     return { ok: true };
@@ -73,6 +77,7 @@ const browserPetBridge: PetBridge = {
 };
 
 const petBridge: PetBridge = window.pet ?? browserPetBridge;
+installPetGlobalDiagnostics();
 
 const VRM_URL = './sample.vrm';
 const MOTION_MANIFEST_URL = './motions/manifest.json';
@@ -1747,6 +1752,7 @@ let remoteConnected = false;
 let lastRemoteMsg = '';
 let lastRemoteAt = 0;
 let rtcPc: RTCPeerConnection | null = null;
+let rtcDiagnostics: RtcDiagnosticHandle | null = null;
 let activeCallId = '';
 let rtcScreenStream: MediaStream | null = null;
 let rtcMicStream: MediaStream | null = null;
@@ -1973,6 +1979,8 @@ function reportRtcError(message: string) {
 
 function cleanupRtc(sendHangup = false) {
   if (sendHangup) remoteSocket?.emit('call:end', { callId: activeCallId || undefined });
+  rtcDiagnostics?.close('call-cleanup');
+  rtcDiagnostics = null;
   try { rtcPc?.close(); } catch {}
   rtcPc = null;
   rtcScreenSender = null;
@@ -2057,19 +2065,41 @@ async function ensurePetMedia(): Promise<MediaStream> {
       });
       console.log('[webrtc] captured screen via getDisplayMedia');
     } catch (error: any) {
+      recordPetDiagnostic({
+        event: 'media.screen-capture-failed',
+        domain: 'media',
+        level: 'warn',
+        errorCode: error?.name === 'NotAllowedError' ? 'media_screen_permission_denied' : 'media_screen_capture_failed',
+        recoverability: 'user_action',
+        correlation: { callId: activeCallId || undefined },
+        exception: normalizeDiagnosticError(error),
+      });
       console.warn('[webrtc] screen capture unavailable; continuing audio-only:', error);
       emitMediaStatus('screen', 'unavailable', 'capture_failed');
     }
   }
 
-  rtcMicStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-    video: false,
-  });
+  try {
+    rtcMicStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+  } catch (error: any) {
+    recordPetDiagnostic({
+      event: 'media.microphone-capture-failed',
+      domain: 'media',
+      level: 'error',
+      errorCode: error?.name === 'NotAllowedError' ? 'media_microphone_permission_denied' : 'media_microphone_capture_failed',
+      recoverability: 'user_action',
+      correlation: { callId: activeCallId || undefined },
+      exception: normalizeDiagnosticError(error),
+    });
+    throw error;
+  }
   console.log('[webrtc] captured microphone');
 
   const systemTracks = rtcScreenStream?.getAudioTracks() ?? [];
@@ -2105,7 +2135,9 @@ async function flushRtcCandidates() {
     if (!candidate) continue;
     try {
       await rtcPc.addIceCandidate(candidate);
+      rtcDiagnostics?.candidate('remote', 'added', candidate);
     } catch (e) {
+      rtcDiagnostics?.candidate('remote', 'add-failed', candidate, e);
       console.warn('[webrtc] addIceCandidate failed:', e);
     }
   }
@@ -2114,8 +2146,16 @@ async function flushRtcCandidates() {
 async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
   if (rtcPc) return rtcPc;
   const media = await ensurePetMedia();
-  const pc = new RTCPeerConnection(await requestRtcConfig());
+  const rtcConfig = await requestRtcConfig();
+  const pc = new RTCPeerConnection(rtcConfig);
   rtcPc = pc;
+  rtcDiagnostics = attachRtcDiagnostics(pc, {
+    recorder: recordPetDiagnostic,
+    role: 'pet',
+    mediaKind: 'main',
+    getCallId: () => activeCallId,
+    configuration: rtcConfig,
+  });
 
   for (const track of media.getTracks()) {
     const sender = pc.addTrack(track, media);
@@ -2131,8 +2171,11 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
+      rtcDiagnostics?.candidate('local', 'generated', event.candidate);
       console.log('[webrtc] pet sent ice candidate');
       remoteSocket?.emit('webrtc:signal', { callId: activeCallId || undefined, candidate: event.candidate.toJSON() });
+    } else {
+      rtcDiagnostics?.candidate('local', 'gathering-complete');
     }
   };
   pc.ontrack = async (event) => {
@@ -2159,6 +2202,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
     const state = pc.connectionState;
     console.log('[webrtc] pet connection state:', state);
     if (state === 'connected') {
+      rtcDiagnostics?.snapshot('route-selected').catch(() => {});
       noteRemote('call on');
       selectedPairVideoProfile(pc).then((profile) => {
         screenRouteProfile = profile;
@@ -2220,13 +2264,17 @@ async function handleRtcSignal(signal: WebRtcSignal) {
 
   if (signal.candidate) {
     console.log('[webrtc] pet got ice candidate');
+    rtcDiagnostics?.candidate('remote', 'received', signal.candidate);
     if (!rtcPc?.remoteDescription) {
       rtcPendingCandidates.push(signal.candidate);
+      rtcDiagnostics?.candidate('remote', 'queued', signal.candidate);
       return;
     }
     try {
       await rtcPc.addIceCandidate(signal.candidate);
+      rtcDiagnostics?.candidate('remote', 'added', signal.candidate);
     } catch (e) {
+      rtcDiagnostics?.candidate('remote', 'add-failed', signal.candidate, e);
       console.warn('[webrtc] addIceCandidate failed:', e);
     }
   }
@@ -2257,10 +2305,25 @@ function connectRemote() {
       (res: { ok: boolean; code?: string; error?: string }) => {
         if (res?.ok) {
           remoteConnected = true;
+          recordPetDiagnostic({
+            event: 'socket.joined',
+            domain: 'socket',
+            correlation: { deviceId: DEVICE_ID },
+            context: { role: 'pet', memberId: MEMBER_ID },
+          });
           console.log('[remote] joined as pet');
           void refreshNoteInbox(true);
         } else {
           remoteConnected = false;
+          recordPetDiagnostic({
+            event: 'socket.join-rejected',
+            domain: 'socket',
+            level: 'error',
+            errorCode: res?.code || 'socket_join_rejected',
+            recoverability: 'user_action',
+            correlation: { deviceId: DEVICE_ID },
+            context: { role: 'pet', memberId: MEMBER_ID, message: res?.error },
+          });
           console.warn('[remote] join rejected:', res?.code || res?.error);
         }
       }
@@ -2270,12 +2333,29 @@ function connectRemote() {
   remoteSocket.on('connect', join);
   remoteSocket.on('disconnect', () => {
     remoteConnected = false;
+    recordPetDiagnostic({
+      event: 'socket.disconnected',
+      domain: 'socket',
+      level: 'warn',
+      errorCode: 'socket_disconnected',
+      recoverability: 'automatic',
+      correlation: { deviceId: DEVICE_ID, callId: activeCallId || undefined },
+    });
     stopTtsPlayback();
     cleanupRtc(false);
     console.log('[remote] disconnected');
   });
   remoteSocket.on('connect_error', (e) => {
     remoteConnected = false;
+    recordPetDiagnostic({
+      event: 'socket.connect-error',
+      domain: 'socket',
+      level: 'warn',
+      errorCode: 'socket_connect_error',
+      recoverability: 'retryable',
+      correlation: { deviceId: DEVICE_ID },
+      exception: normalizeDiagnosticError(e),
+    });
     console.warn('[remote] connect_error:', e.message);
   });
   remoteSocket.on('pet:command', (cmd: RemoteCommand) => {

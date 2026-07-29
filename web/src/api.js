@@ -27,7 +27,7 @@ export function connect(serverUrl, secret, identity) {
             }
             else {
                 listeners.onStatus?.('rejected');
-                listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败');
+                listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败', res?.code || 'socket_join_rejected');
             }
         });
     };
@@ -35,11 +35,11 @@ export function connect(serverUrl, secret, identity) {
     s.on('disconnect', () => listeners.onStatus?.('disconnected'));
     s.on('connect_error', (e) => {
         listeners.onStatus?.('disconnected');
-        listeners.onError?.(`连接出错：${e.message}`);
+        listeners.onError?.(`连接出错：${e.message}`, 'socket_connect_error');
     });
     s.on('room:peers', (p) => listeners.onPeers?.(p));
     s.on('room:kicked', (r) => {
-        listeners.onError?.(`被踢出：${r?.reason || ''}`);
+        listeners.onError?.(`被踢出：${r?.reason || ''}`, `socket_kicked_${r?.reason || 'unknown'}`);
         listeners.onStatus?.('rejected');
     });
     s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));

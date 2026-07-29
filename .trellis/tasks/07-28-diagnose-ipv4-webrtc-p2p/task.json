@@ -1,0 +1,33 @@
+{
+  "id": "diagnose-ipv4-webrtc-p2p",
+  "name": "diagnose-ipv4-webrtc-p2p",
+  "title": "诊断 IPv4 WebRTC P2P 从未成功",
+  "description": "补齐两端可导出的结构化 ICE 诊断，以证据区分 IPv4 srflx 生成、信令传输、ICE generation/时序和 NAT/防火墙路径故障。",
+  "status": "planning",
+  "dev_type": null,
+  "scope": "pet main/preload/renderer diagnostics; web controller WebRTC diagnostics; route status UI; tests and controlled reproduction",
+  "package": "desktop-pet",
+  "priority": "P2",
+  "creator": "deequoique",
+  "assignee": "deequoique",
+  "createdAt": "2026-07-28",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "07-28-end-to-end-diagnostics",
+  "relatedFiles": [
+    "pet/src/main/diagnostics.js",
+    "pet/src/main/index.js",
+    "pet/src/main/preload.js",
+    "pet/src/main/control-preload.js",
+    "pet/src/renderer/main.ts",
+    "web/src/App.tsx"
+  ],
+  "notes": "Observation-only first pass: do not change ICE servers, signaling, negotiation, retry timing, or TURN media policy.",
+  "meta": {}
+}

@@ -14,7 +14,15 @@ contextBridge.exposeInMainWorld('desktopPetControl', {
     ipcRenderer.on('pet:scale-changed', handler);
     return () => ipcRenderer.removeListener('pet:scale-changed', handler);
   },
+  recordDiagnostic: (event) => ipcRenderer.send('diagnostics:record', event),
+  getDiagnosticStatus: () => ipcRenderer.invoke('diagnostics:status'),
+  dismissDiagnosticIncident: (id) => ipcRenderer.invoke('diagnostics:dismiss', id),
   exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
+  onDiagnosticRefresh: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('diagnostics:refresh', handler);
+    return () => ipcRenderer.removeListener('diagnostics:refresh', handler);
+  },
   openExternal: (url) => ipcRenderer.invoke('note:open-external', url),
   onMediaFloatClosed: (cb) => {
     const handler = () => cb();

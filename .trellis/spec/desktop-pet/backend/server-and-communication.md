@@ -113,7 +113,7 @@ CosyVoice 使用 duplex WebSocket，ElevenLabs 使用 `fetch` stream，但两者
 
 客户端可见的运行失败使用稳定的小写错误码，例如 `room_full`、`peer_not_ready`、`tts_queue_full` 和 `tts_upstream_rate_limited`。provider 细节只写 server warning，客户端只接收受控错误码。
 
-日志使用简短 subsystem 前缀，如 `[socket]`、`[tts]`、`[webrtc]`，并使用 `console.log`、`console.warn` 或 `console.error`。禁止记录房间密钥、API key、包含凭据的 Socket.IO payload、完整 TTS 文本或音频。房间日志只使用 hash 的短前缀。
+业务日志通过 `server/src/diagnostics.js` 输出逐行 JSON；字段、关联 ID、脱敏、限频与 PM2 保留规则遵循共享的[诊断与 Incident 契约](../shared/diagnostics-and-incidents.md)。只保留兼容进程探活所需的少量启动文本，新增业务路径不得退回零散 subsystem `console.*`。禁止记录房间密钥、API key、包含凭据的 Socket.IO payload、完整 TTS 文本、音频、SDP 或原始 ICE candidate。
 
 ## 测试
 

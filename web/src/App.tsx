@@ -32,6 +32,8 @@ import {
   type PersonalAudio, type PairingMember, type DesktopNote, type NoteImageInput,
 } from './api';
 import { applyVideoSenderProfile, type VideoRouteProfile } from './video-profile';
+import { normalizeDiagnosticError, recordControlDiagnostic, type RendererDiagnosticInput } from './diagnostics';
+import { attachRtcDiagnostics, type RtcDiagnosticHandle } from './rtc-diagnostics';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
 type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
@@ -61,6 +63,15 @@ const LS_CAMERA_DEVICE = 'pet.cameraDeviceId';
 type PairingConfig = { serverUrl?: string; roomSecret?: string; deviceId?: string; deviceName?: string; memberId?: 'a' | 'b' };
 type PetScaleResult = { ok: boolean; scale?: number; error?: string };
 type DiagnosticsExportResult = { ok: boolean; canceled?: boolean; path?: string; error?: string };
+type DiagnosticIncidentSummary = {
+  id: string;
+  timestamp: string;
+  errorCode: string;
+  message: string;
+  count: number;
+  level: 'fatal';
+};
+type DiagnosticStatus = { pendingIncidents: DiagnosticIncidentSummary[] };
 
 declare global {
   interface Window {
@@ -74,7 +85,11 @@ declare global {
       setPetScale: (scale: number) => Promise<PetScaleResult>;
       resetPetScale: () => Promise<PetScaleResult>;
       onPetScaleChanged: (cb: (scale: number) => void) => () => void;
+      recordDiagnostic: (event: RendererDiagnosticInput) => void;
+      getDiagnosticStatus: () => Promise<DiagnosticStatus>;
+      dismissDiagnosticIncident: (id: string) => Promise<{ ok: boolean; error?: string }>;
       exportDiagnostics: () => Promise<DiagnosticsExportResult>;
+      onDiagnosticRefresh: (cb: () => void) => () => void;
       openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
       onMediaFloatClosed: (cb: () => void) => () => void;
       onOpenNoteComposer: (cb: () => void) => () => void;
@@ -365,6 +380,7 @@ export default function App() {
   const [noteHistory, setNoteHistory] = useState<DesktopNote[]>([]);
   const [favoriteNotes, setFavoriteNotes] = useState<DesktopNote[]>([]);
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
+  const [diagnosticStatus, setDiagnosticStatus] = useState<DiagnosticStatus>({ pendingIncidents: [] });
   const [petScale, setPetScaleState] = useState(1);
   const [callState, setCallState] = useState<CallState>('idle');
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
@@ -401,7 +417,9 @@ export default function App() {
   const remoteMicStreamRef = useRef<MediaStream | null>(null);
   const remoteSystemStreamRef = useRef<MediaStream | null>(null);
   const rtcPcRef = useRef<RTCPeerConnection | null>(null);
+  const rtcDiagnosticsRef = useRef<RtcDiagnosticHandle | null>(null);
   const cameraPcRef = useRef<RTCPeerConnection | null>(null);
+  const cameraDiagnosticsRef = useRef<RtcDiagnosticHandle | null>(null);
   const cameraPcInitRef = useRef<Promise<RTCPeerConnection> | null>(null);
   const cameraSenderRef = useRef<RTCRtpSender | null>(null);
   const localCameraStreamRef = useRef<MediaStream | null>(null);
@@ -429,6 +447,29 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), 2200);
   }, []);
 
+  const refreshDiagnosticStatus = useCallback(async () => {
+    if (!window.desktopPetControl) return;
+    try {
+      setDiagnosticStatus(await window.desktopPetControl.getDiagnosticStatus());
+    } catch (error) {
+      recordControlDiagnostic({
+        event: 'app.diagnostic-status-failed',
+        domain: 'app',
+        level: 'warn',
+        errorCode: 'app_diagnostic_status_failed',
+        recoverability: 'automatic',
+        exception: normalizeDiagnosticError(error),
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDiagnosticStatus();
+    return window.desktopPetControl?.onDiagnosticRefresh(() => {
+      void refreshDiagnosticStatus();
+    });
+  }, [refreshDiagnosticStatus]);
+
   useEffect(() => {
     memberIdRef.current = memberId;
   }, [memberId]);
@@ -447,11 +488,15 @@ export default function App() {
 
   const teardownCall = useCallback((opts?: { sendRemoteHangup?: boolean; nextState?: CallState }) => {
     if (opts?.sendRemoteHangup) endCall(currentCallIdRef.current || undefined);
+    rtcDiagnosticsRef.current?.close('call-teardown');
+    rtcDiagnosticsRef.current = null;
     try { rtcPcRef.current?.close(); } catch {}
     if (recoveryTimerRef.current) window.clearTimeout(recoveryTimerRef.current);
     recoveryTimerRef.current = null;
     iceRestartedRef.current = false;
     rtcPcRef.current = null;
+    cameraDiagnosticsRef.current?.close('call-teardown');
+    cameraDiagnosticsRef.current = null;
     try { cameraPcRef.current?.close(); } catch {}
     cameraPcRef.current = null;
     cameraPcInitRef.current = null;
@@ -536,7 +581,9 @@ export default function App() {
       if (!candidate) continue;
       try {
         await pc.addIceCandidate(candidate);
+        rtcDiagnosticsRef.current?.candidate('remote', 'added', candidate);
       } catch (e) {
+        rtcDiagnosticsRef.current?.candidate('remote', 'add-failed', candidate, e);
         console.warn('[webrtc] addIceCandidate failed:', e);
       }
     }
@@ -564,8 +611,20 @@ export default function App() {
       localAudioRef.current = stream;
       return stream;
     } catch (e: any) {
+      const errorCode = e?.name === 'NotAllowedError'
+        ? 'media_microphone_permission_denied'
+        : 'media_microphone_capture_failed';
+      recordControlDiagnostic({
+        event: 'media.microphone-capture-failed',
+        domain: 'media',
+        level: 'warn',
+        errorCode,
+        recoverability: 'user_action',
+        correlation: { callId: currentCallIdRef.current || undefined },
+        exception: normalizeDiagnosticError(e),
+      });
       console.warn('[webrtc] local microphone capture failed; starting receive-only call:', e);
-      showToast(`麦克风不可用，将只接收远程画面：${e?.message || e}`, true);
+      showToast(`麦克风不可用，将只接收远程画面（${errorCode}）：${e?.message || e}`, true);
       return null;
     }
   }, [showToast]);
@@ -577,6 +636,13 @@ export default function App() {
     const rtcConfig = await requestRtcConfig();
     const pc = new RTCPeerConnection(rtcConfig);
     rtcPcRef.current = pc;
+    rtcDiagnosticsRef.current = attachRtcDiagnostics(pc, {
+      recorder: recordControlDiagnostic,
+      role: 'controller',
+      mediaKind: 'main',
+      getCallId: () => currentCallIdRef.current,
+      configuration: rtcConfig,
+    });
 
     if (localAudio) {
       pc.addTrack(localAudio.getAudioTracks()[0], localAudio);
@@ -587,7 +653,12 @@ export default function App() {
     pc.addTransceiver('video', { direction: 'recvonly' });
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) sendRtcSignal({ candidate: event.candidate.toJSON() });
+      if (event.candidate) {
+        rtcDiagnosticsRef.current?.candidate('local', 'generated', event.candidate);
+        sendRtcSignal({ candidate: event.candidate.toJSON() });
+      } else {
+        rtcDiagnosticsRef.current?.candidate('local', 'gathering-complete');
+      }
     };
     pc.ontrack = async (event) => {
       const streamRef = event.track.kind === 'video'
@@ -638,6 +709,7 @@ export default function App() {
         if (recoveryTimerRef.current) window.clearTimeout(recoveryTimerRef.current);
         recoveryTimerRef.current = null;
         setCallState('in-call');
+        rtcDiagnosticsRef.current?.snapshot('route-selected').catch(() => {});
         readRtcRoute(pc).then(setRtcRoute).catch(() => {});
         return;
       }
@@ -700,12 +772,20 @@ export default function App() {
 
     if (signal.candidate) {
       console.log('[webrtc] controller got ice candidate');
+      rtcDiagnosticsRef.current?.candidate('remote', 'received', signal.candidate);
       const pc = rtcPcRef.current;
       if (!pc?.remoteDescription) {
         pendingCandidatesRef.current.push(signal.candidate);
+        rtcDiagnosticsRef.current?.candidate('remote', 'queued', signal.candidate);
         return;
       }
-      await pc.addIceCandidate(signal.candidate);
+      try {
+        await pc.addIceCandidate(signal.candidate);
+        rtcDiagnosticsRef.current?.candidate('remote', 'added', signal.candidate);
+      } catch (error) {
+        rtcDiagnosticsRef.current?.candidate('remote', 'add-failed', signal.candidate, error);
+        throw error;
+      }
     }
   }, [ensurePeerConnection, flushPendingCandidates, sendRtcSignal]);
 
@@ -837,11 +917,24 @@ export default function App() {
       await syncCameraSenderTrack();
       cameraCapturePendingRef.current = false;
     } catch (error: any) {
+      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+      const errorCode = denied ? 'media_camera_permission_denied' : 'media_camera_capture_failed';
+      recordControlDiagnostic({
+        event: 'media.camera-capture-failed',
+        domain: 'media',
+        level: 'warn',
+        errorCode,
+        recoverability: 'user_action',
+        correlation: { callId: currentCallIdRef.current || undefined },
+        exception: normalizeDiagnosticError(error),
+      });
       cameraDesiredRef.current = false;
       setCameraDesired(false);
-      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
       reportCameraStatus('unavailable', denied ? 'permission_denied' : 'capture_failed');
-      showToast(denied ? '没有获得摄像头权限' : `摄像头打开失败：${error?.message || error}`, true);
+      showToast(
+        denied ? `没有获得摄像头权限（${errorCode}）` : `摄像头打开失败（${errorCode}）：${error?.message || error}`,
+        true,
+      );
       cameraCapturePendingRef.current = false;
     }
   }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, syncCameraSenderTrack]);
@@ -854,13 +947,23 @@ export default function App() {
       if (currentCallIdRef.current !== callId) throw new Error('camera call superseded');
       const pc = new RTCPeerConnection(rtcConfig);
       cameraPcRef.current = pc;
+      cameraDiagnosticsRef.current = attachRtcDiagnostics(pc, {
+        recorder: recordControlDiagnostic,
+        role: 'controller',
+        mediaKind: 'camera',
+        getCallId: () => currentCallIdRef.current,
+        configuration: rtcConfig,
+      });
       if (offererSide) {
         const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
         cameraSenderRef.current = transceiver.sender;
       }
       pc.onicecandidate = (event) => {
         if (event.candidate && currentCallIdRef.current === callId) {
+          cameraDiagnosticsRef.current?.candidate('local', 'generated', event.candidate);
           sendCameraSignal({ callId, candidate: event.candidate.toJSON() });
+        } else if (!event.candidate) {
+          cameraDiagnosticsRef.current?.candidate('local', 'gathering-complete');
         }
       };
       pc.ontrack = (event) => {
@@ -910,7 +1013,14 @@ export default function App() {
     if (!pc?.remoteDescription) return;
     while (cameraPendingCandidatesRef.current.length) {
       const candidate = cameraPendingCandidatesRef.current.shift();
-      if (candidate) await pc.addIceCandidate(candidate);
+      if (!candidate) continue;
+      try {
+        await pc.addIceCandidate(candidate);
+        cameraDiagnosticsRef.current?.candidate('remote', 'added', candidate);
+      } catch (error) {
+        cameraDiagnosticsRef.current?.candidate('remote', 'add-failed', candidate, error);
+        throw error;
+      }
     }
   }, []);
 
@@ -945,8 +1055,19 @@ export default function App() {
       return;
     }
     if (signal.candidate) {
-      if (!pc.remoteDescription) cameraPendingCandidatesRef.current.push(signal.candidate);
-      else await pc.addIceCandidate(signal.candidate);
+      cameraDiagnosticsRef.current?.candidate('remote', 'received', signal.candidate);
+      if (!pc.remoteDescription) {
+        cameraPendingCandidatesRef.current.push(signal.candidate);
+        cameraDiagnosticsRef.current?.candidate('remote', 'queued', signal.candidate);
+      } else {
+        try {
+          await pc.addIceCandidate(signal.candidate);
+          cameraDiagnosticsRef.current?.candidate('remote', 'added', signal.candidate);
+        } catch (error) {
+          cameraDiagnosticsRef.current?.candidate('remote', 'add-failed', signal.candidate, error);
+          throw error;
+        }
+      }
     }
   }, [ensureCameraPeerConnection, flushCameraCandidates, syncCameraSenderTrack]);
 
@@ -984,7 +1105,23 @@ export default function App() {
 
   useEffect(() => {
     setListeners({
-      onStatus: setStatus,
+      onStatus: (nextStatus) => {
+        setStatus(nextStatus);
+        recordControlDiagnostic({
+          event: 'socket.status-changed',
+          domain: 'socket',
+          level: nextStatus === 'rejected' ? 'error' : nextStatus === 'disconnected' ? 'warn' : 'info',
+          ...(nextStatus === 'rejected' ? {
+            errorCode: 'socket_join_rejected',
+            recoverability: 'user_action' as const,
+          } : nextStatus === 'disconnected' ? {
+            errorCode: 'socket_disconnected',
+            recoverability: 'automatic' as const,
+          } : {}),
+          correlation: { deviceId: participantId },
+          context: { status: nextStatus, memberId },
+        });
+      },
       onPeers: (next) => {
         setPeers(next);
         selfDeviceIdRef.current = next.self.deviceId;
@@ -1008,9 +1145,29 @@ export default function App() {
           return callable.length === 1 ? callable[0].id : '';
         });
       },
-      onError: (m) => showToast(m, true),
+      onError: (m, code = 'socket_operation_failed') => {
+        recordControlDiagnostic({
+          event: 'socket.error',
+          domain: 'socket',
+          level: 'error',
+          errorCode: code,
+          recoverability: 'retryable',
+          correlation: { deviceId: participantId, callId: currentCallIdRef.current || undefined },
+          context: { message: m },
+        });
+        showToast(`${m}（${code}）`, true);
+      },
       onSignal: (signal) => {
         handleSignal(signal).catch((e) => {
+          recordControlDiagnostic({
+            event: 'webrtc.signal-processing-failed',
+            domain: 'webrtc',
+            level: 'error',
+            errorCode: 'webrtc_signal_processing_failed',
+            recoverability: 'retryable',
+            correlation: { callId: currentCallIdRef.current || undefined },
+            exception: normalizeDiagnosticError(e),
+          });
           console.warn('[webrtc] signal failed:', e);
           showToast(`通话失败：${e?.message || e}`, true);
           teardownCall({ nextState: 'error' });
@@ -1018,6 +1175,15 @@ export default function App() {
       },
       onCameraSignal: (signal) => {
         handleCameraSignal(signal).catch((error) => {
+          recordControlDiagnostic({
+            event: 'webrtc.camera-signal-processing-failed',
+            domain: 'webrtc',
+            level: 'error',
+            errorCode: 'webrtc_camera_signal_processing_failed',
+            recoverability: 'retryable',
+            correlation: { callId: currentCallIdRef.current || undefined },
+            exception: normalizeDiagnosticError(error),
+          });
           console.warn('[webrtc] camera signal failed:', error);
           showToast(`摄像头连接失败：${error?.message || error}`, true);
         });
@@ -1103,7 +1269,7 @@ export default function App() {
       },
     });
     return () => setListeners({});
-  }, [beginCameraCall, beginMediaCall, handleCameraSignal, handleSignal, showToast, teardownCall]);
+  }, [beginCameraCall, beginMediaCall, handleCameraSignal, handleSignal, memberId, participantId, showToast, teardownCall]);
 
   useEffect(() => () => {
     teardownCall({ nextState: 'idle' });
@@ -1556,9 +1722,37 @@ export default function App() {
   }, [showToast]);
 
   const exportDiagnostics = useCallback(async () => {
-    const result = await window.desktopPetControl?.exportDiagnostics();
-    if (!result || result.canceled) return;
-    showToast(result.ok ? '诊断日志已导出' : `导出失败：${result.error || 'unknown'}`, !result.ok);
+    try {
+      const result = await window.desktopPetControl?.exportDiagnostics();
+      if (!result || result.canceled) return;
+      if (result.ok) {
+        setDiagnosticStatus({ pendingIncidents: [] });
+        showToast(`诊断包已保存：${result.path || '已选择的位置'}`);
+      } else {
+        showToast(`导出失败：${result.error || 'storage_diagnostic_export_failed'}`, true);
+      }
+    } catch (error) {
+      recordControlDiagnostic({
+        event: 'storage.diagnostic-export-failed',
+        domain: 'storage',
+        level: 'error',
+        errorCode: 'storage_diagnostic_export_failed',
+        recoverability: 'retryable',
+        exception: normalizeDiagnosticError(error),
+      });
+      showToast('导出失败：storage_diagnostic_export_failed', true);
+    }
+  }, [showToast]);
+
+  const dismissDiagnosticIncident = useCallback(async (id: string) => {
+    const result = await window.desktopPetControl?.dismissDiagnosticIncident(id);
+    if (!result?.ok) {
+      showToast(`忽略失败：${result?.error || 'storage_diagnostic_incident_update_failed'}`, true);
+      return;
+    }
+    setDiagnosticStatus((current) => ({
+      pendingIncidents: current.pendingIncidents.filter((incident) => incident.id !== id),
+    }));
   }, [showToast]);
 
   const peerMember = peers.members.find((member) => member.id !== peers.self.memberId);
@@ -1928,7 +2122,7 @@ export default function App() {
             {callActive ? (
               <>
                 {!floatContainer && mediaStage}
-                <aside className="call-sidebar"><section className="card"><h2>正在和{peerName}通话</h2><p>{callState === 'in-call' ? '已连接' : '连接中…'}</p></section><section className="card"><h2>通话控制</h2><label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label><label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label><label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label></section><section className="card camera-preview-card"><div className="section-title"><h2>我的摄像头</h2><button onClick={() => setCameraPreviewCollapsed((value) => !value)}>{cameraPreviewCollapsed ? '展开预览' : '收起预览'}</button></div>{!cameraPreviewCollapsed && <video ref={bindLocalCameraVideo} autoPlay muted playsInline />}{cameraDevices.length > 0 && <select aria-label="选择摄像头" value={selectedCameraId} onChange={(event) => selectCamera(event.target.value)}>{cameraDevices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `摄像头 ${index + 1}`}</option>)}</select>}<button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraDesired ? '关闭并释放摄像头' : '打开摄像头'}</button><small>{localCameraStatus === 'available' ? localCameraQuality === 'relay-low' ? '正在以 TURN 低清发送；' : '正在发送；' : localCameraStatus === 'paused' ? '画面暂未发送；' : ''}收起预览不会停止发送；关闭会真正释放硬件。</small></section><section className="card connection-quality"><span className="status-dot" />{rtcRoute.relayed ? 'TURN 低清视频' : rtcRoute.candidateType === 'failed' ? '连接恢复中' : '连接稳定'}</section></aside>
+                <aside className="call-sidebar"><section className="card"><h2>正在和{peerName}通话</h2><p>{callState === 'in-call' ? '已连接' : '连接中…'}</p></section><section className="card"><h2>通话控制</h2><label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label><label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label><label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label></section><section className="card camera-preview-card"><div className="section-title"><h2>我的摄像头</h2><button onClick={() => setCameraPreviewCollapsed((value) => !value)}>{cameraPreviewCollapsed ? '展开预览' : '收起预览'}</button></div>{!cameraPreviewCollapsed && <video ref={bindLocalCameraVideo} autoPlay muted playsInline />}{cameraDevices.length > 0 && <select aria-label="选择摄像头" value={selectedCameraId} onChange={(event) => selectCamera(event.target.value)}>{cameraDevices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `摄像头 ${index + 1}`}</option>)}</select>}<button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraDesired ? '关闭并释放摄像头' : '打开摄像头'}</button><small>{localCameraStatus === 'available' ? localCameraQuality === 'relay-low' ? '正在以 TURN 低清发送；' : '正在发送；' : localCameraStatus === 'paused' ? '画面暂未发送；' : ''}收起预览不会停止发送；关闭会真正释放硬件。</small></section><section className="card connection-quality"><span className="status-dot" />{rtcRoute.candidateType === 'failed' ? '连接恢复中' : rtcRoute.candidateType === 'unknown' ? '正在选路' : rtcRoute.relayed ? 'TURN 低清视频' : `连接稳定 · ${rtcRoute.path}`}</section></aside>
               </>
             ) : (
               <section className="card call-idle">
@@ -1952,9 +2146,28 @@ export default function App() {
               <section className="card settings-section"><h2>连接</h2><div className="form-grid"><label>服务器<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>房间密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label><label>当前身份<strong className="identity-summary">{memberId ? knownMemberNames[memberId] : '未选择'}</strong>{window.desktopPetControl && <button disabled={status !== 'connected'} onClick={() => { if (memberId) { setIdentityChangeTarget(memberId === 'a' ? 'b' : 'a'); setIdentityChangeOpen(true); } }}>更改身份</button>}</label><label>设备名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} disabled={status === 'connecting' || status === 'connected'} /></label></div>{identityChangeOpen && <div className="identity-change"><strong>更改身份会让桌宠和控制端短暂重新连接。</strong><select value={identityChangeTarget} onChange={(event) => setIdentityChangeTarget(event.target.value as MemberId)}><option value="a">{knownMemberNames.a}</option><option value="b">{knownMemberNames.b}</option></select><button className="primary-button" disabled={identityChanging || identityChangeTarget === memberId} onClick={() => void confirmIdentityChange()}>{identityChanging ? '正在更改…' : '确认并重新连接'}</button><button disabled={identityChanging} onClick={() => setIdentityChangeOpen(false)}>取消</button></div>}<div className="settings-actions"><StatusPill status={status} />{status === 'connected' || status === 'connecting' ? <button onClick={onDisconnect}>断开</button> : <button className="primary-button" disabled={!serverUrl.trim() || !secret.trim() || !memberId || !deviceName.trim()} onClick={() => void onConnect()}>连接</button>}</div></section>
               <section className="card settings-section"><h2>成员名称</h2>{peers.members.map((member) => <div className="member-row" key={member.id}><span>{member.id === peers.self.memberId ? '我' : '对方'}</span>{editingMemberId === member.id ? <><input value={memberNameDraft} onChange={(event) => setMemberNameDraft(event.target.value)} /><button onClick={async () => { if (memberNameDraft.trim()) await renameMember(member.id, memberNameDraft.trim()); setEditingMemberId(null); }}>保存</button><button onClick={() => setEditingMemberId(null)}>取消</button></> : <><strong>{member.displayName}</strong><button onClick={() => { setEditingMemberId(member.id); setMemberNameDraft(member.displayName); }}>修改</button></>}</div>)}</section>
               <section className="card settings-section"><h2>设备</h2>{peers.members.map((member) => <div className="device-group" key={member.id}><h3>{member.displayName}</h3>{member.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-signal ${device.petOnline ? 'online' : ''}`} /><div><strong>{device.name}{device.id === peers.self.deviceId ? ' · 本机' : ''}</strong><small>桌宠{device.petOnline ? '在线' : '离线'} · 控制端{device.controllerOnline ? '在线' : '离线'} · {new Date(device.lastSeenAt).toLocaleString()}</small></div>{member.id === peers.self.memberId && device.id !== peers.self.deviceId && !device.petOnline && !device.controllerOnline && (reclaimCandidate?.id === device.id ? <span className="inline-confirm"><button onClick={async () => { await reclaimDevice(device.id, device.name); setReclaimCandidate(null); }}>确认认领</button><button onClick={() => setReclaimCandidate(null)}>取消</button></span> : <button onClick={() => setReclaimCandidate(device)}>认领为本机</button>)}</div>)}</div>)}</section>
-              {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button><button onClick={() => void exportDiagnostics()}>导出诊断日志</button></div></section>}
+              {window.desktopPetControl && <section className="card settings-section"><h2>本机桌宠</h2><div className="scale-settings"><input className="scale-range" type="range" min="30" max="150" step="10" value={Math.round(petScale * 100)} onChange={(event) => void changePetScale(Number(event.target.value) / 100)} /><strong>{Math.round(petScale * 100)}%</strong></div><div className="button-row"><button onClick={() => void resetPetScale()}>恢复默认</button></div></section>}
               <section className="card settings-section"><h2>语音服务</h2><div className="button-row"><button className={ttsMode === 'managed' ? 'selected' : ''} onClick={() => selectTtsMode('managed')}>服务端声音</button>{ttsProvider === 'elevenlabs' && <button className={ttsMode === 'byok' ? 'selected' : ''} onClick={() => selectTtsMode('byok')}>我的 API Key</button>}</div>{ttsMode === 'byok' && <div className="key-row"><input type="password" value={ttsApiKeyInput} onChange={(event) => setTtsApiKeyInput(event.target.value)} placeholder={ttsKeyConfigured ? '已配置，输入新 Key 可替换' : 'ElevenLabs API Key'} /><button onClick={() => void saveByokKey()}>保存</button>{ttsKeyConfigured && <button className="danger" onClick={() => void clearByokKey()}>删除 Key</button>}</div>}</section>
             </>}
+            {window.desktopPetControl && (
+              <section className="card settings-section diagnostics-section">
+                <h2>诊断与故障</h2>
+                {diagnosticStatus.pendingIncidents.map((incident) => (
+                  <div className="diagnostic-incident" key={incident.id}>
+                    <div>
+                      <strong>检测到上次异常退出</strong>
+                      <small>{new Date(incident.timestamp).toLocaleString()} · {incident.errorCode}{incident.count > 1 ? ` · ${incident.count} 次` : ''}</small>
+                    </div>
+                    <span className="button-row">
+                      <button className="primary-button" onClick={() => void exportDiagnostics()}>导出诊断</button>
+                      <button onClick={() => void dismissDiagnosticIncident(incident.id)}>忽略</button>
+                    </span>
+                  </div>
+                ))}
+                <p className="settings-hint">诊断包保存在你选择的位置，不会自动上传。导出前会提示其中包含 IP、端口等网络地址信息。</p>
+                <div className="button-row"><button className="primary-button" onClick={() => void exportDiagnostics()}>导出诊断包</button></div>
+              </section>
+            )}
           </main>
         )}
       </div>

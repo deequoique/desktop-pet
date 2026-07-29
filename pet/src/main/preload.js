@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('pet', {
   savePairingConfig: (config) => ipcRenderer.invoke('pet:save-pairing-config', config),
   onPairingChanged: (cb) => ipcRenderer.on('pet:pairing-changed', (_e, config) => cb(config)),
   getDesktopSourceId: () => ipcRenderer.invoke('pet:desktop-source-id'),
+  recordDiagnostic: (event) => ipcRenderer.send('diagnostics:record', event),
   openExternal: (url) => ipcRenderer.invoke('note:open-external', url),
   isGameMode: () => ipcRenderer.invoke('note:is-game-mode'),
   openNoteComposer: () => ipcRenderer.send('note:open-composer'),
