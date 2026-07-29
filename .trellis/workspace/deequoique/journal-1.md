@@ -527,3 +527,37 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: 修复 WebRTC P2P 带宽估算自锁
+
+**Date**: 2026-07-29
+**Task**: 修复 WebRTC P2P 带宽估算自锁
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+将 P2P 屏幕共享改为480p30至2K90的双维自适应状态机，availableOutgoingBitrate降为软信号，TURN保留360p/5fps硬上限；补齐诊断、回归测试和网络规范。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e0af588` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
