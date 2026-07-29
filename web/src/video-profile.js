@@ -1,10 +1,10 @@
 export const VIDEO_QUALITY_LEVELS = {
     screen: {
-        1: { width: 640, height: 360, maxFramerate: 5, maxBitrate: 240000 },
-        2: { width: 854, height: 480, maxFramerate: 7, maxBitrate: 450000 },
-        3: { width: 1280, height: 720, maxFramerate: 10, maxBitrate: 900000 },
-        4: { width: 1600, height: 900, maxFramerate: 12, maxBitrate: 1500000 },
-        5: { width: 2560, height: 1440, maxFramerate: 15, maxBitrate: 3500000 },
+        1: { width: 640, height: 360, maxFramerate: 60, maxBitrate: 800000 },
+        2: { width: 854, height: 480, maxFramerate: 60, maxBitrate: 1200000 },
+        3: { width: 1280, height: 720, maxFramerate: 60, maxBitrate: 2500000 },
+        4: { width: 1920, height: 1080, maxFramerate: 60, maxBitrate: 5000000 },
+        5: { width: 2560, height: 1440, maxFramerate: 60, maxBitrate: 8000000 },
     },
     camera: {
         1: { width: 320, height: 180, maxFramerate: 10, maxBitrate: 120000 },
@@ -14,9 +14,18 @@ export const VIDEO_QUALITY_LEVELS = {
         5: { width: 1280, height: 720, maxFramerate: 24, maxBitrate: 1500000 },
     },
 };
+export const SCREEN_P2P_STATES = [
+    { qualityLevel: 2, frameRateTarget: 30 },
+    { qualityLevel: 3, frameRateTarget: 30 },
+    { qualityLevel: 3, frameRateTarget: 45 },
+    { qualityLevel: 4, frameRateTarget: 45 },
+    { qualityLevel: 4, frameRateTarget: 60 },
+    { qualityLevel: 5, frameRateTarget: 60 },
+    { qualityLevel: 5, frameRateTarget: 90 },
+];
 export const RELAY_VIDEO_LIMITS = {
-    screen: VIDEO_QUALITY_LEVELS.screen[1],
-    camera: VIDEO_QUALITY_LEVELS.camera[1],
+    screen: { width: 640, height: 360, maxFramerate: 5, maxBitrate: 240000 },
+    camera: { width: 320, height: 180, maxFramerate: 10, maxBitrate: 120000 },
 };
 export function calculateScaleResolutionDownBy(source, limit) {
     const width = Number(source.width);
@@ -31,7 +40,24 @@ function boundedLevel(value) {
 function degrade(target, maximum) {
     return Math.min(target, maximum);
 }
-export function recommendVideoQualityLevel(metrics, kind) {
+function isHealthySample(metrics) {
+    if (metrics.connected === false)
+        return false;
+    const values = [
+        Number(metrics.roundTripTimeMs),
+        Number(metrics.lossRatio),
+        Number(metrics.jitterMs),
+    ];
+    if (!values.some(Number.isFinite))
+        return false;
+    const rtt = values[0];
+    const loss = values[1];
+    const jitter = values[2];
+    return (!Number.isFinite(rtt) || rtt < 120)
+        && (!Number.isFinite(loss) || loss < 0.015)
+        && (!Number.isFinite(jitter) || jitter < 40);
+}
+export function recommendVideoQualityLevel(metrics, _kind) {
     if (metrics.connected === false)
         return 1;
     let target = 5;
@@ -68,23 +94,20 @@ export function recommendVideoQualityLevel(metrics, kind) {
         else if (jitter >= 40)
             target = degrade(target, 4);
     }
-    const available = Number(metrics.availableOutgoingBitrate);
-    if (Number.isFinite(available) && available > 0) {
-        const reserve = kind === 'screen' ? 128000 : 32000;
-        const usable = Math.max(0, available - reserve);
-        let capacityLevel = 1;
-        for (let level = 5; level >= 1; level -= 1) {
-            const candidate = level;
-            if (VIDEO_QUALITY_LEVELS[kind][candidate].maxBitrate * 1.25 <= usable) {
-                capacityLevel = candidate;
-                break;
-            }
-        }
-        target = degrade(target, capacityLevel);
-    }
-    if (metrics.qualityLimitationReason === 'bandwidth')
-        target = degrade(target, 4);
     return target;
+}
+export function estimateBandwidthQualityLevel(metrics, kind) {
+    const available = Number(metrics.availableOutgoingBitrate);
+    if (!Number.isFinite(available) || available <= 0)
+        return 5;
+    const reserve = kind === 'screen' ? 128000 : 32000;
+    const usable = Math.max(0, available - reserve);
+    for (let level = 5; level >= 1; level -= 1) {
+        const candidate = level;
+        if (VIDEO_QUALITY_LEVELS[kind][candidate].maxBitrate * 1.25 <= usable)
+            return candidate;
+    }
+    return 1;
 }
 export class AdaptiveVideoQualityController {
     constructor(initialLevel = 3) {
@@ -102,42 +125,196 @@ export class AdaptiveVideoQualityController {
         return this.level;
     }
     update(metrics, kind, relayed = false) {
-        const targetLevel = relayed ? 1 : recommendVideoQualityLevel(metrics, kind);
-        if (targetLevel < this.level) {
+        const measuredHealthLevel = recommendVideoQualityLevel(metrics, kind);
+        const healthTargetLevel = relayed ? 1 : measuredHealthLevel;
+        const bandwidthLevel = estimateBandwidthQualityLevel(metrics, kind);
+        const targetLevel = healthTargetLevel;
+        if (relayed) {
+            const changed = this.level !== 1;
+            this.level = 1;
+            this.badSamples = 0;
+            this.stableSamples = 0;
+            return { level: 1, targetLevel: 1, healthTargetLevel: 1, bandwidthLevel, changed, reason: 'relay' };
+        }
+        if (healthTargetLevel < this.level) {
             this.stableSamples = 0;
             this.badSamples += 1;
-            const severe = targetLevel === 1 || this.level - targetLevel >= 2;
+            const severe = healthTargetLevel === 1 || this.level - healthTargetLevel >= 2;
             if (severe || this.badSamples >= 2) {
-                this.level = targetLevel;
+                this.level = healthTargetLevel;
                 this.badSamples = 0;
-                return { level: this.level, targetLevel, changed: true, reason: relayed ? 'relay' : 'degrade' };
+                return {
+                    level: this.level,
+                    targetLevel,
+                    healthTargetLevel,
+                    bandwidthLevel,
+                    changed: true,
+                    reason: severe ? 'hard-degrade' : 'degrade',
+                };
             }
-            return { level: this.level, targetLevel, changed: false, reason: 'stable' };
+            return { level: this.level, targetLevel, healthTargetLevel, bandwidthLevel, changed: false, reason: 'stable' };
         }
         this.badSamples = 0;
-        if (targetLevel > this.level) {
+        if (healthTargetLevel > this.level && isHealthySample(metrics)) {
             this.stableSamples += 1;
-            if (this.stableSamples >= 6) {
+            const bandwidthPressure = metrics.qualityLimitationReason === 'bandwidth' && bandwidthLevel < this.level;
+            if (this.stableSamples >= (bandwidthPressure ? 12 : 6)) {
                 this.level = boundedLevel(this.level + 1);
                 this.stableSamples = 0;
-                return { level: this.level, targetLevel, changed: true, reason: 'upgrade' };
+                return {
+                    level: this.level,
+                    targetLevel,
+                    healthTargetLevel,
+                    bandwidthLevel,
+                    changed: true,
+                    reason: bandwidthPressure ? 'recovery-probe' : 'upgrade',
+                };
             }
-            return { level: this.level, targetLevel, changed: false, reason: 'stable' };
         }
-        this.stableSamples = 0;
-        return { level: this.level, targetLevel, changed: false, reason: 'stable' };
+        else {
+            this.stableSamples = 0;
+        }
+        return { level: this.level, targetLevel, healthTargetLevel, bandwidthLevel, changed: false, reason: 'stable' };
     }
 }
-export async function applyVideoSenderProfile(sender, track, profile, kind, requestedLevel = profile === 'relay-low' ? 1 : 5) {
+const RELAY_SCREEN_STATE = { qualityLevel: 1, frameRateTarget: 5 };
+function copyScreenState(state) {
+    return { qualityLevel: state.qualityLevel, frameRateTarget: state.frameRateTarget };
+}
+export class AdaptiveScreenQualityController {
+    constructor() {
+        this.stateIndex = 0;
+        this.relayed = false;
+        this.badSamples = 0;
+        this.stableSamples = 0;
+    }
+    current() {
+        return copyScreenState(this.relayed ? RELAY_SCREEN_STATE : SCREEN_P2P_STATES[this.stateIndex]);
+    }
+    reset(relayed = false) {
+        this.relayed = relayed;
+        this.stateIndex = 0;
+        this.badSamples = 0;
+        this.stableSamples = 0;
+        return this.current();
+    }
+    update(metrics, relayed = false) {
+        const bandwidthLevel = estimateBandwidthQualityLevel(metrics, 'screen');
+        if (relayed) {
+            const changed = !this.relayed || this.stateIndex !== 0;
+            this.relayed = true;
+            this.stateIndex = 0;
+            this.badSamples = 0;
+            this.stableSamples = 0;
+            return {
+                state: copyScreenState(RELAY_SCREEN_STATE),
+                healthTargetLevel: 1,
+                bandwidthLevel,
+                changed,
+                reason: 'relay',
+            };
+        }
+        const cameFromRelay = this.relayed;
+        this.relayed = false;
+        const healthTargetLevel = recommendVideoQualityLevel(metrics, 'screen');
+        if (cameFromRelay) {
+            this.stateIndex = 0;
+            this.badSamples = 0;
+            this.stableSamples = 0;
+            return {
+                state: this.current(),
+                healthTargetLevel,
+                bandwidthLevel,
+                changed: true,
+                reason: 'recovery-probe',
+            };
+        }
+        if (healthTargetLevel === 1) {
+            const changed = this.stateIndex !== 0;
+            this.stateIndex = 0;
+            this.badSamples = 0;
+            this.stableSamples = 0;
+            return {
+                state: this.current(),
+                healthTargetLevel,
+                bandwidthLevel,
+                changed,
+                reason: changed ? 'hard-degrade' : 'stable',
+            };
+        }
+        const current = SCREEN_P2P_STATES[this.stateIndex];
+        if (healthTargetLevel < current.qualityLevel) {
+            this.stableSamples = 0;
+            this.badSamples += 1;
+            if (this.badSamples >= 2) {
+                this.stateIndex = Math.max(0, this.stateIndex - 1);
+                this.badSamples = 0;
+                return {
+                    state: this.current(),
+                    healthTargetLevel,
+                    bandwidthLevel,
+                    changed: true,
+                    reason: 'congestion-step-down',
+                };
+            }
+            return { state: this.current(), healthTargetLevel, bandwidthLevel, changed: false, reason: 'stable' };
+        }
+        this.badSamples = 0;
+        const next = SCREEN_P2P_STATES[this.stateIndex + 1];
+        if (next && healthTargetLevel >= next.qualityLevel && isHealthySample(metrics)) {
+            this.stableSamples += 1;
+            const bandwidthPressure = metrics.qualityLimitationReason === 'bandwidth'
+                && bandwidthLevel < next.qualityLevel;
+            const baseSamples = next.qualityLevel === 5 ? 6 : 3;
+            const requiredSamples = bandwidthPressure ? baseSamples * 2 : baseSamples;
+            if (this.stableSamples >= requiredSamples) {
+                this.stateIndex += 1;
+                this.stableSamples = 0;
+                return {
+                    state: this.current(),
+                    healthTargetLevel,
+                    bandwidthLevel,
+                    changed: true,
+                    reason: bandwidthPressure
+                        ? 'recovery-probe'
+                        : next.qualityLevel > current.qualityLevel
+                            ? 'quality-upgrade'
+                            : 'frame-rate-upgrade',
+                };
+            }
+        }
+        else {
+            this.stableSamples = 0;
+        }
+        return { state: this.current(), healthTargetLevel, bandwidthLevel, changed: false, reason: 'stable' };
+    }
+}
+function screenP2PLimit(level, frameRateTarget) {
+    const base = VIDEO_QUALITY_LEVELS.screen[level];
+    const maxFramerate = Math.max(1, Math.min(90, Math.round(frameRateTarget)));
+    return {
+        ...base,
+        maxFramerate,
+        maxBitrate: Math.round(base.maxBitrate * maxFramerate / 60),
+    };
+}
+export async function applyVideoSenderProfile(sender, track, profile, kind, requestedLevel = profile === 'relay-low' ? 1 : 5, requestedFrameRate) {
     try {
         const parameters = sender.getParameters();
         if (!parameters.encodings?.length)
             return { ok: false, error: 'missing_encoding' };
         const level = profile === 'relay-low' ? 1 : boundedLevel(requestedLevel);
-        const limit = VIDEO_QUALITY_LEVELS[kind][level];
+        const limit = profile === 'relay-low'
+            ? RELAY_VIDEO_LIMITS[kind]
+            : kind === 'screen'
+                ? screenP2PLimit(level, requestedFrameRate ?? VIDEO_QUALITY_LEVELS.screen[level].maxFramerate)
+                : VIDEO_QUALITY_LEVELS.camera[level];
         const scale = calculateScaleResolutionDownBy(track.getSettings(), limit);
         if (scale == null)
             return { ok: false, error: 'missing_track_dimensions' };
+        parameters.degradationPreference = kind === 'screen' && profile === 'normal'
+            ? 'maintain-framerate'
+            : 'balanced';
         for (const encoding of parameters.encodings) {
             encoding.maxBitrate = limit.maxBitrate;
             encoding.maxFramerate = limit.maxFramerate;

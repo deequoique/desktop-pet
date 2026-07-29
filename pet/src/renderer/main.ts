@@ -4,8 +4,9 @@ import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
 import { createVRMAnimationClip, VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation';
 import { io, type Socket } from 'socket.io-client';
 import {
-  AdaptiveVideoQualityController,
+  AdaptiveScreenQualityController,
   applyVideoSenderProfile,
+  type ScreenAdaptiveState,
   type VideoQualityLevel,
   type VideoRouteProfile,
 } from './video-profile';
@@ -1770,8 +1771,8 @@ let rtcRemoteAudioStream: MediaStream | null = null;
 const rtcPendingCandidates: RTCIceCandidateInit[] = [];
 let screenRequestedByController = true;
 let screenRouteProfile: VideoRouteProfile = 'unknown';
-let screenQualityLevel: VideoQualityLevel = 3;
-const screenQualityController = new AdaptiveVideoQualityController(screenQualityLevel);
+const screenQualityController = new AdaptiveScreenQualityController();
+let screenAdaptiveState: ScreenAdaptiveState = screenQualityController.current();
 let rtcScreenSender: RTCRtpSender | null = null;
 let screenProfileGeneration = 0;
 let screenProfileApplyChain: Promise<void> = Promise.resolve();
@@ -1901,7 +1902,14 @@ async function applyRequestedScreenState() {
   const profile = screenRouteProfile;
   const operation = screenProfileApplyChain.catch(() => {}).then(async () => {
     if (generation !== screenProfileGeneration || !screenRequestedByController) return;
-    const applied = await applyVideoSenderProfile(sender, screenTrack, profile, 'screen', screenQualityLevel);
+    const applied = await applyVideoSenderProfile(
+      sender,
+      screenTrack,
+      profile,
+      'screen',
+      screenAdaptiveState.qualityLevel,
+      screenAdaptiveState.frameRateTarget,
+    );
     if (generation !== screenProfileGeneration || !screenRequestedByController) return;
     if (!applied.ok) {
       console.warn('[webrtc] screen video profile unavailable:', applied.error);
@@ -1948,7 +1956,7 @@ function handleScreenNetworkSample(sample: RtcNetworkSample) {
   const routeChanged = screenRouteProfile !== nextProfile;
   if (routeChanged) {
     screenRouteProfile = nextProfile;
-    screenQualityLevel = screenQualityController.reset(sample.effectiveRelayed ? 1 : 3);
+    screenAdaptiveState = screenQualityController.reset(sample.effectiveRelayed);
   }
   const decision = screenQualityController.update({
     connected: sample.connected,
@@ -1957,17 +1965,19 @@ function handleScreenNetworkSample(sample: RtcNetworkSample) {
     lossRatio: sample.lossRatio,
     jitterMs: sample.jitterMs,
     qualityLimitationReason: sample.outboundVideo?.qualityLimitationReason,
-  }, 'screen', sample.effectiveRelayed);
+  }, sample.effectiveRelayed);
   if (!routeChanged && !decision.changed) return;
-  screenQualityLevel = decision.level;
+  screenAdaptiveState = decision.state;
   recordPetDiagnostic({
     event: 'webrtc.quality-changed',
     domain: 'webrtc',
     correlation: { callId: activeCallId },
     context: {
       mediaKind: 'screen',
-      qualityLevel: decision.level,
-      targetLevel: decision.targetLevel,
+      qualityLevel: decision.state.qualityLevel,
+      frameRateTarget: decision.state.frameRateTarget,
+      healthTargetLevel: decision.healthTargetLevel,
+      bandwidthLevel: decision.bandwidthLevel,
       reason: routeChanged ? (sample.effectiveRelayed ? 'relay' : 'route-recovered') : decision.reason,
       effectiveRelayed: sample.effectiveRelayed,
       roundTripTimeMs: sample.roundTripTimeMs,
@@ -2061,7 +2071,7 @@ function cleanupRtc(sendHangup = false) {
   rtcAudioEl.srcObject = null;
   screenRequestedByController = true;
   screenRouteProfile = 'unknown';
-  screenQualityLevel = screenQualityController.reset(3);
+  screenAdaptiveState = screenQualityController.reset();
   screenProfileGeneration += 1;
   screenProfileApplyChain = Promise.resolve();
   activeCallId = '';
@@ -2100,6 +2110,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
           minHeight: 720,
           maxWidth: 2560,
           maxHeight: 1440,
+          maxFrameRate: 90,
         },
       },
     };
@@ -2124,7 +2135,7 @@ async function ensurePetMedia(): Promise<MediaStream> {
     try {
       rtcScreenStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          frameRate: 15,
+          frameRate: { ideal: 90, max: 90 },
           width: { ideal: 1600 },
           height: { ideal: 900 },
         },
@@ -2274,7 +2285,7 @@ async function ensurePetPeerConnection(): Promise<RTCPeerConnection> {
       noteRemote('call on');
       selectedPairVideoProfile(pc).then((profile) => {
         screenRouteProfile = profile;
-        screenQualityLevel = screenQualityController.reset(profile === 'relay-low' ? 1 : 3);
+        screenAdaptiveState = screenQualityController.reset(profile === 'relay-low');
         void applyRequestedScreenState();
       }).catch((error) => {
         console.warn('[webrtc] route inspection failed:', error);

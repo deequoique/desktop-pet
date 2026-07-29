@@ -176,7 +176,7 @@ const controls = !floatContainer && <div className="media-controls">...</div>;
 // video { object-fit: contain }
 ```
 
-## 9. Scenario: effective relay and five-tier adaptive video
+## 9. Scenario: effective relay and dual-axis adaptive video
 
 ### 1. Scope / Trigger
 
@@ -187,6 +187,10 @@ const controls = !floatContainer && <div className="media-controls">...</div>;
 
 ```ts
 type VideoQualityLevel = 1|2|3|4|5;
+type ScreenAdaptiveState = {
+  qualityLevel: VideoQualityLevel;
+  frameRateTarget: 5|30|45|60|90;
+};
 type RtcNetworkSample = {
   selectedPair?: {
     effectiveRelayed: boolean;
@@ -209,21 +213,39 @@ recommendVideoQualityLevel(
   kind: 'screen'|'camera',
 ): VideoQualityLevel;
 
+interface AdaptiveScreenQualityController {
+  update(
+    metrics: AdaptiveVideoMetrics,
+    relayed?: boolean,
+  ): {
+    state: ScreenAdaptiveState;
+    healthTargetLevel: VideoQualityLevel;
+    bandwidthLevel: VideoQualityLevel;
+    changed: boolean;
+    reason: string;
+  };
+}
+
 applyVideoSenderProfile(
   sender: RTCRtpSender,
   track: MediaStreamTrack,
   route: 'normal'|'relay-low',
   kind: 'screen'|'camera',
   level: VideoQualityLevel,
-): Promise<{ok:true; level:VideoQualityLevel}|{ok:false; reason:string}>;
+  frameRateTarget?: number,
+): Promise<{ok:true; level:VideoQualityLevel}|{ok:false; error:string}>;
 ```
 
 ### 3. Contracts
 
 - Effective relay 为以下任一条件成立：candidate 是 `relay`；存在 `relayProtocol`；candidate address 命中 `RTC_TURN_URLS` host；selected `prflx` 与同一 report 中的 relay candidate 共享 port 和 username fragment。
-- screen 档位 1→5 分别为 `640×360/5/240k`、`854×480/7/450k`、`1280×720/10/900k`、`1600×900/12/1.5m`、`2560×1440/15/3.5m`。
+- P2P screen 使用内部状态 `480p30 → 720p30 → 720p45 → 1080p45 → 1080p60 → 2K60 → 2K90`；`qualityLevel` 仍只表示分辨率，最高2K是2560×1440。
+- P2P screen 的60fps码率基线依次为 360p/800k、480p/1.2m、720p/2.5m、1080p/5m、2K/8m；实际 `maxBitrate = base60 × frameRateTarget / 60`。P2P 设置 `degradationPreference='maintain-framerate'`。
+- TURN screen 不进入P2P状态表，固定为 `640×360/5fps/240k`。
 - camera 档位 1→5 分别为 `320×180/10/120k`、`480×270/12/240k`、`640×360/15/500k`、`960×540/20/900k`、`1280×720/24/1.5m`。
-- 每 2 秒读取 compact selected pair/RTP stats。严重恶化或档位 1 立即下降；普通恶化连续 2 次下降；连续稳定 6 次才逐档上升。effective relay 始终锁定 1 档。
+- 每2秒读取 compact selected pair/RTP stats。P2P screen 普通状态连续3个健康样本升一级，2K60/2K90连续6个健康样本升一级；bandwidth软信号有压力时观察窗口加倍。普通拥塞连续2次反向退一级，严重RTT/loss/jitter或连接失败立即回到480p30。
+- `availableOutgoingBitrate` 是 Chromium 基于近期发送反馈的估算，不是独立测速。它不得单独降低P2P状态；与 `qualityLimitationReason='bandwidth'` 同时出现时只能延长升级观察，且健康P2P必须保留恢复探测机会。
+- `webrtc.quality-changed` 至少记录 `qualityLevel`、screen的`frameRateTarget`、`healthTargetLevel`、`bandwidthLevel`、reason和参与决策的网络指标。
 - `webrtc:media-status.qualityLevel` 是可选整数 1..5。server 仅校验并转发当前 call 的合法来源；旧 `quality` 字段继续兼容。
 - coturn 在公网 IP 不等于私网 IP 时必须配置精确的 `external-ip=<PUBLIC_IP>/<PRIVATE_IP>`，同时固定 `relay-ip` 与 relay 端口范围。
 
@@ -233,6 +255,8 @@ applyVideoSenderProfile(
 | --- | --- |
 | `qualityLevel` 非整数或不在 1..5 | server 丢弃该可选字段，其他合法 status 可继续转发 |
 | selected `prflx` 命中 TURN host/relay alias | UI 和 sender 一律按 TURN、1 档处理 |
+| 健康P2P但初始 `availableOutgoingBitrate` 偏低 | 不降档；连续健康后执行逐级恢复探测 |
+| RTT ≥550ms、loss ≥9%或jitter ≥180ms | P2P screen立即回到480p30；camera进入1档 |
 | selected pair unknown/failed | 对应视频 fail closed，音频保持 |
 | stats 暂缺 RTT/带宽/RTP | 使用已有指标保守判级，不抛错、不结束 call |
 | `setParameters()` 失败 | null/disable 对应视频并上报 `profile_failed` |
@@ -240,13 +264,13 @@ applyVideoSenderProfile(
 
 ### 5. Good/Base/Bad Cases
 
-- Good：真实 IPv4 P2P 显示公网两端地址，网络稳定后每约 12 秒最多升一档；拥堵时快速下降且不重捕获。
+- Good：真实 IPv4/IPv6 P2P 从480p30逐级恢复，普通台阶约6秒、高成本2K台阶约12秒；拥堵时沿状态表回退且不重捕获。
 - Base：TURN 或 NAT 后伪 `prflx` 始终显示 TURN/1档，声音连续，UI 每约 2 秒更新 RTT、接收码率与帧率。
-- Bad：只以 `candidateType !== relay` 宣称 P2P；在一次高延迟 TURN 上发送 1440p；每次档位变化都 stop/reacquire track；把周期 stats 发到 server。
+- Bad：把低 `availableOutgoingBitrate` 当硬容量门造成5fps自锁；只以 `candidateType !== relay` 宣称P2P；在TURN上发送2K；每次状态变化都stop/reacquire track。
 
 ### 6. Tests Required
 
-- 纯函数：五档参数、比例不放大、严重/连续降档、六次稳定逐档升级、TURN 锁 1 档。
+- 纯函数：七个P2P screen状态、独立fps/scale/bitrate、低估算恢复探测、严重/连续降档、TURN锁5fps、camera帧率不变。
 - RTC stats：覆盖 `relayProtocol`、TURN host、同 port+ufrag alias、delta bitrate/loss、selected pair 与最多 8 个 alternatives。
 - Server integration：合法 `qualityLevel` 定向转发，非法值、伪造 source、过期 call 与错误 role 不泄漏。
 - 构建/部署：server/pet tests、web/pet build、两份 profile/diagnostics 镜像一致、`bash -n` 与 coturn verify 现场检查。
@@ -260,12 +284,20 @@ applyVideoSenderProfile(
 const relayed = selectedCandidate.candidateType === 'relay';
 await sender.replaceTrack(null); // every quality transition
 await sender.setParameters({ encodings: [{ maxBitrate: 3_500_000 }] }); // TURN
+const level = estimateFromAvailableOutgoingBitrate(sample); // hard capacity gate
 ```
 
 #### Correct
 
 ```ts
 const relayed = isEffectiveRelayCandidate(selectedCandidate, allCandidates, configuration);
-const next = controller.update(sample, mediaKind);
-await applyVideoSenderProfile(sender, track, relayed ? 'relay-low' : 'normal', mediaKind, next.level);
+const next = screenController.update(sample, relayed);
+await applyVideoSenderProfile(
+  sender,
+  track,
+  relayed ? 'relay-low' : 'normal',
+  'screen',
+  next.state.qualityLevel,
+  next.state.frameRateTarget,
+);
 ```

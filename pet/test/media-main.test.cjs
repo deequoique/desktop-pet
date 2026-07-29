@@ -47,7 +47,7 @@ test('controller camera is bidirectional, locally controlled, and listener refre
 });
 
 test('TURN keeps bounded low-resolution screen and camera video with fail-closed profiles', () => {
-  assert.match(petRendererSource, /applyVideoSenderProfile\(sender, screenTrack, profile, 'screen', screenQualityLevel\)/);
+  assert.match(petRendererSource, /applyVideoSenderProfile\([\s\S]*?sender,[\s\S]*?screenTrack,[\s\S]*?profile,[\s\S]*?'screen',[\s\S]*?screenAdaptiveState\.qualityLevel,[\s\S]*?screenAdaptiveState\.frameRateTarget/);
   assert.match(petRendererSource, /screenProfileApplyChain\.catch\(\(\) => \{\}\)\.then/);
   assert.match(petRendererSource, /if \(!applied\.ok\)[\s\S]*?screenTrack\.enabled = false;[\s\S]*?screenTrack\.enabled = true/);
   assert.match(appSource, /applyVideoSenderProfile\([\s\S]*?sender,[\s\S]*?track,[\s\S]*?profile,[\s\S]*?'camera',[\s\S]*?cameraQualityLevelRef\.current/);
@@ -56,7 +56,9 @@ test('TURN keeps bounded low-resolution screen and camera video with fail-closed
   assert.match(appSource, /TURN 低清视频/);
   assert.match(appSource, /qualityLevelLabel\(screenQualityLevel\)/);
   assert.match(appSource, /rtcNetworkSample\?\.roundTripTimeMs/);
-  assert.match(petRendererSource, /new AdaptiveVideoQualityController\(screenQualityLevel\)/);
+  assert.match(petRendererSource, /new AdaptiveScreenQualityController\(\)/);
+  assert.match(petRendererSource, /frameRate:\s*\{\s*ideal:\s*90,\s*max:\s*90\s*\}/);
+  assert.match(petRendererSource, /screenAdaptiveState\.frameRateTarget/);
   assert.doesNotMatch(appSource, /TURN 音频兜底|relay_audio_only/);
   assert.doesNotMatch(petRendererSource, /screenRouteIsP2P|relay_audio_only/);
 });

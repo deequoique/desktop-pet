@@ -1066,6 +1066,8 @@ export default function App() {
               mediaKind: 'camera',
               qualityLevel: decision.level,
               targetLevel: decision.targetLevel,
+              healthTargetLevel: decision.healthTargetLevel,
+              bandwidthLevel: decision.bandwidthLevel,
               reason: routeChanged ? (sample.effectiveRelayed ? 'relay' : 'route-recovered') : decision.reason,
               effectiveRelayed: sample.effectiveRelayed,
               roundTripTimeMs: sample.roundTripTimeMs,
