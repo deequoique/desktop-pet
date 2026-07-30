@@ -1343,7 +1343,7 @@ io.on('connection', (socket) => {
     if (!targetId) return;
     const allowedReasons = new Set([
       'controller_disabled', 'capture_failed', 'permission_denied',
-      'device_lost', 'track_ended', 'profile_failed',
+      'device_lost', 'track_ended', 'profile_failed', 'relay_disabled',
     ]);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
     const quality = ['normal', 'relay-low'].includes(payload?.quality) ? payload.quality : undefined;

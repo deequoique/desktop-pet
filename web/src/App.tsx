@@ -57,7 +57,7 @@ type SetupStage = 'server' | 'identity' | 'complete';
 type RtcRoute = {
   candidateType: CandidateType;
   relayed: boolean;
-  path: 'IPv4 P2P' | 'IPv6 P2P' | 'TURN 低清视频' | '选路中' | '失败';
+  path: 'IPv4 P2P' | 'IPv6 P2P' | 'TURN 自适应视频' | '选路中' | '失败';
   detail: string;
 };
 
@@ -289,7 +289,7 @@ function routeFromPair(pair?: RtcPairSummary | null, configuration?: RTCConfigur
   return {
     candidateType,
     relayed,
-    path: relayed ? 'TURN 低清视频' : ipv6 ? 'IPv6 P2P' : ipv4 ? 'IPv4 P2P' : '选路中',
+    path: relayed ? 'TURN 自适应视频' : ipv6 ? 'IPv6 P2P' : ipv4 ? 'IPv4 P2P' : '选路中',
     detail: detail || 'ICE 已连接',
   };
 }
@@ -455,6 +455,7 @@ export default function App() {
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState(() => localStorage.getItem(LS_CAMERA_DEVICE) || '');
   const [cameraPreviewCollapsed, setCameraPreviewCollapsed] = useState(false);
+  const [cameraRouteState, setCameraRouteState] = useState<VideoRouteProfile>('unknown');
   const [cameraHidden, setCameraHidden] = useState(false);
   const [preferredPrimary, setPreferredPrimary] = useState<'screen' | 'camera'>('screen');
   const [floatContainer, setFloatContainer] = useState<HTMLElement | null>(null);
@@ -481,6 +482,9 @@ export default function App() {
   const localCameraStreamRef = useRef<MediaStream | null>(null);
   const remoteCameraStreamRef = useRef<MediaStream | null>(null);
   const cameraPendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const cameraDeferredSignalsRef = useRef<WebRtcSignal[]>([]);
+  const cameraPrewarmReadyRef = useRef(false);
+  const cameraPrewarmStartedCallIdRef = useRef('');
   const cameraOffererDeviceIdRef = useRef('');
   const selfDeviceIdRef = useRef('');
   const memberIdRef = useRef<MemberId | ''>('');
@@ -538,6 +542,13 @@ export default function App() {
     localAudioRef.current = null;
   }, []);
 
+  const stopLocalCameraCapture = useCallback(() => {
+    for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
+    localCameraStreamRef.current = null;
+    cameraCapturePendingRef.current = false;
+    if (localCameraVideoRef.current) localCameraVideoRef.current.srcObject = null;
+  }, []);
+
   const setMicEnabled = useCallback((enabled: boolean) => {
     for (const track of localAudioRef.current?.getAudioTracks() ?? []) {
       track.enabled = enabled;
@@ -561,14 +572,16 @@ export default function App() {
     cameraPcInitRef.current = null;
     cameraSenderRef.current = null;
     cameraPendingCandidatesRef.current = [];
+    cameraDeferredSignalsRef.current = [];
+    cameraPrewarmReadyRef.current = false;
+    cameraPrewarmStartedCallIdRef.current = '';
     cameraRouteProfileRef.current = 'unknown';
+    setCameraRouteState('unknown');
     cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
     cameraProfileGenerationRef.current += 1;
     cameraProfileApplyChainRef.current = Promise.resolve();
     cameraOffererDeviceIdRef.current = '';
-    cameraCapturePendingRef.current = false;
-    for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
-    localCameraStreamRef.current = null;
+    stopLocalCameraCapture();
     remoteCameraStreamRef.current = null;
     cameraDesiredRef.current = false;
     setCameraDesired(false);
@@ -607,7 +620,7 @@ export default function App() {
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     if (remoteMicAudioRef.current) remoteMicAudioRef.current.srcObject = null;
     if (remoteSystemAudioRef.current) remoteSystemAudioRef.current.srcObject = null;
-  }, [setMicEnabled, stopLocalAudio]);
+  }, [setMicEnabled, stopLocalAudio, stopLocalCameraCapture]);
 
   const sendRtcSignal = useCallback((signal: WebRtcSignal) => {
     return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined }, callTargetIdRef.current || undefined);
@@ -893,6 +906,36 @@ export default function App() {
     });
   }, []);
 
+  const disableCameraForRelay = useCallback(async () => {
+    const callId = currentCallIdRef.current;
+    if (!callId) return;
+    const newlyBlocked = cameraRouteProfileRef.current !== 'relay-low';
+    const generation = ++cameraProfileGenerationRef.current;
+    cameraRouteProfileRef.current = 'relay-low';
+    setCameraRouteState('relay-low');
+    cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(1);
+    cameraDesiredRef.current = false;
+    setCameraDesired(false);
+    const sender = cameraSenderRef.current;
+    const operation = cameraProfileApplyChainRef.current.catch(() => {}).then(async () => {
+      if (generation !== cameraProfileGenerationRef.current || currentCallIdRef.current !== callId) return;
+      try { await sender?.replaceTrack(null); } catch {}
+    });
+    cameraProfileApplyChainRef.current = operation;
+    await operation;
+    if (generation !== cameraProfileGenerationRef.current || currentCallIdRef.current !== callId) return;
+    stopLocalCameraCapture();
+    reportCameraStatus('unavailable', 'relay_disabled');
+    if (newlyBlocked) {
+      recordControlDiagnostic({
+        event: 'webrtc.camera-relay-disabled',
+        domain: 'webrtc',
+        correlation: { callId },
+        context: { mediaKind: 'camera', effectiveRelayed: true },
+      });
+    }
+  }, [reportCameraStatus, stopLocalCameraCapture]);
+
   const syncCameraSenderTrack = useCallback(async () => {
     const generation = ++cameraProfileGenerationRef.current;
     const sender = cameraSenderRef.current;
@@ -903,6 +946,10 @@ export default function App() {
       return;
     }
     const profile = cameraRouteProfileRef.current;
+    if (profile === 'relay-low') {
+      await disableCameraForRelay();
+      return;
+    }
     if (profile === 'unknown' || profile === 'failed') {
       await sender.replaceTrack(null);
       reportCameraStatus('paused');
@@ -938,13 +985,13 @@ export default function App() {
       reportCameraStatus(
         'available',
         undefined,
-        profile === 'relay-low' ? 'relay-low' : 'normal',
+        'normal',
         applied.level,
       );
     });
     cameraProfileApplyChainRef.current = operation;
     await operation;
-  }, [reportCameraStatus]);
+  }, [disableCameraForRelay, reportCameraStatus]);
 
   const setLocalCameraEnabled = useCallback(async (enabled: boolean) => {
     const callId = currentCallIdRef.current;
@@ -955,11 +1002,21 @@ export default function App() {
     setCameraDesired(enabled);
     if (!enabled) {
       try { await cameraSenderRef.current?.replaceTrack(null); } catch {}
-      for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
-      localCameraStreamRef.current = null;
-      if (localCameraVideoRef.current) localCameraVideoRef.current.srcObject = null;
+      stopLocalCameraCapture();
       reportCameraStatus('unavailable', 'controller_disabled');
+      return;
+    }
+    if (cameraRouteProfileRef.current !== 'normal') {
+      cameraDesiredRef.current = false;
+      setCameraDesired(false);
       cameraCapturePendingRef.current = false;
+      if (cameraRouteProfileRef.current === 'relay-low') {
+        reportCameraStatus('unavailable', 'relay_disabled');
+        showToast('摄像头通道使用 TURN，为保证屏幕和声音已关闭', true);
+      } else {
+        reportCameraStatus('paused');
+        showToast('正在检测摄像头网络路径，请稍后再试', true);
+      }
       return;
     }
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -1024,7 +1081,7 @@ export default function App() {
       );
       cameraCapturePendingRef.current = false;
     }
-  }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, syncCameraSenderTrack]);
+  }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, stopLocalCameraCapture, syncCameraSenderTrack]);
 
   const ensureCameraPeerConnection = useCallback(async (offererSide: boolean, callId: string) => {
     if (cameraPcRef.current) return cameraPcRef.current;
@@ -1042,11 +1099,17 @@ export default function App() {
         configuration: rtcConfig,
         onSample: (sample) => {
           if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc || !sample.connected) return;
-          const nextProfile: VideoRouteProfile = sample.effectiveRelayed ? 'relay-low' : 'normal';
-          const routeChanged = cameraRouteProfileRef.current !== nextProfile;
+          if (sample.effectiveRelayed) {
+            void disableCameraForRelay();
+            return;
+          }
+          const recoveredFromRelay = cameraRouteProfileRef.current === 'relay-low';
+          const routeChanged = cameraRouteProfileRef.current !== 'normal';
           if (routeChanged) {
-            cameraRouteProfileRef.current = nextProfile;
-            cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(sample.effectiveRelayed ? 1 : DEFAULT_QUALITY_LEVEL);
+            cameraRouteProfileRef.current = 'normal';
+            setCameraRouteState('normal');
+            cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
+            if (recoveredFromRelay) showToast('摄像头网络已恢复 P2P，可手动重新打开');
           }
           const decision = cameraQualityControllerRef.current.update({
             connected: sample.connected,
@@ -1055,7 +1118,7 @@ export default function App() {
             lossRatio: sample.lossRatio,
             jitterMs: sample.jitterMs,
             qualityLimitationReason: sample.outboundVideo?.qualityLimitationReason,
-          }, 'camera', sample.effectiveRelayed);
+          }, 'camera', false);
           if (!routeChanged && !decision.changed) return;
           cameraQualityLevelRef.current = decision.level;
           recordControlDiagnostic({
@@ -1068,8 +1131,8 @@ export default function App() {
               targetLevel: decision.targetLevel,
               healthTargetLevel: decision.healthTargetLevel,
               bandwidthLevel: decision.bandwidthLevel,
-              reason: routeChanged ? (sample.effectiveRelayed ? 'relay' : 'route-recovered') : decision.reason,
-              effectiveRelayed: sample.effectiveRelayed,
+              reason: routeChanged ? (recoveredFromRelay ? 'route-recovered' : 'route-selected') : decision.reason,
+              effectiveRelayed: false,
               roundTripTimeMs: sample.roundTripTimeMs,
               availableOutgoingBitrate: sample.availableOutgoingBitrate,
               lossRatio: sample.lossRatio,
@@ -1109,20 +1172,31 @@ export default function App() {
         if (pc.connectionState === 'connected') {
           readRtcRoute(pc, rtcConfig).then(async (route) => {
             if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
-            cameraRouteProfileRef.current = route.candidateType === 'unknown'
-              ? 'unknown'
-              : route.relayed ? 'relay-low' : 'normal';
-            cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(
-              route.relayed ? 1 : DEFAULT_QUALITY_LEVEL,
-            );
+            if (route.relayed) {
+              await disableCameraForRelay();
+              return;
+            }
+            if (route.candidateType === 'unknown') {
+              cameraRouteProfileRef.current = 'unknown';
+              setCameraRouteState('unknown');
+              await syncCameraSenderTrack();
+              return;
+            }
+            const recoveredFromRelay = cameraRouteProfileRef.current === 'relay-low';
+            cameraRouteProfileRef.current = 'normal';
+            setCameraRouteState('normal');
+            cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
+            if (recoveredFromRelay) showToast('摄像头网络已恢复 P2P，可手动重新打开');
             await syncCameraSenderTrack();
           }).catch(() => {
             if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
             cameraRouteProfileRef.current = 'failed';
+            setCameraRouteState('failed');
             void syncCameraSenderTrack();
           });
         } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
           cameraRouteProfileRef.current = 'failed';
+          setCameraRouteState('failed');
           void syncCameraSenderTrack();
         }
       };
@@ -1134,7 +1208,7 @@ export default function App() {
     } finally {
       if (cameraPcInitRef.current === initialization) cameraPcInitRef.current = null;
     }
-  }, [syncCameraSenderTrack]);
+  }, [disableCameraForRelay, showToast, syncCameraSenderTrack]);
 
   const flushCameraCandidates = useCallback(async () => {
     const pc = cameraPcRef.current;
@@ -1152,7 +1226,7 @@ export default function App() {
     }
   }, []);
 
-  const handleCameraSignal = useCallback(async (signal: WebRtcSignal) => {
+  const processCameraSignal = useCallback(async (signal: WebRtcSignal) => {
     if (!signal?.callId || signal.callId !== currentCallIdRef.current) return;
     const callId = signal.callId;
     const offererSide = selfDeviceIdRef.current === cameraOffererDeviceIdRef.current;
@@ -1202,6 +1276,8 @@ export default function App() {
   const beginCameraCall = useCallback(async (callId: string, cameraOffererDeviceId: string) => {
     if (currentCallIdRef.current !== callId) return;
     cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
+    cameraRouteProfileRef.current = 'unknown';
+    setCameraRouteState('unknown');
     const offererSide = selfDeviceIdRef.current === cameraOffererDeviceId;
     setCameraDesired(false);
     cameraDesiredRef.current = false;
@@ -1218,10 +1294,20 @@ export default function App() {
     sendCameraSignal({ callId, description: pc.localDescription });
   }, [ensureCameraPeerConnection, refreshCameraDevices]);
 
-  const beginMediaCall = useCallback(async (callId: string) => {
+  const handleCameraSignal = useCallback(async (signal: WebRtcSignal) => {
+    if (!signal?.callId || signal.callId !== currentCallIdRef.current) return;
+    if (!cameraPrewarmReadyRef.current) {
+      cameraDeferredSignalsRef.current.push(signal);
+      return;
+    }
+    await processCameraSignal(signal);
+  }, [processCameraSignal]);
+
+  const beginMediaCall = useCallback(async (callId: string, cameraOffererDeviceId: string) => {
     if (currentCallIdRef.current === callId && rtcPcRef.current) return;
     teardownCall({ nextState: 'requesting-media' });
     currentCallIdRef.current = callId;
+    cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
     const pc = await ensurePeerConnection();
     if (currentCallIdRef.current !== callId || rtcPcRef.current !== pc) return;
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
@@ -1230,6 +1316,42 @@ export default function App() {
     sendRtcSignal({ description: pc.localDescription });
     setCallState('calling');
   }, [ensurePeerConnection, sendRtcSignal, teardownCall]);
+
+  useEffect(() => {
+    const callId = currentCallIdRef.current;
+    const pc = rtcPcRef.current;
+    if (!callId || !pc) return;
+    const mainConnected = pc.connectionState === 'connected';
+    if (!mainConnected
+      || rtcRoute.candidateType === 'unknown' || rtcRoute.candidateType === 'failed') return;
+    if (!cameraOffererDeviceIdRef.current || cameraPrewarmStartedCallIdRef.current === callId) return;
+    cameraPrewarmStartedCallIdRef.current = callId;
+    void beginCameraCall(callId, cameraOffererDeviceIdRef.current).then(async () => {
+      if (currentCallIdRef.current !== callId) return;
+      cameraPrewarmReadyRef.current = true;
+      const deferred = cameraDeferredSignalsRef.current;
+      cameraDeferredSignalsRef.current = [];
+      for (const signal of deferred) {
+        if (currentCallIdRef.current !== callId) return;
+        await processCameraSignal(signal);
+      }
+    }).catch((error) => {
+      if (currentCallIdRef.current !== callId) return;
+      recordControlDiagnostic({
+        event: 'webrtc.camera-prewarm-failed',
+        domain: 'webrtc',
+        level: 'warn',
+        errorCode: 'webrtc_camera_prewarm_failed',
+        recoverability: 'retryable',
+        correlation: { callId },
+        exception: normalizeDiagnosticError(error),
+      });
+      cameraRouteProfileRef.current = 'failed';
+      setCameraRouteState('failed');
+      console.warn('[webrtc] camera prewarm failed:', error);
+      showToast('摄像头网络预热失败，屏幕和声音不受影响', true);
+    });
+  }, [beginCameraCall, processCameraSignal, rtcRoute, showToast]);
 
   useEffect(() => {
     setListeners({
@@ -1349,6 +1471,7 @@ export default function App() {
           if (payload.reason === 'permission_denied') showToast('对方未授予摄像头权限', true);
           if (payload.reason === 'device_lost') showToast('对方摄像头已断开', true);
           if (payload.reason === 'profile_failed') showToast('对方摄像头低清参数应用失败', true);
+          if (payload.reason === 'relay_disabled') showToast('对方摄像头通道使用 TURN，已自动关闭');
         }
       },
       onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId) => {
@@ -1357,12 +1480,10 @@ export default function App() {
           ? legacyCameraSenderDeviceId === selfDeviceIdRef.current
             ? peerDeviceId
             : selfDeviceIdRef.current
-          : '');
+          : '') || '';
         setActiveView('call');
-        beginMediaCall(callId).then(() => {
-          if (offererDeviceId) return beginCameraCall(callId, offererDeviceId);
-          showToast('摄像头协议不兼容，请升级双方客户端', true);
-        }).catch((e) => {
+        if (!offererDeviceId) showToast('摄像头协议不兼容，请升级双方客户端', true);
+        beginMediaCall(callId, offererDeviceId).catch((e) => {
           console.warn('[webrtc] start coordinated call failed:', e);
           showToast(`通话失败：${e?.message || e}`, true);
           teardownCall({ nextState: 'error' });
@@ -1401,7 +1522,7 @@ export default function App() {
       },
     });
     return () => setListeners({});
-  }, [beginCameraCall, beginMediaCall, handleCameraSignal, handleSignal, memberId, participantId, showToast, teardownCall]);
+  }, [beginMediaCall, handleCameraSignal, handleSignal, memberId, participantId, showToast, teardownCall]);
 
   useEffect(() => () => {
     teardownCall({ nextState: 'idle' });
@@ -2080,6 +2201,7 @@ export default function App() {
   const selfName = selfMember?.displayName || '我';
   const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
   const remoteCameraAvailable = remoteCameraStatus === 'available';
+  const cameraCanOpen = cameraRouteState === 'normal';
   const liveNetworkLevel = networkLevel(rtcNetworkSample);
   const inboundVideo = rtcNetworkSample?.inboundVideo;
   const effectivePrimary: 'screen' | 'camera' = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
@@ -2096,10 +2218,9 @@ export default function App() {
           </div>
         )}
       </div>
-      {!cameraHidden && <div className={`media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} ${remoteCameraAvailable ? 'available' : ''}`}>
+      {remoteCameraAvailable && !cameraHidden && <div className={`media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} available`}>
         <video ref={bindRemoteCameraVideo} playsInline autoPlay muted />
-        {!floatContainer && !remoteCameraAvailable && <div className="surface-label">摄像头未开启</div>}
-        {!floatContainer && remoteCameraAvailable && remoteCameraQualityLevel && (
+        {!floatContainer && remoteCameraQualityLevel && (
           <div className="quality-badge">
             摄像头 · {qualityLevelLabel(remoteCameraQualityLevel)}{remoteCameraQuality === 'relay-low' ? ' · TURN' : ''}
           </div>
@@ -2108,7 +2229,7 @@ export default function App() {
       {!floatContainer && screenStatus !== 'available' && !remoteCameraAvailable && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>音频通话中</strong></div>}
       {!floatContainer && <div className="call-controls media-controls">
         <button disabled={screenControlPending} onClick={() => void toggleRemoteScreen()}>{screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享'}</button>
-        <button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头'}</button>
+        <button disabled={cameraControlPending || (!cameraDesired && !cameraCanOpen)} onClick={() => void toggleCamera()}>{cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头'}</button>
         {remoteCameraAvailable && <button onClick={() => setCameraHidden((hidden) => !hidden)}>{cameraHidden ? '显示摄像头' : '隐藏摄像头'}</button>}
         {remoteCameraAvailable && !cameraHidden && <button onClick={() => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen')}>交换画面</button>}
         {window.desktopPetControl && <button onClick={openMediaFloat}>系统浮窗</button>}
@@ -2286,12 +2407,18 @@ export default function App() {
                         {cameraDevices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `摄像头 ${index + 1}`}</option>)}
                       </select>
                     )}
-                    <button disabled={cameraControlPending} onClick={() => void toggleCamera()}>{cameraDesired ? '关闭并释放摄像头' : '打开摄像头'}</button>
+                    <button disabled={cameraControlPending || (!cameraDesired && !cameraCanOpen)} onClick={() => void toggleCamera()}>{cameraDesired ? '关闭并释放摄像头' : '打开摄像头'}</button>
                     <small>
-                      {localCameraStatus === 'available'
+                      {cameraRouteState === 'relay-low'
+                        ? '摄像头通道使用 TURN，为保证屏幕和声音已关闭。'
+                        : cameraRouteState === 'failed'
+                          ? '摄像头网络路径不可用，屏幕和声音不受影响。'
+                          : cameraRouteState === 'unknown'
+                            ? '正在检测摄像头网络路径…'
+                            : localCameraStatus === 'available'
                         ? `正在以${qualityLevelLabel(localCameraQualityLevel)}发送${localCameraQuality === 'relay-low' ? '（TURN）' : ''}；`
                         : localCameraStatus === 'paused' ? '画面暂未发送；' : ''}
-                      收起预览不会停止发送；关闭会真正释放硬件。
+                      {cameraRouteState === 'normal' && '收起预览不会停止发送；关闭会真正释放硬件。'}
                     </small>
                   </section>
                   <section className={`card connection-quality level-${liveNetworkLevel ?? 0}`}>

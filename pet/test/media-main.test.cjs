@@ -46,14 +46,15 @@ test('controller camera is bidirectional, locally controlled, and listener refre
   assert.doesNotMatch(appSource, /isCameraSender/);
 });
 
-test('TURN keeps bounded low-resolution screen and camera video with fail-closed profiles', () => {
+test('TURN keeps bounded adaptive screen video while camera relay fails closed', () => {
   assert.match(petRendererSource, /applyVideoSenderProfile\([\s\S]*?sender,[\s\S]*?screenTrack,[\s\S]*?profile,[\s\S]*?'screen',[\s\S]*?screenAdaptiveState\.qualityLevel,[\s\S]*?screenAdaptiveState\.frameRateTarget/);
   assert.match(petRendererSource, /screenProfileApplyChain\.catch\(\(\) => \{\}\)\.then/);
   assert.match(petRendererSource, /if \(!applied\.ok\)[\s\S]*?screenTrack\.enabled = false;[\s\S]*?screenTrack\.enabled = true/);
   assert.match(appSource, /applyVideoSenderProfile\([\s\S]*?sender,[\s\S]*?track,[\s\S]*?profile,[\s\S]*?'camera',[\s\S]*?cameraQualityLevelRef\.current/);
   assert.match(appSource, /cameraProfileApplyChainRef\.current\.catch\(\(\) => \{\}\)\.then/);
-  assert.match(appSource, /if \(!applied\.ok\)[\s\S]*?await sender\.replaceTrack\(null\);[\s\S]*?sender\.track !== track/);
-  assert.match(appSource, /TURN 低清视频/);
+  assert.match(appSource, /disableCameraForRelay[\s\S]*?replaceTrack\(null\)[\s\S]*?stopLocalCameraCapture[\s\S]*?relay_disabled/);
+  assert.match(appSource, /cameraDesiredRef\.current = false;[\s\S]*?setCameraDesired\(false\)/);
+  assert.match(appSource, /摄像头通道使用 TURN，为保证屏幕和声音已关闭/);
   assert.match(appSource, /qualityLevelLabel\(screenQualityLevel\)/);
   assert.match(appSource, /rtcNetworkSample\?\.roundTripTimeMs/);
   assert.match(petRendererSource, /new AdaptiveScreenQualityController\(\)/);
@@ -61,4 +62,21 @@ test('TURN keeps bounded low-resolution screen and camera video with fail-closed
   assert.match(petRendererSource, /screenAdaptiveState\.frameRateTarget/);
   assert.doesNotMatch(appSource, /TURN 音频兜底|relay_audio_only/);
   assert.doesNotMatch(petRendererSource, /screenRouteIsP2P|relay_audio_only/);
+});
+
+test('camera ICE prewarms only after the main route is selected and early signals stay call-scoped', () => {
+  assert.match(appSource, /cameraPrewarmReadyRef/);
+  assert.match(appSource, /cameraPrewarmStartedCallIdRef/);
+  assert.match(appSource, /cameraDeferredSignalsRef/);
+  assert.match(appSource, /pc\.connectionState === 'connected'/);
+  assert.match(appSource, /rtcRoute\.candidateType === 'unknown' \|\| rtcRoute\.candidateType === 'failed'/);
+  assert.match(appSource, /cameraPrewarmStartedCallIdRef\.current = callId;[\s\S]*?beginCameraCall/);
+  assert.match(appSource, /if \(!cameraPrewarmReadyRef\.current\)[\s\S]*?cameraDeferredSignalsRef\.current\.push\(signal\)/);
+  assert.match(appSource, /cameraDeferredSignalsRef\.current = \[\]/);
+  assert.match(appSource, /currentCallIdRef\.current !== callId/);
+});
+
+test('camera surface only mounts for available remote video', () => {
+  assert.match(appSource, /remoteCameraAvailable && !cameraHidden && <div className=\{`media-surface camera-surface/);
+  assert.doesNotMatch(appSource, /\{!cameraHidden && <div className=\{`media-surface camera-surface/);
 });

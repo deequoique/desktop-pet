@@ -155,6 +155,16 @@ try {
     reason: 'controller_disabled', sourceDeviceId: 'b-pc',
   });
 
+  const relayDisabledCameraStatus = once(aController.socket, 'webrtc:media-status');
+  bController1.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'relay_disabled', sourceDeviceId: 'a-laptop', quality: 'relay-low', qualityLevel: 1,
+  });
+  assert.deepEqual(await relayDisabledCameraStatus, {
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'relay_disabled', sourceDeviceId: 'b-pc', quality: 'relay-low', qualityLevel: 1,
+  });
+
   const reverseCameraStatus = once(bController1.socket, 'webrtc:media-status');
   aController.socket.emit('webrtc:media-status', {
     callId: started.callId, media: 'camera', state: 'available',

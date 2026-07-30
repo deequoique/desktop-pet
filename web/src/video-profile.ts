@@ -1,7 +1,7 @@
 export type VideoRouteProfile = 'unknown' | 'normal' | 'relay-low' | 'failed';
 export type VideoMediaKind = 'screen' | 'camera';
 export type VideoQualityLevel = 1 | 2 | 3 | 4 | 5;
-export type ScreenFrameRateTarget = 5 | 30 | 45 | 60 | 90;
+export type ScreenFrameRateTarget = 30 | 45 | 60 | 90;
 
 export type VideoQualityLimit = {
   width: number;
@@ -55,8 +55,14 @@ export const SCREEN_P2P_STATES: readonly ScreenAdaptiveState[] = [
   { qualityLevel: 5, frameRateTarget: 90 },
 ];
 
+export const SCREEN_RELAY_STATES: readonly ScreenAdaptiveState[] = [
+  { qualityLevel: 2, frameRateTarget: 30 },
+  { qualityLevel: 3, frameRateTarget: 30 },
+  { qualityLevel: 3, frameRateTarget: 45 },
+];
+
 export const RELAY_VIDEO_LIMITS: Record<VideoMediaKind, VideoQualityLimit> = {
-  screen: { width: 640, height: 360, maxFramerate: 5, maxBitrate: 240_000 },
+  screen: { width: 1280, height: 720, maxFramerate: 45, maxBitrate: 1_875_000 },
   camera: { width: 320, height: 180, maxFramerate: 10, maxBitrate: 120_000 },
 };
 
@@ -234,8 +240,6 @@ export type AdaptiveScreenQualityDecision = {
     | 'quality-upgrade' | 'frame-rate-upgrade' | 'stable';
 };
 
-const RELAY_SCREEN_STATE: ScreenAdaptiveState = { qualityLevel: 1, frameRateTarget: 5 };
-
 function copyScreenState(state: ScreenAdaptiveState): ScreenAdaptiveState {
   return { qualityLevel: state.qualityLevel, frameRateTarget: state.frameRateTarget };
 }
@@ -247,7 +251,8 @@ export class AdaptiveScreenQualityController {
   private stableSamples = 0;
 
   current(): ScreenAdaptiveState {
-    return copyScreenState(this.relayed ? RELAY_SCREEN_STATE : SCREEN_P2P_STATES[this.stateIndex]);
+    const states = this.relayed ? SCREEN_RELAY_STATES : SCREEN_P2P_STATES;
+    return copyScreenState(states[this.stateIndex]);
   }
 
   reset(relayed = false): ScreenAdaptiveState {
@@ -260,24 +265,9 @@ export class AdaptiveScreenQualityController {
 
   update(metrics: VideoQualityMetrics, relayed = false): AdaptiveScreenQualityDecision {
     const bandwidthLevel = estimateBandwidthQualityLevel(metrics, 'screen');
-    if (relayed) {
-      const changed = !this.relayed || this.stateIndex !== 0;
-      this.relayed = true;
-      this.stateIndex = 0;
-      this.badSamples = 0;
-      this.stableSamples = 0;
-      return {
-        state: copyScreenState(RELAY_SCREEN_STATE),
-        healthTargetLevel: 1,
-        bandwidthLevel,
-        changed,
-        reason: 'relay',
-      };
-    }
-    const cameFromRelay = this.relayed;
-    this.relayed = false;
     const healthTargetLevel = recommendVideoQualityLevel(metrics, 'screen');
-    if (cameFromRelay) {
+    if (this.relayed !== relayed) {
+      this.relayed = relayed;
       this.stateIndex = 0;
       this.badSamples = 0;
       this.stableSamples = 0;
@@ -286,7 +276,7 @@ export class AdaptiveScreenQualityController {
         healthTargetLevel,
         bandwidthLevel,
         changed: true,
-        reason: 'recovery-probe',
+        reason: relayed ? 'relay' : 'recovery-probe',
       };
     }
     if (healthTargetLevel === 1) {
@@ -302,8 +292,12 @@ export class AdaptiveScreenQualityController {
         reason: changed ? 'hard-degrade' : 'stable',
       };
     }
-    const current = SCREEN_P2P_STATES[this.stateIndex];
-    if (healthTargetLevel < current.qualityLevel) {
+    const states = this.relayed ? SCREEN_RELAY_STATES : SCREEN_P2P_STATES;
+    const current = states[this.stateIndex];
+    const relayStateUnderPressure = this.relayed
+      && this.stateIndex > 0
+      && !isHealthySample(metrics);
+    if (healthTargetLevel < current.qualityLevel || relayStateUnderPressure) {
       this.stableSamples = 0;
       this.badSamples += 1;
       if (this.badSamples >= 2) {
@@ -320,12 +314,14 @@ export class AdaptiveScreenQualityController {
       return { state: this.current(), healthTargetLevel, bandwidthLevel, changed: false, reason: 'stable' };
     }
     this.badSamples = 0;
-    const next = SCREEN_P2P_STATES[this.stateIndex + 1];
+    const next = states[this.stateIndex + 1];
     if (next && healthTargetLevel >= next.qualityLevel && isHealthySample(metrics)) {
       this.stableSamples += 1;
       const bandwidthPressure = metrics.qualityLimitationReason === 'bandwidth'
         && bandwidthLevel < next.qualityLevel;
-      const baseSamples = next.qualityLevel === 5 ? 6 : 3;
+      const baseSamples = this.relayed
+        ? this.stateIndex === 0 ? 3 : 6
+        : next.qualityLevel === 5 ? 6 : 3;
       const requiredSamples = bandwidthPressure ? baseSamples * 2 : baseSamples;
       if (this.stableSamples >= requiredSamples) {
         this.stateIndex += 1;
@@ -359,6 +355,19 @@ function screenP2PLimit(level: VideoQualityLevel, frameRateTarget: number): Vide
   };
 }
 
+function relayScreenState(
+  requestedLevel: VideoQualityLevel,
+  requestedFrameRate: number,
+): ScreenAdaptiveState {
+  const level = Math.min(3, boundedLevel(requestedLevel)) as VideoQualityLevel;
+  const frameRate = Math.max(30, Math.min(45, Math.round(requestedFrameRate)));
+  let selected = SCREEN_RELAY_STATES[0];
+  for (const state of SCREEN_RELAY_STATES) {
+    if (state.qualityLevel <= level && state.frameRateTarget <= frameRate) selected = state;
+  }
+  return copyScreenState(selected);
+}
+
 export async function applyVideoSenderProfile(
   sender: RTCRtpSender,
   track: MediaStreamTrack,
@@ -368,17 +377,27 @@ export async function applyVideoSenderProfile(
   requestedFrameRate?: number,
 ): Promise<{ ok: true; level: VideoQualityLevel } | { ok: false; error: string }> {
   try {
+    if (profile === 'relay-low' && kind === 'camera') {
+      return { ok: false, error: 'relay_camera_disabled' };
+    }
     const parameters = sender.getParameters();
     if (!parameters.encodings?.length) return { ok: false, error: 'missing_encoding' };
-    const level = profile === 'relay-low' ? 1 : boundedLevel(requestedLevel);
-    const limit = profile === 'relay-low'
-      ? RELAY_VIDEO_LIMITS[kind]
-      : kind === 'screen'
-        ? screenP2PLimit(level, requestedFrameRate ?? VIDEO_QUALITY_LEVELS.screen[level].maxFramerate)
-        : VIDEO_QUALITY_LEVELS.camera[level];
+    let level = boundedLevel(requestedLevel);
+    let limit: VideoQualityLimit;
+    if (kind === 'screen') {
+      if (profile === 'relay-low') {
+        const state = relayScreenState(level, requestedFrameRate ?? 30);
+        level = state.qualityLevel;
+        limit = screenP2PLimit(level, state.frameRateTarget);
+      } else {
+        limit = screenP2PLimit(level, requestedFrameRate ?? VIDEO_QUALITY_LEVELS.screen[level].maxFramerate);
+      }
+    } else {
+      limit = VIDEO_QUALITY_LEVELS.camera[level];
+    }
     const scale = calculateScaleResolutionDownBy(track.getSettings(), limit);
     if (scale == null) return { ok: false, error: 'missing_track_dimensions' };
-    (parameters as MutableRtpSendParameters).degradationPreference = kind === 'screen' && profile === 'normal'
+    (parameters as MutableRtpSendParameters).degradationPreference = kind === 'screen'
       ? 'maintain-framerate'
       : 'balanced';
     for (const encoding of parameters.encodings) {

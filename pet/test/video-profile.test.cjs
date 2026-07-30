@@ -20,16 +20,16 @@ const modules = [
 ].map(([name, file]) => [name, loadTypeScriptModule(file)]);
 
 for (const [runtime, profile] of modules) {
-  test(`${runtime} relay video profile calculates bounded proportional scale`, () => {
+  test(`${runtime} relay screen hard limit calculates bounded proportional scale`, () => {
     const screen = profile.RELAY_VIDEO_LIMITS.screen;
-    assert.deepEqual(screen, { width: 640, height: 360, maxFramerate: 5, maxBitrate: 240_000 });
-    assert.equal(profile.calculateScaleResolutionDownBy({ width: 1920, height: 1080 }, screen), 3);
-    assert.equal(profile.calculateScaleResolutionDownBy({ width: 800, height: 600 }, screen), 5 / 3);
+    assert.deepEqual(screen, { width: 1280, height: 720, maxFramerate: 45, maxBitrate: 1_875_000 });
+    assert.equal(profile.calculateScaleResolutionDownBy({ width: 2560, height: 1440 }, screen), 2);
+    assert.equal(profile.calculateScaleResolutionDownBy({ width: 1920, height: 1080 }, screen), 1.5);
     assert.equal(profile.calculateScaleResolutionDownBy({ width: 320, height: 180 }, screen), 1);
     assert.equal(profile.calculateScaleResolutionDownBy({}, screen), null);
   });
 
-  test(`${runtime} screen P2P states are monotonic while TURN stays at five fps`, () => {
+  test(`${runtime} screen P2P and TURN state tables stay independent`, () => {
     assert.deepEqual(profile.SCREEN_P2P_STATES, [
       { qualityLevel: 2, frameRateTarget: 30 },
       { qualityLevel: 3, frameRateTarget: 30 },
@@ -39,8 +39,13 @@ for (const [runtime, profile] of modules) {
       { qualityLevel: 5, frameRateTarget: 60 },
       { qualityLevel: 5, frameRateTarget: 90 },
     ]);
+    assert.deepEqual(profile.SCREEN_RELAY_STATES, [
+      { qualityLevel: 2, frameRateTarget: 30 },
+      { qualityLevel: 3, frameRateTarget: 30 },
+      { qualityLevel: 3, frameRateTarget: 45 },
+    ]);
     assert.deepEqual(profile.RELAY_VIDEO_LIMITS.screen, {
-      width: 640, height: 360, maxFramerate: 5, maxBitrate: 240_000,
+      width: 1280, height: 720, maxFramerate: 45, maxBitrate: 1_875_000,
     });
     assert.deepEqual(
       Object.values(profile.VIDEO_QUALITY_LEVELS.camera).map((item) => item.maxFramerate),
@@ -48,21 +53,19 @@ for (const [runtime, profile] of modules) {
     );
   });
 
-  test(`${runtime} video profile applies independent P2P screen fps and relay bounds`, async () => {
+  test(`${runtime} video profile applies P2P camera and route-bounded screen fps`, async () => {
     let applied;
     const sender = {
       getParameters: () => ({ encodings: [{ rid: 'main', active: true }] }),
       setParameters: async (parameters) => { applied = parameters; },
     };
     const track = { getSettings: () => ({ width: 2560, height: 1440 }) };
-    assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'camera'), { ok: true, level: 1 });
-    assert.equal(applied.encodings[0].rid, 'main');
-    assert.equal(applied.encodings[0].active, true);
-    assert.equal(applied.encodings[0].maxBitrate, 120_000);
-    assert.equal(applied.encodings[0].maxFramerate, 10);
-    assert.equal(applied.encodings[0].scaleResolutionDownBy, 8);
+    assert.deepEqual(
+      await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'camera'),
+      { ok: false, error: 'relay_camera_disabled' },
+    );
+    assert.equal(applied, undefined);
 
-    sender.getParameters = () => ({ encodings: [{ ...applied.encodings[0] }] });
     assert.deepEqual(await profile.applyVideoSenderProfile(sender, track, 'normal', 'camera', 3), { ok: true, level: 3 });
     assert.equal(applied.encodings[0].maxBitrate, 500_000);
     assert.equal(applied.encodings[0].maxFramerate, 15);
@@ -89,12 +92,31 @@ for (const [runtime, profile] of modules) {
 
     sender.getParameters = () => ({ encodings: [{ rid: 'screen', active: true }] });
     assert.deepEqual(
-      await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'screen', 5, 90),
-      { ok: true, level: 1 },
+      await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'screen', 2, 30),
+      { ok: true, level: 2 },
     );
-    assert.equal(applied.encodings[0].maxBitrate, 240_000);
-    assert.equal(applied.encodings[0].maxFramerate, 5);
-    assert.equal(applied.encodings[0].scaleResolutionDownBy, 4);
+    assert.equal(applied.degradationPreference, 'maintain-framerate');
+    assert.equal(applied.encodings[0].maxBitrate, 600_000);
+    assert.equal(applied.encodings[0].maxFramerate, 30);
+    assert.equal(applied.encodings[0].scaleResolutionDownBy, 3);
+
+    sender.getParameters = () => ({ encodings: [{ rid: 'screen', active: true }] });
+    assert.deepEqual(
+      await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'screen', 3, 45),
+      { ok: true, level: 3 },
+    );
+    assert.equal(applied.encodings[0].maxBitrate, 1_875_000);
+    assert.equal(applied.encodings[0].maxFramerate, 45);
+    assert.equal(applied.encodings[0].scaleResolutionDownBy, 2);
+
+    sender.getParameters = () => ({ encodings: [{ rid: 'screen', active: true }] });
+    assert.deepEqual(
+      await profile.applyVideoSenderProfile(sender, track, 'relay-low', 'screen', 5, 90),
+      { ok: true, level: 3 },
+    );
+    assert.equal(applied.encodings[0].maxBitrate, 1_875_000);
+    assert.equal(applied.encodings[0].maxFramerate, 45);
+    assert.equal(applied.encodings[0].scaleResolutionDownBy, 2);
   });
 
   test(`${runtime} relay video profile fails closed when dimensions or setParameters are unavailable`, async () => {
@@ -153,7 +175,7 @@ for (const [runtime, profile] of modules) {
     });
   });
 
-  test(`${runtime} screen controller escapes low-estimate lock and follows the seven states`, () => {
+  test(`${runtime} screen controller escapes low-estimate lock and follows the seven P2P states`, () => {
     const healthy = {
       connected: true,
       roundTripTimeMs: 29,
@@ -218,11 +240,81 @@ for (const [runtime, profile] of modules) {
     assert.equal(hard.reason, 'hard-degrade');
 
     assert.deepEqual(controller.update(healthy, true), {
-      state: { qualityLevel: 1, frameRateTarget: 5 },
-      healthTargetLevel: 1,
+      state: { qualityLevel: 2, frameRateTarget: 30 },
+      healthTargetLevel: 5,
       bandwidthLevel: 5,
       changed: true,
       reason: 'relay',
     });
+  });
+
+  test(`${runtime} TURN screen upgrades finitely, probes through soft bandwidth pressure, and degrades safely`, () => {
+    const healthy = {
+      connected: true,
+      roundTripTimeMs: 29,
+      availableOutgoingBitrate: 3_000_000,
+      lossRatio: 0,
+      jitterMs: 5,
+    };
+    const pressure = {
+      ...healthy,
+      availableOutgoingBitrate: 300_000,
+      qualityLimitationReason: 'bandwidth',
+    };
+    const controller = new profile.AdaptiveScreenQualityController();
+    assert.deepEqual(controller.reset(true), { qualityLevel: 2, frameRateTarget: 30 });
+
+    let decision;
+    for (let index = 0; index < 2; index += 1) decision = controller.update(healthy, true);
+    assert.equal(decision.changed, false);
+    decision = controller.update(healthy, true);
+    assert.deepEqual(decision.state, { qualityLevel: 3, frameRateTarget: 30 });
+    assert.equal(decision.reason, 'quality-upgrade');
+
+    for (let index = 0; index < 5; index += 1) decision = controller.update(healthy, true);
+    assert.equal(decision.changed, false);
+    decision = controller.update(healthy, true);
+    assert.deepEqual(decision.state, { qualityLevel: 3, frameRateTarget: 45 });
+    assert.equal(decision.reason, 'frame-rate-upgrade');
+
+    const mild = {
+      connected: true,
+      roundTripTimeMs: 150,
+      availableOutgoingBitrate: 3_000_000,
+      lossRatio: 0,
+      jitterMs: 5,
+    };
+    assert.equal(controller.update(mild, true).changed, false);
+    assert.deepEqual(controller.update(mild, true), {
+      state: { qualityLevel: 3, frameRateTarget: 30 },
+      healthTargetLevel: 4,
+      bandwidthLevel: 2,
+      changed: true,
+      reason: 'congestion-step-down',
+    });
+    assert.equal(controller.update(mild, true).changed, false);
+    assert.deepEqual(controller.update(mild, true).state, { qualityLevel: 2, frameRateTarget: 30 });
+
+    const hard = controller.update({
+      connected: true,
+      roundTripTimeMs: 600,
+      availableOutgoingBitrate: 300_000,
+      lossRatio: 0.1,
+      jitterMs: 200,
+    }, true);
+    assert.deepEqual(hard.state, { qualityLevel: 2, frameRateTarget: 30 });
+
+    controller.reset(true);
+    for (let index = 0; index < 5; index += 1) assert.equal(controller.update(pressure, true).changed, false);
+    decision = controller.update(pressure, true);
+    assert.deepEqual(decision.state, { qualityLevel: 3, frameRateTarget: 30 });
+    assert.equal(decision.reason, 'recovery-probe');
+    for (let index = 0; index < 11; index += 1) assert.equal(controller.update(pressure, true).changed, false);
+    decision = controller.update(pressure, true);
+    assert.deepEqual(decision.state, { qualityLevel: 3, frameRateTarget: 45 });
+    assert.equal(decision.reason, 'recovery-probe');
+
+    assert.deepEqual(controller.update(healthy, false).state, { qualityLevel: 2, frameRateTarget: 30 });
+    assert.equal(controller.current().frameRateTarget, 30);
   });
 }

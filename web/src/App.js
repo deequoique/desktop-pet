@@ -180,7 +180,7 @@ function routeFromPair(pair, configuration) {
     return {
         candidateType,
         relayed,
-        path: relayed ? 'TURN 低清视频' : ipv6 ? 'IPv6 P2P' : ipv4 ? 'IPv4 P2P' : '选路中',
+        path: relayed ? 'TURN 自适应视频' : ipv6 ? 'IPv6 P2P' : ipv4 ? 'IPv4 P2P' : '选路中',
         detail: detail || 'ICE 已连接',
     };
 }
@@ -342,6 +342,7 @@ export default function App() {
     const [cameraDevices, setCameraDevices] = useState([]);
     const [selectedCameraId, setSelectedCameraId] = useState(() => localStorage.getItem(LS_CAMERA_DEVICE) || '');
     const [cameraPreviewCollapsed, setCameraPreviewCollapsed] = useState(false);
+    const [cameraRouteState, setCameraRouteState] = useState('unknown');
     const [cameraHidden, setCameraHidden] = useState(false);
     const [preferredPrimary, setPreferredPrimary] = useState('screen');
     const [floatContainer, setFloatContainer] = useState(null);
@@ -368,6 +369,9 @@ export default function App() {
     const localCameraStreamRef = useRef(null);
     const remoteCameraStreamRef = useRef(null);
     const cameraPendingCandidatesRef = useRef([]);
+    const cameraDeferredSignalsRef = useRef([]);
+    const cameraPrewarmReadyRef = useRef(false);
+    const cameraPrewarmStartedCallIdRef = useRef('');
     const cameraOffererDeviceIdRef = useRef('');
     const selfDeviceIdRef = useRef('');
     const memberIdRef = useRef('');
@@ -425,6 +429,14 @@ export default function App() {
         catch { }
         localAudioRef.current = null;
     }, []);
+    const stopLocalCameraCapture = useCallback(() => {
+        for (const track of localCameraStreamRef.current?.getTracks() ?? [])
+            track.stop();
+        localCameraStreamRef.current = null;
+        cameraCapturePendingRef.current = false;
+        if (localCameraVideoRef.current)
+            localCameraVideoRef.current.srcObject = null;
+    }, []);
     const setMicEnabled = useCallback((enabled) => {
         for (const track of localAudioRef.current?.getAudioTracks() ?? []) {
             track.enabled = enabled;
@@ -455,15 +467,16 @@ export default function App() {
         cameraPcInitRef.current = null;
         cameraSenderRef.current = null;
         cameraPendingCandidatesRef.current = [];
+        cameraDeferredSignalsRef.current = [];
+        cameraPrewarmReadyRef.current = false;
+        cameraPrewarmStartedCallIdRef.current = '';
         cameraRouteProfileRef.current = 'unknown';
+        setCameraRouteState('unknown');
         cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
         cameraProfileGenerationRef.current += 1;
         cameraProfileApplyChainRef.current = Promise.resolve();
         cameraOffererDeviceIdRef.current = '';
-        cameraCapturePendingRef.current = false;
-        for (const track of localCameraStreamRef.current?.getTracks() ?? [])
-            track.stop();
-        localCameraStreamRef.current = null;
+        stopLocalCameraCapture();
         remoteCameraStreamRef.current = null;
         cameraDesiredRef.current = false;
         setCameraDesired(false);
@@ -510,7 +523,7 @@ export default function App() {
             remoteMicAudioRef.current.srcObject = null;
         if (remoteSystemAudioRef.current)
             remoteSystemAudioRef.current.srcObject = null;
-    }, [setMicEnabled, stopLocalAudio]);
+    }, [setMicEnabled, stopLocalAudio, stopLocalCameraCapture]);
     const sendRtcSignal = useCallback((signal) => {
         return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined }, callTargetIdRef.current || undefined);
     }, []);
@@ -795,6 +808,41 @@ export default function App() {
             ...(qualityLevel ? { qualityLevel } : {}),
         });
     }, []);
+    const disableCameraForRelay = useCallback(async () => {
+        const callId = currentCallIdRef.current;
+        if (!callId)
+            return;
+        const newlyBlocked = cameraRouteProfileRef.current !== 'relay-low';
+        const generation = ++cameraProfileGenerationRef.current;
+        cameraRouteProfileRef.current = 'relay-low';
+        setCameraRouteState('relay-low');
+        cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(1);
+        cameraDesiredRef.current = false;
+        setCameraDesired(false);
+        const sender = cameraSenderRef.current;
+        const operation = cameraProfileApplyChainRef.current.catch(() => { }).then(async () => {
+            if (generation !== cameraProfileGenerationRef.current || currentCallIdRef.current !== callId)
+                return;
+            try {
+                await sender?.replaceTrack(null);
+            }
+            catch { }
+        });
+        cameraProfileApplyChainRef.current = operation;
+        await operation;
+        if (generation !== cameraProfileGenerationRef.current || currentCallIdRef.current !== callId)
+            return;
+        stopLocalCameraCapture();
+        reportCameraStatus('unavailable', 'relay_disabled');
+        if (newlyBlocked) {
+            recordControlDiagnostic({
+                event: 'webrtc.camera-relay-disabled',
+                domain: 'webrtc',
+                correlation: { callId },
+                context: { mediaKind: 'camera', effectiveRelayed: true },
+            });
+        }
+    }, [reportCameraStatus, stopLocalCameraCapture]);
     const syncCameraSenderTrack = useCallback(async () => {
         const generation = ++cameraProfileGenerationRef.current;
         const sender = cameraSenderRef.current;
@@ -806,6 +854,10 @@ export default function App() {
             return;
         }
         const profile = cameraRouteProfileRef.current;
+        if (profile === 'relay-low') {
+            await disableCameraForRelay();
+            return;
+        }
         if (profile === 'unknown' || profile === 'failed') {
             await sender.replaceTrack(null);
             reportCameraStatus('paused');
@@ -835,11 +887,11 @@ export default function App() {
                 await sender.replaceTrack(null);
                 return;
             }
-            reportCameraStatus('available', undefined, profile === 'relay-low' ? 'relay-low' : 'normal', applied.level);
+            reportCameraStatus('available', undefined, 'normal', applied.level);
         });
         cameraProfileApplyChainRef.current = operation;
         await operation;
-    }, [reportCameraStatus]);
+    }, [disableCameraForRelay, reportCameraStatus]);
     const setLocalCameraEnabled = useCallback(async (enabled) => {
         const callId = currentCallIdRef.current;
         if (!callId)
@@ -853,13 +905,22 @@ export default function App() {
                 await cameraSenderRef.current?.replaceTrack(null);
             }
             catch { }
-            for (const track of localCameraStreamRef.current?.getTracks() ?? [])
-                track.stop();
-            localCameraStreamRef.current = null;
-            if (localCameraVideoRef.current)
-                localCameraVideoRef.current.srcObject = null;
+            stopLocalCameraCapture();
             reportCameraStatus('unavailable', 'controller_disabled');
+            return;
+        }
+        if (cameraRouteProfileRef.current !== 'normal') {
+            cameraDesiredRef.current = false;
+            setCameraDesired(false);
             cameraCapturePendingRef.current = false;
+            if (cameraRouteProfileRef.current === 'relay-low') {
+                reportCameraStatus('unavailable', 'relay_disabled');
+                showToast('摄像头通道使用 TURN，为保证屏幕和声音已关闭', true);
+            }
+            else {
+                reportCameraStatus('paused');
+                showToast('正在检测摄像头网络路径，请稍后再试', true);
+            }
             return;
         }
         if (!navigator.mediaDevices?.getUserMedia) {
@@ -924,7 +985,7 @@ export default function App() {
             showToast(denied ? `没有获得摄像头权限（${errorCode}）` : `摄像头打开失败（${errorCode}）：${error?.message || error}`, true);
             cameraCapturePendingRef.current = false;
         }
-    }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, syncCameraSenderTrack]);
+    }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, stopLocalCameraCapture, syncCameraSenderTrack]);
     const ensureCameraPeerConnection = useCallback(async (offererSide, callId) => {
         if (cameraPcRef.current)
             return cameraPcRef.current;
@@ -945,11 +1006,18 @@ export default function App() {
                 onSample: (sample) => {
                     if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc || !sample.connected)
                         return;
-                    const nextProfile = sample.effectiveRelayed ? 'relay-low' : 'normal';
-                    const routeChanged = cameraRouteProfileRef.current !== nextProfile;
+                    if (sample.effectiveRelayed) {
+                        void disableCameraForRelay();
+                        return;
+                    }
+                    const recoveredFromRelay = cameraRouteProfileRef.current === 'relay-low';
+                    const routeChanged = cameraRouteProfileRef.current !== 'normal';
                     if (routeChanged) {
-                        cameraRouteProfileRef.current = nextProfile;
-                        cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(sample.effectiveRelayed ? 1 : DEFAULT_QUALITY_LEVEL);
+                        cameraRouteProfileRef.current = 'normal';
+                        setCameraRouteState('normal');
+                        cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
+                        if (recoveredFromRelay)
+                            showToast('摄像头网络已恢复 P2P，可手动重新打开');
                     }
                     const decision = cameraQualityControllerRef.current.update({
                         connected: sample.connected,
@@ -958,7 +1026,7 @@ export default function App() {
                         lossRatio: sample.lossRatio,
                         jitterMs: sample.jitterMs,
                         qualityLimitationReason: sample.outboundVideo?.qualityLimitationReason,
-                    }, 'camera', sample.effectiveRelayed);
+                    }, 'camera', false);
                     if (!routeChanged && !decision.changed)
                         return;
                     cameraQualityLevelRef.current = decision.level;
@@ -972,8 +1040,8 @@ export default function App() {
                             targetLevel: decision.targetLevel,
                             healthTargetLevel: decision.healthTargetLevel,
                             bandwidthLevel: decision.bandwidthLevel,
-                            reason: routeChanged ? (sample.effectiveRelayed ? 'relay' : 'route-recovered') : decision.reason,
-                            effectiveRelayed: sample.effectiveRelayed,
+                            reason: routeChanged ? (recoveredFromRelay ? 'route-recovered' : 'route-selected') : decision.reason,
+                            effectiveRelayed: false,
                             roundTripTimeMs: sample.roundTripTimeMs,
                             availableOutgoingBitrate: sample.availableOutgoingBitrate,
                             lossRatio: sample.lossRatio,
@@ -1019,20 +1087,34 @@ export default function App() {
                     readRtcRoute(pc, rtcConfig).then(async (route) => {
                         if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc)
                             return;
-                        cameraRouteProfileRef.current = route.candidateType === 'unknown'
-                            ? 'unknown'
-                            : route.relayed ? 'relay-low' : 'normal';
-                        cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(route.relayed ? 1 : DEFAULT_QUALITY_LEVEL);
+                        if (route.relayed) {
+                            await disableCameraForRelay();
+                            return;
+                        }
+                        if (route.candidateType === 'unknown') {
+                            cameraRouteProfileRef.current = 'unknown';
+                            setCameraRouteState('unknown');
+                            await syncCameraSenderTrack();
+                            return;
+                        }
+                        const recoveredFromRelay = cameraRouteProfileRef.current === 'relay-low';
+                        cameraRouteProfileRef.current = 'normal';
+                        setCameraRouteState('normal');
+                        cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
+                        if (recoveredFromRelay)
+                            showToast('摄像头网络已恢复 P2P，可手动重新打开');
                         await syncCameraSenderTrack();
                     }).catch(() => {
                         if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc)
                             return;
                         cameraRouteProfileRef.current = 'failed';
+                        setCameraRouteState('failed');
                         void syncCameraSenderTrack();
                     });
                 }
                 else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                     cameraRouteProfileRef.current = 'failed';
+                    setCameraRouteState('failed');
                     void syncCameraSenderTrack();
                 }
             };
@@ -1046,7 +1128,7 @@ export default function App() {
             if (cameraPcInitRef.current === initialization)
                 cameraPcInitRef.current = null;
         }
-    }, [syncCameraSenderTrack]);
+    }, [disableCameraForRelay, showToast, syncCameraSenderTrack]);
     const flushCameraCandidates = useCallback(async () => {
         const pc = cameraPcRef.current;
         if (!pc?.remoteDescription)
@@ -1065,7 +1147,7 @@ export default function App() {
             }
         }
     }, []);
-    const handleCameraSignal = useCallback(async (signal) => {
+    const processCameraSignal = useCallback(async (signal) => {
         if (!signal?.callId || signal.callId !== currentCallIdRef.current)
             return;
         const callId = signal.callId;
@@ -1126,6 +1208,8 @@ export default function App() {
         if (currentCallIdRef.current !== callId)
             return;
         cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
+        cameraRouteProfileRef.current = 'unknown';
+        setCameraRouteState('unknown');
         const offererSide = selfDeviceIdRef.current === cameraOffererDeviceId;
         setCameraDesired(false);
         cameraDesiredRef.current = false;
@@ -1144,11 +1228,21 @@ export default function App() {
             return;
         sendCameraSignal({ callId, description: pc.localDescription });
     }, [ensureCameraPeerConnection, refreshCameraDevices]);
-    const beginMediaCall = useCallback(async (callId) => {
+    const handleCameraSignal = useCallback(async (signal) => {
+        if (!signal?.callId || signal.callId !== currentCallIdRef.current)
+            return;
+        if (!cameraPrewarmReadyRef.current) {
+            cameraDeferredSignalsRef.current.push(signal);
+            return;
+        }
+        await processCameraSignal(signal);
+    }, [processCameraSignal]);
+    const beginMediaCall = useCallback(async (callId, cameraOffererDeviceId) => {
         if (currentCallIdRef.current === callId && rtcPcRef.current)
             return;
         teardownCall({ nextState: 'requesting-media' });
         currentCallIdRef.current = callId;
+        cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
         const pc = await ensurePeerConnection();
         if (currentCallIdRef.current !== callId || rtcPcRef.current !== pc)
             return;
@@ -1159,6 +1253,47 @@ export default function App() {
         sendRtcSignal({ description: pc.localDescription });
         setCallState('calling');
     }, [ensurePeerConnection, sendRtcSignal, teardownCall]);
+    useEffect(() => {
+        const callId = currentCallIdRef.current;
+        const pc = rtcPcRef.current;
+        if (!callId || !pc)
+            return;
+        const mainConnected = pc.connectionState === 'connected';
+        if (!mainConnected
+            || rtcRoute.candidateType === 'unknown' || rtcRoute.candidateType === 'failed')
+            return;
+        if (!cameraOffererDeviceIdRef.current || cameraPrewarmStartedCallIdRef.current === callId)
+            return;
+        cameraPrewarmStartedCallIdRef.current = callId;
+        void beginCameraCall(callId, cameraOffererDeviceIdRef.current).then(async () => {
+            if (currentCallIdRef.current !== callId)
+                return;
+            cameraPrewarmReadyRef.current = true;
+            const deferred = cameraDeferredSignalsRef.current;
+            cameraDeferredSignalsRef.current = [];
+            for (const signal of deferred) {
+                if (currentCallIdRef.current !== callId)
+                    return;
+                await processCameraSignal(signal);
+            }
+        }).catch((error) => {
+            if (currentCallIdRef.current !== callId)
+                return;
+            recordControlDiagnostic({
+                event: 'webrtc.camera-prewarm-failed',
+                domain: 'webrtc',
+                level: 'warn',
+                errorCode: 'webrtc_camera_prewarm_failed',
+                recoverability: 'retryable',
+                correlation: { callId },
+                exception: normalizeDiagnosticError(error),
+            });
+            cameraRouteProfileRef.current = 'failed';
+            setCameraRouteState('failed');
+            console.warn('[webrtc] camera prewarm failed:', error);
+            showToast('摄像头网络预热失败，屏幕和声音不受影响', true);
+        });
+    }, [beginCameraCall, processCameraSignal, rtcRoute, showToast]);
     useEffect(() => {
         setListeners({
             onStatus: (nextStatus) => {
@@ -1290,6 +1425,8 @@ export default function App() {
                         showToast('对方摄像头已断开', true);
                     if (payload.reason === 'profile_failed')
                         showToast('对方摄像头低清参数应用失败', true);
+                    if (payload.reason === 'relay_disabled')
+                        showToast('对方摄像头通道使用 TURN，已自动关闭');
                 }
             },
             onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId) => {
@@ -1298,13 +1435,11 @@ export default function App() {
                     ? legacyCameraSenderDeviceId === selfDeviceIdRef.current
                         ? peerDeviceId
                         : selfDeviceIdRef.current
-                    : '');
+                    : '') || '';
                 setActiveView('call');
-                beginMediaCall(callId).then(() => {
-                    if (offererDeviceId)
-                        return beginCameraCall(callId, offererDeviceId);
+                if (!offererDeviceId)
                     showToast('摄像头协议不兼容，请升级双方客户端', true);
-                }).catch((e) => {
+                beginMediaCall(callId, offererDeviceId).catch((e) => {
                     console.warn('[webrtc] start coordinated call failed:', e);
                     showToast(`通话失败：${e?.message || e}`, true);
                     teardownCall({ nextState: 'error' });
@@ -1345,7 +1480,7 @@ export default function App() {
             },
         });
         return () => setListeners({});
-    }, [beginCameraCall, beginMediaCall, handleCameraSignal, handleSignal, memberId, participantId, showToast, teardownCall]);
+    }, [beginMediaCall, handleCameraSignal, handleSignal, memberId, participantId, showToast, teardownCall]);
     useEffect(() => () => {
         teardownCall({ nextState: 'idle' });
     }, [teardownCall]);
@@ -2045,12 +2180,13 @@ export default function App() {
     const selfName = selfMember?.displayName || '我';
     const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
     const remoteCameraAvailable = remoteCameraStatus === 'available';
+    const cameraCanOpen = cameraRouteState === 'normal';
     const liveNetworkLevel = networkLevel(rtcNetworkSample);
     const inboundVideo = rtcNetworkSample?.inboundVideo;
     const effectivePrimary = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
         ? 'camera'
         : !cameraHidden && preferredPrimary === 'camera' && remoteCameraAvailable ? 'camera' : 'screen';
-    const mediaStage = callActive ? (_jsxs("section", { className: `video-stage-new unified-media-stage ${floatContainer ? 'detached' : ''}`, ref: videoStageRef, children: [_jsxs("div", { className: `media-surface screen-surface ${effectivePrimary === 'screen' ? 'primary' : 'inset'} ${screenStatus === 'available' ? 'available' : ''}`, children: [_jsx("video", { ref: bindScreenVideo, playsInline: true, autoPlay: true, muted: true }), !floatContainer && screenStatus !== 'available' && _jsxs("div", { className: "surface-label", children: ["\u5C4F\u5E55", screenStatus === 'paused' ? '已暂停' : '不可用'] }), !floatContainer && screenStatus === 'available' && screenQualityLevel && (_jsxs("div", { className: "quality-badge", children: ["\u5C4F\u5E55 \u00B7 ", qualityLevelLabel(screenQualityLevel), screenQuality === 'relay-low' ? ' · TURN' : ''] }))] }), !cameraHidden && _jsxs("div", { className: `media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} ${remoteCameraAvailable ? 'available' : ''}`, children: [_jsx("video", { ref: bindRemoteCameraVideo, playsInline: true, autoPlay: true, muted: true }), !floatContainer && !remoteCameraAvailable && _jsx("div", { className: "surface-label", children: "\u6444\u50CF\u5934\u672A\u5F00\u542F" }), !floatContainer && remoteCameraAvailable && remoteCameraQualityLevel && (_jsxs("div", { className: "quality-badge", children: ["\u6444\u50CF\u5934 \u00B7 ", qualityLevelLabel(remoteCameraQualityLevel), remoteCameraQuality === 'relay-low' ? ' · TURN' : ''] }))] }), !floatContainer && screenStatus !== 'available' && !remoteCameraAvailable && _jsxs("div", { className: "call-placeholder", children: [_jsx("div", { className: "pet-face small", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsx("strong", { children: "\u97F3\u9891\u901A\u8BDD\u4E2D" })] }), !floatContainer && _jsxs("div", { className: "call-controls media-controls", children: [_jsx("button", { disabled: screenControlPending, onClick: () => void toggleRemoteScreen(), children: screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享' }), _jsx("button", { disabled: cameraControlPending, onClick: () => void toggleCamera(), children: cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头' }), remoteCameraAvailable && _jsx("button", { onClick: () => setCameraHidden((hidden) => !hidden), children: cameraHidden ? '显示摄像头' : '隐藏摄像头' }), remoteCameraAvailable && !cameraHidden && _jsx("button", { onClick: () => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen'), children: "\u4EA4\u6362\u753B\u9762" }), window.desktopPetControl && _jsx("button", { onClick: openMediaFloat, children: "\u7CFB\u7EDF\u6D6E\u7A97" }), _jsx("button", { disabled: !remoteReady && !remoteCameraAvailable, onClick: () => void toggleFullscreen(), children: "\u5168\u5C4F" }), _jsx("button", { className: "hangup", onClick: onEndCall, children: "\u7ED3\u675F" })] })] })) : null;
+    const mediaStage = callActive ? (_jsxs("section", { className: `video-stage-new unified-media-stage ${floatContainer ? 'detached' : ''}`, ref: videoStageRef, children: [_jsxs("div", { className: `media-surface screen-surface ${effectivePrimary === 'screen' ? 'primary' : 'inset'} ${screenStatus === 'available' ? 'available' : ''}`, children: [_jsx("video", { ref: bindScreenVideo, playsInline: true, autoPlay: true, muted: true }), !floatContainer && screenStatus !== 'available' && _jsxs("div", { className: "surface-label", children: ["\u5C4F\u5E55", screenStatus === 'paused' ? '已暂停' : '不可用'] }), !floatContainer && screenStatus === 'available' && screenQualityLevel && (_jsxs("div", { className: "quality-badge", children: ["\u5C4F\u5E55 \u00B7 ", qualityLevelLabel(screenQualityLevel), screenQuality === 'relay-low' ? ' · TURN' : ''] }))] }), remoteCameraAvailable && !cameraHidden && _jsxs("div", { className: `media-surface camera-surface ${effectivePrimary === 'camera' ? 'primary' : 'inset'} available`, children: [_jsx("video", { ref: bindRemoteCameraVideo, playsInline: true, autoPlay: true, muted: true }), !floatContainer && remoteCameraQualityLevel && (_jsxs("div", { className: "quality-badge", children: ["\u6444\u50CF\u5934 \u00B7 ", qualityLevelLabel(remoteCameraQualityLevel), remoteCameraQuality === 'relay-low' ? ' · TURN' : ''] }))] }), !floatContainer && screenStatus !== 'available' && !remoteCameraAvailable && _jsxs("div", { className: "call-placeholder", children: [_jsx("div", { className: "pet-face small", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsx("strong", { children: "\u97F3\u9891\u901A\u8BDD\u4E2D" })] }), !floatContainer && _jsxs("div", { className: "call-controls media-controls", children: [_jsx("button", { disabled: screenControlPending, onClick: () => void toggleRemoteScreen(), children: screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享' }), _jsx("button", { disabled: cameraControlPending || (!cameraDesired && !cameraCanOpen), onClick: () => void toggleCamera(), children: cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头' }), remoteCameraAvailable && _jsx("button", { onClick: () => setCameraHidden((hidden) => !hidden), children: cameraHidden ? '显示摄像头' : '隐藏摄像头' }), remoteCameraAvailable && !cameraHidden && _jsx("button", { onClick: () => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen'), children: "\u4EA4\u6362\u753B\u9762" }), window.desktopPetControl && _jsx("button", { onClick: openMediaFloat, children: "\u7CFB\u7EDF\u6D6E\u7A97" }), _jsx("button", { disabled: !remoteReady && !remoteCameraAvailable, onClick: () => void toggleFullscreen(), children: "\u5168\u5C4F" }), _jsx("button", { className: "hangup", onClick: onEndCall, children: "\u7ED3\u675F" })] })] })) : null;
     return (_jsxs("div", { className: "control-app", children: [_jsxs("aside", { className: "app-rail", "aria-label": "\u4E3B\u5BFC\u822A", children: [_jsx("div", { className: "brand-mark", "aria-hidden": "true", children: "\uD83D\uDC3E" }), [
                         ['control', '⌁', '控制'],
                         ['send', '✦', '发送'],
@@ -2069,9 +2205,15 @@ export default function App() {
                                                                 setNoteImage(null);
                                                                 setNoteImageName('');
                                                             } if (kind === 'none' || kind === 'image')
-                                                                setNoteLink(''); }, children: ({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind] }, kind)) })] }), noteMediaKind === 'image' && _jsxs("label", { className: "button-like", children: ["\u9009\u62E9\u56FE\u7247", _jsx("input", { hidden: true, type: "file", accept: "image/jpeg,image/png", onChange: (event) => void onSelectNoteImage(event.target.files?.[0]) })] }), _jsx("button", { className: "primary-button large", disabled: status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000, onClick: () => void onSendNote(), children: noteSending ? '投递中…' : `投递给${peerName}` })] })] })), noteSection === 'sent' && _jsxs("section", { className: "note-record-grid", children: [sentNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !sentNotes.length && _jsx("div", { className: "card notes-empty", children: "\u8FD8\u6CA1\u6709\u53D1\u51FA\u7684\u4FBF\u7B7E\u3002" })] }), noteSection === 'history' && _jsxs("section", { className: "note-record-grid", children: [noteHistory.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !noteHistory.length && _jsx("div", { className: "card notes-empty", children: "\u6279\u9605\u540E\u7684\u4FBF\u7B7E\u4F1A\u5728\u8FD9\u91CC\u4FDD\u7559 30 \u5929\u3002" })] }), noteSection === 'favorites' && _jsxs("section", { className: "note-record-grid", children: [favoriteNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !favoriteNotes.length && _jsx("div", { className: "card notes-empty", children: "\u6536\u85CF\u4F1A\u540C\u6B65\u5230\u4F60\u7684\u6240\u6709\u8BBE\u5907\u3002" })] })] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] }), _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && (_jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) })), _jsx("button", { disabled: cameraControlPending, onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsxs("small", { children: [localCameraStatus === 'available'
-                                                                ? `正在以${qualityLevelLabel(localCameraQualityLevel)}发送${localCameraQuality === 'relay-low' ? '（TURN）' : ''}；`
-                                                                : localCameraStatus === 'paused' ? '画面暂未发送；' : '', "\u6536\u8D77\u9884\u89C8\u4E0D\u4F1A\u505C\u6B62\u53D1\u9001\uFF1B\u5173\u95ED\u4F1A\u771F\u6B63\u91CA\u653E\u786C\u4EF6\u3002"] })] }), _jsxs("section", { className: `card connection-quality level-${liveNetworkLevel ?? 0}`, children: [_jsxs("div", { className: "connection-quality-title", children: [_jsx("span", { className: "status-dot" }), _jsx("strong", { children: networkLevelLabel(liveNetworkLevel) }), _jsx("span", { children: rtcRoute.candidateType === 'failed' ? '连接恢复中' : rtcRoute.path })] }), _jsxs("dl", { children: [_jsxs("div", { children: [_jsx("dt", { children: "\u5EF6\u8FDF" }), _jsx("dd", { children: rtcNetworkSample?.roundTripTimeMs != null ? `${rtcNetworkSample.roundTripTimeMs} ms` : '检测中' })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u5C4F\u5E55\u6863\u4F4D" }), _jsx("dd", { children: qualityLevelLabel(screenQualityLevel) })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u63A5\u6536\u7801\u7387" }), _jsx("dd", { children: inboundVideo?.bitrateKbps != null ? `${inboundVideo.bitrateKbps} kbps` : '检测中' })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u63A5\u6536\u5E27\u7387" }), _jsx("dd", { children: inboundVideo?.framesPerSecond != null ? `${Math.round(inboundVideo.framesPerSecond)} fps` : '检测中' })] })] })] })] })] })) : (_jsxs("section", { className: "card call-idle", children: [_jsx("div", { className: "pet-face", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), callableDevices.length > 1 && _jsx("div", { className: "call-device-list", children: callableDevices.map((device) => _jsxs("label", { children: [_jsx("input", { type: "radio", name: "call-target", checked: callTargetId === device.id, onChange: () => setCallTargetId(device.id) }), device.name] }, device.id)) }), _jsx("button", { className: "primary-button large", disabled: !canCall, onClick: () => void onStartCall(), children: "\u5F00\u59CB\u901A\u8BDD" })] }))] })), activeView === 'settings' && (_jsxs("main", { className: "page settings-page", children: [_jsx("div", { className: "page-heading", children: _jsx("h1", { children: "\u8BBE\u7F6E" }) }), setupRequired ? (_jsxs("section", { className: "card settings-section setup-card", children: [_jsx("p", { className: "setup-step", children: setupStep === 'server' ? '第 1 步，共 2 步' : '第 2 步，共 2 步' }), _jsx("h2", { children: setupStep === 'server' ? '连接你的服务器' : '选择你的身份' }), setupStep === 'server' ? _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u5148\u9A8C\u8BC1\u670D\u52A1\u5668\u5730\u5740\u548C\u5BC6\u94A5\uFF0C\u518D\u9009\u62E9\u8EAB\u4EFD\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668\u5730\u5740", _jsx("input", { value: serverUrl, onChange: (event) => { setServerUrl(event.target.value); resetPairingVerification(); }, placeholder: "https://pet.example.com" })] }), _jsxs("label", { children: ["\u670D\u52A1\u5668\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => { setSecret(event.target.value); resetPairingVerification(); }, placeholder: "\u8F93\u5165\u670D\u52A1\u5668\u5BC6\u94A5" })] })] }), _jsx("div", { className: "settings-actions", children: _jsx("button", { className: "primary-button", disabled: verifyingPairing || !serverUrl.trim() || !secret.trim(), onClick: () => void verifyPairing(), children: verifyingPairing ? '验证中…' : '验证并继续' }) })] }) : _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u8BF7\u9009\u62E9\u8FD9\u53F0\u8BBE\u5907\u5C5E\u4E8E\u8C01\uFF1B\u5207\u6362\u8EAB\u4EFD\u540E\u4ECD\u53EF\u5728\u8BBE\u7F6E\u4E2D\u66F4\u6539\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u6211\u7684\u8EAB\u4EFD", _jsxs("select", { value: memberId, onChange: (event) => setMemberId(event.target.value), children: [_jsx("option", { value: "", children: "\u8BF7\u9009\u62E9\u8EAB\u4EFD" }), verifiedMembers?.map((member) => _jsx("option", { value: member.id, children: member.displayName }, member.id))] })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value) })] })] }), _jsxs("div", { className: "settings-actions", children: [_jsx("button", { onClick: () => { setSetupStage('server'); setMemberId(''); }, children: "\u4E0A\u4E00\u6B65" }), _jsx("button", { className: "primary-button", disabled: !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u4FDD\u5B58\u5E76\u8FDE\u63A5" })] })] })] })) : _jsxs(_Fragment, { children: [_jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8FDE\u63A5" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668", _jsx("input", { value: serverUrl, onChange: (event) => setServerUrl(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u623F\u95F4\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => setSecret(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u5F53\u524D\u8EAB\u4EFD", _jsx("strong", { className: "identity-summary", children: memberId ? knownMemberNames[memberId] : '未选择' }), window.desktopPetControl && _jsx("button", { disabled: status !== 'connected', onClick: () => { if (memberId) {
+                                                                setNoteLink(''); }, children: ({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind] }, kind)) })] }), noteMediaKind === 'image' && _jsxs("label", { className: "button-like", children: ["\u9009\u62E9\u56FE\u7247", _jsx("input", { hidden: true, type: "file", accept: "image/jpeg,image/png", onChange: (event) => void onSelectNoteImage(event.target.files?.[0]) })] }), _jsx("button", { className: "primary-button large", disabled: status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000, onClick: () => void onSendNote(), children: noteSending ? '投递中…' : `投递给${peerName}` })] })] })), noteSection === 'sent' && _jsxs("section", { className: "note-record-grid", children: [sentNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !sentNotes.length && _jsx("div", { className: "card notes-empty", children: "\u8FD8\u6CA1\u6709\u53D1\u51FA\u7684\u4FBF\u7B7E\u3002" })] }), noteSection === 'history' && _jsxs("section", { className: "note-record-grid", children: [noteHistory.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !noteHistory.length && _jsx("div", { className: "card notes-empty", children: "\u6279\u9605\u540E\u7684\u4FBF\u7B7E\u4F1A\u5728\u8FD9\u91CC\u4FDD\u7559 30 \u5929\u3002" })] }), noteSection === 'favorites' && _jsxs("section", { className: "note-record-grid", children: [favoriteNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !favoriteNotes.length && _jsx("div", { className: "card notes-empty", children: "\u6536\u85CF\u4F1A\u540C\u6B65\u5230\u4F60\u7684\u6240\u6709\u8BBE\u5907\u3002" })] })] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] }), _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && (_jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) })), _jsx("button", { disabled: cameraControlPending || (!cameraDesired && !cameraCanOpen), onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsxs("small", { children: [cameraRouteState === 'relay-low'
+                                                                ? '摄像头通道使用 TURN，为保证屏幕和声音已关闭。'
+                                                                : cameraRouteState === 'failed'
+                                                                    ? '摄像头网络路径不可用，屏幕和声音不受影响。'
+                                                                    : cameraRouteState === 'unknown'
+                                                                        ? '正在检测摄像头网络路径…'
+                                                                        : localCameraStatus === 'available'
+                                                                            ? `正在以${qualityLevelLabel(localCameraQualityLevel)}发送${localCameraQuality === 'relay-low' ? '（TURN）' : ''}；`
+                                                                            : localCameraStatus === 'paused' ? '画面暂未发送；' : '', cameraRouteState === 'normal' && '收起预览不会停止发送；关闭会真正释放硬件。'] })] }), _jsxs("section", { className: `card connection-quality level-${liveNetworkLevel ?? 0}`, children: [_jsxs("div", { className: "connection-quality-title", children: [_jsx("span", { className: "status-dot" }), _jsx("strong", { children: networkLevelLabel(liveNetworkLevel) }), _jsx("span", { children: rtcRoute.candidateType === 'failed' ? '连接恢复中' : rtcRoute.path })] }), _jsxs("dl", { children: [_jsxs("div", { children: [_jsx("dt", { children: "\u5EF6\u8FDF" }), _jsx("dd", { children: rtcNetworkSample?.roundTripTimeMs != null ? `${rtcNetworkSample.roundTripTimeMs} ms` : '检测中' })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u5C4F\u5E55\u6863\u4F4D" }), _jsx("dd", { children: qualityLevelLabel(screenQualityLevel) })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u63A5\u6536\u7801\u7387" }), _jsx("dd", { children: inboundVideo?.bitrateKbps != null ? `${inboundVideo.bitrateKbps} kbps` : '检测中' })] }), _jsxs("div", { children: [_jsx("dt", { children: "\u63A5\u6536\u5E27\u7387" }), _jsx("dd", { children: inboundVideo?.framesPerSecond != null ? `${Math.round(inboundVideo.framesPerSecond)} fps` : '检测中' })] })] })] })] })] })) : (_jsxs("section", { className: "card call-idle", children: [_jsx("div", { className: "pet-face", children: "\u02F6\u1D54 \u1D55 \u1D54\u02F6" }), _jsxs("h1", { children: ["\u548C", peerName, "\u901A\u8BDD"] }), callableDevices.length > 1 && _jsx("div", { className: "call-device-list", children: callableDevices.map((device) => _jsxs("label", { children: [_jsx("input", { type: "radio", name: "call-target", checked: callTargetId === device.id, onChange: () => setCallTargetId(device.id) }), device.name] }, device.id)) }), _jsx("button", { className: "primary-button large", disabled: !canCall, onClick: () => void onStartCall(), children: "\u5F00\u59CB\u901A\u8BDD" })] }))] })), activeView === 'settings' && (_jsxs("main", { className: "page settings-page", children: [_jsx("div", { className: "page-heading", children: _jsx("h1", { children: "\u8BBE\u7F6E" }) }), setupRequired ? (_jsxs("section", { className: "card settings-section setup-card", children: [_jsx("p", { className: "setup-step", children: setupStep === 'server' ? '第 1 步，共 2 步' : '第 2 步，共 2 步' }), _jsx("h2", { children: setupStep === 'server' ? '连接你的服务器' : '选择你的身份' }), setupStep === 'server' ? _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u5148\u9A8C\u8BC1\u670D\u52A1\u5668\u5730\u5740\u548C\u5BC6\u94A5\uFF0C\u518D\u9009\u62E9\u8EAB\u4EFD\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668\u5730\u5740", _jsx("input", { value: serverUrl, onChange: (event) => { setServerUrl(event.target.value); resetPairingVerification(); }, placeholder: "https://pet.example.com" })] }), _jsxs("label", { children: ["\u670D\u52A1\u5668\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => { setSecret(event.target.value); resetPairingVerification(); }, placeholder: "\u8F93\u5165\u670D\u52A1\u5668\u5BC6\u94A5" })] })] }), _jsx("div", { className: "settings-actions", children: _jsx("button", { className: "primary-button", disabled: verifyingPairing || !serverUrl.trim() || !secret.trim(), onClick: () => void verifyPairing(), children: verifyingPairing ? '验证中…' : '验证并继续' }) })] }) : _jsxs(_Fragment, { children: [_jsx("p", { className: "settings-hint", children: "\u8BF7\u9009\u62E9\u8FD9\u53F0\u8BBE\u5907\u5C5E\u4E8E\u8C01\uFF1B\u5207\u6362\u8EAB\u4EFD\u540E\u4ECD\u53EF\u5728\u8BBE\u7F6E\u4E2D\u66F4\u6539\u3002" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u6211\u7684\u8EAB\u4EFD", _jsxs("select", { value: memberId, onChange: (event) => setMemberId(event.target.value), children: [_jsx("option", { value: "", children: "\u8BF7\u9009\u62E9\u8EAB\u4EFD" }), verifiedMembers?.map((member) => _jsx("option", { value: member.id, children: member.displayName }, member.id))] })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value) })] })] }), _jsxs("div", { className: "settings-actions", children: [_jsx("button", { onClick: () => { setSetupStage('server'); setMemberId(''); }, children: "\u4E0A\u4E00\u6B65" }), _jsx("button", { className: "primary-button", disabled: !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u4FDD\u5B58\u5E76\u8FDE\u63A5" })] })] })] })) : _jsxs(_Fragment, { children: [_jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u8FDE\u63A5" }), _jsxs("div", { className: "form-grid", children: [_jsxs("label", { children: ["\u670D\u52A1\u5668", _jsx("input", { value: serverUrl, onChange: (event) => setServerUrl(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u623F\u95F4\u5BC6\u94A5", _jsx("input", { type: "password", value: secret, onChange: (event) => setSecret(event.target.value), disabled: status === 'connecting' || status === 'connected' })] }), _jsxs("label", { children: ["\u5F53\u524D\u8EAB\u4EFD", _jsx("strong", { className: "identity-summary", children: memberId ? knownMemberNames[memberId] : '未选择' }), window.desktopPetControl && _jsx("button", { disabled: status !== 'connected', onClick: () => { if (memberId) {
                                                                     setIdentityChangeTarget(memberId === 'a' ? 'b' : 'a');
                                                                     setIdentityChangeOpen(true);
                                                                 } }, children: "\u66F4\u6539\u8EAB\u4EFD" })] }), _jsxs("label", { children: ["\u8BBE\u5907\u540D\u79F0", _jsx("input", { value: deviceName, onChange: (event) => setDeviceName(event.target.value), disabled: status === 'connecting' || status === 'connected' })] })] }), identityChangeOpen && _jsxs("div", { className: "identity-change", children: [_jsx("strong", { children: "\u66F4\u6539\u8EAB\u4EFD\u4F1A\u8BA9\u684C\u5BA0\u548C\u63A7\u5236\u7AEF\u77ED\u6682\u91CD\u65B0\u8FDE\u63A5\u3002" }), _jsxs("select", { value: identityChangeTarget, onChange: (event) => setIdentityChangeTarget(event.target.value), children: [_jsx("option", { value: "a", children: knownMemberNames.a }), _jsx("option", { value: "b", children: knownMemberNames.b })] }), _jsx("button", { className: "primary-button", disabled: identityChanging || identityChangeTarget === memberId, onClick: () => void confirmIdentityChange(), children: identityChanging ? '正在更改…' : '确认并重新连接' }), _jsx("button", { disabled: identityChanging, onClick: () => setIdentityChangeOpen(false), children: "\u53D6\u6D88" })] }), _jsxs("div", { className: "settings-actions", children: [_jsx(StatusPill, { status: status }), status === 'connected' || status === 'connecting' ? _jsx("button", { onClick: onDisconnect, children: "\u65AD\u5F00" }) : _jsx("button", { className: "primary-button", disabled: !serverUrl.trim() || !secret.trim() || !memberId || !deviceName.trim(), onClick: () => void onConnect(), children: "\u8FDE\u63A5" })] })] }), _jsxs("section", { className: "card settings-section", children: [_jsx("h2", { children: "\u6210\u5458\u540D\u79F0" }), peers.members.map((member) => _jsxs("div", { className: "member-row", children: [_jsx("span", { children: member.id === peers.self.memberId ? '我' : '对方' }), editingMemberId === member.id ? _jsxs(_Fragment, { children: [_jsx("input", { value: memberNameDraft, onChange: (event) => setMemberNameDraft(event.target.value) }), _jsx("button", { onClick: async () => { if (memberNameDraft.trim())
