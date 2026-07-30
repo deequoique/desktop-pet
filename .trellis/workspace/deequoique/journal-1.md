@@ -595,3 +595,38 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: TURN bandwidth and camera relay policy
+
+**Date**: 2026-07-30
+**Task**: TURN bandwidth and camera relay policy
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+Implemented bounded TURN screen adaptation through 720p45, disabled camera video on relay with delayed prewarm and manual recovery, synchronized server/status contracts and UI behavior, added regression coverage, and prepared v1.6.1-beta.4 test packages.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7ae3caf` | (see git log) |
+| `511e0e4` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
