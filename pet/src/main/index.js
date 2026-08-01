@@ -194,6 +194,7 @@ let tray = null;
 let gameMode = false;
 let petDragging = false;
 let petDragOffset = { x: 0, y: 0 };
+let petDragBounds = null;
 let updateState = {
   checking: false,
   available: false,
@@ -539,7 +540,7 @@ function rebuildTrayMenu() {
 
 function setGameMode(enabled) {
   gameMode = !!enabled;
-  if (gameMode) petDragging = false;
+  if (gameMode) stopPetDrag();
   patchState({ gameMode });
   if (win && !win.isDestroyed()) {
     // Game mode is an unconditional lock: renderer hit-testing must not make
@@ -564,6 +565,11 @@ function setGameMode(enabled) {
     noteWindowsHiddenForGame.clear();
   }
   rebuildTrayMenu();
+}
+
+function stopPetDrag() {
+  petDragging = false;
+  petDragBounds = null;
 }
 
 function checkForPetUpdates(manual = false) {
@@ -861,12 +867,13 @@ ipcMain.on('pet:drag', (_e, { dx, dy }) => {
 ipcMain.on('pet:drag-start', () => {
   if (!win || win.isDestroyed() || gameMode) return;
   const p = screen.getCursorScreenPoint();
-  const [x, y] = win.getPosition();
-  petDragOffset = { x: p.x - x, y: p.y - y };
+  const bounds = win.getBounds();
+  petDragOffset = { x: p.x - bounds.x, y: p.y - bounds.y };
+  petDragBounds = bounds;
   petDragging = true;
 });
 ipcMain.on('pet:drag-end', () => {
-  petDragging = false;
+  stopPetDrag();
 });
 
 // 远程 relocate：A 端发 corner → 主进程贴到对应角
@@ -921,8 +928,14 @@ function startCursorPoll() {
     const [ww, wh] = win.getSize();
     const inside = p.x >= wx && p.x < wx + ww && p.y >= wy && p.y < wy + wh;
     cursorInsidePetWindow = inside;
-    if (petDragging && !gameMode) {
-      win.setPosition(Math.round(p.x - petDragOffset.x), Math.round(p.y - petDragOffset.y));
+    if (petDragging && !gameMode && petDragBounds) {
+      const x = Math.round(p.x - petDragOffset.x);
+      const y = Math.round(p.y - petDragOffset.y);
+      if (x !== wx || y !== wy) {
+        // Windows fractional DPI can make repeated setPosition calls drift the window size.
+        // Apply the drag-start size atomically and skip native calls while the cursor is still.
+        win.setBounds({ x, y, width: petDragBounds.width, height: petDragBounds.height });
+      }
     }
     // PNG 动画桌宠不使用旧 VRM raycast。主进程以窗口范围作为可靠兜底，
     // 避免 renderer 的首次 clickable IPC 丢失后窗口永久保持鼠标穿透。
@@ -1095,7 +1108,7 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
-  petDragging = false;
+  stopPetDrag();
   stopCursorPoll();
   screen.removeListener('display-metrics-changed', onDisplayMetricsChanged);
   screen.removeListener('display-added', onDisplayAdded);

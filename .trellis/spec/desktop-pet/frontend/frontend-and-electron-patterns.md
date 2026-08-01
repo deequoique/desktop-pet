@@ -66,6 +66,8 @@ ipcMain.handle('pet:get-scale', () => number);
 ipcMain.handle('pet:set-scale', (_event, scale) => ({ ok, scale?, bounds?, error? }));
 ipcMain.handle('pet:reset-scale', () => ({ ok, scale?, bounds?, error? }));
 ipcMain.handle('diagnostics:export', () => ({ ok, canceled?, path?, error? }));
+ipcMain.on('pet:drag-start', () => void);
+ipcMain.on('pet:drag-end', () => void);
 
 webContents.send('pet:scale-changed', actualScale);
 ```
@@ -77,6 +79,8 @@ webContents.send('pet:scale-changed', actualScale);
 - scale 输入转为有限数值并 clamp 到 0.3–1.5；非法值回退到 1。
 - 主进程以 180×240 DIP 为基准计算 bounds（旧版 360×480 的一半），底部中心锚定并 clamp 到匹配 display 的 workArea；scale 百分比及其持久值语义保持不变。
 - `setBounds` 后读取实际 bounds，以实际宽度重新计算并持久化 scale，再广播给两个 renderer。
+- 主进程拖拽开始时必须用 `win.getBounds()` 冻结实际 `width/height` 和光标偏移；轮询只在目标 `x/y` 变化时调用一次 `setBounds({ x, y, width, height })`。不得在高频轮询中反复只调用 `setPosition()`，因为 Windows 分数 DPI 下 DIP/物理像素取整会累积改变窗口尺寸。
+- 拖拽结束、进入游戏模式和应用退出时必须同时清理 active 标志与冻结 bounds；renderer 仍只发送 start/end，不持有原生窗口尺寸真相。
 - 诊断 JSONL 位于 Electron `userData/logs/`，有限轮转；只在用户调用导出时弹出保存对话框，不自动上传。
 - 日志/导出允许包含应用版本、OS/Electron 版本、display bounds/workArea/scaleFactor、窗口 bounds 和非敏感 pet-state；禁止包含 room secret、API key、credential、Socket.IO payload 或音频二进制。
 
@@ -87,6 +91,9 @@ webContents.send('pet:scale-changed', actualScale);
 | pet window 尚未创建或已销毁 | `{ ok:false, error:'pet_window_unavailable' }` |
 | scale 非有限值 | 使用 1，再按正常路径应用与广播 |
 | 目标位置超出 workArea | clamp 回当前匹配显示器可见范围 |
+| 拖拽轮询时目标 `x/y` 未变化 | 不调用 `setPosition` 或 `setBounds` |
+| Windows 分数 DPI 下拖拽移动 | 使用拖拽开始时冻结的实际尺寸原子设置 bounds，不做固定 DPI 比例补偿 |
+| 拖拽结束、游戏模式启用或应用退出 | 清理拖拽 active 标志与冻结 bounds |
 | 用户取消保存对话框 | `{ ok:false, canceled:true }`，不改变窗口状态 |
 | 日志写入失败 | console warning 并继续运行；不得阻止 app ready 或缩放 |
 | 导出写入失败 | `{ ok:false, canceled:false, error }`，控制面板显示受控错误 |
@@ -94,12 +101,13 @@ webContents.send('pet:scale-changed', actualScale);
 ### 5. 正常、基准与错误案例
 
 - 正常：控制面板把 scale 改为 0.8，main 应用实际 bounds、保存 0.8，并让浮层与控制面板同时更新。
-- 基准：Electron bridge 不可用时隐藏本机桌宠缩放/导出 UI；该 fallback 只服务开发调试。
-- 错误：renderer 自己保存 currentScale 并直接假设 `setBounds` 成功，导致 Windows DPI/实际 bounds 与 UI 显示分叉。
+- 正常：拖拽移动只改变位置，每次原生调用都显式携带拖拽开始时的实际宽高。
+- 基准：点击并按住但不移动光标时不调用原生窗口 bounds API；Electron bridge 不可用时隐藏本机桌宠缩放/导出 UI。
+- 错误：高频轮询无条件调用 `setPosition()`，Windows 125% DPI 下每轮约增加 1px，最终绕过 scale 上限持续放大。
 
 ### 6. 必需测试
 
-- unit：scale clamp、workArea bounds clamp、敏感字段/字符串/二进制 redaction、持久日志再次导出仍无秘密。
+- unit：scale clamp、workArea bounds clamp、敏感字段/字符串/二进制 redaction、持久日志再次导出仍无秘密；拖拽回归测试必须断言静止时跳过原生调用、移动时使用冻结尺寸、结束时清理快照。
 - build：`npm run build:web` 与 `npm run build:pet`，确认 main/preload/renderer 契约副本一致。
 - manual：浮层与控制面板互相同步、重启持久化、reset 可见、导出成功/取消；故障机日志必须能串起 request→actual bounds→display scaleFactor。
 
@@ -113,6 +121,14 @@ petBridge.resize(currentScale);
 // 正确：main 返回/广播实际值，renderer 只镜像权威状态。
 const result = await petBridge.resize(requestedScale);
 if (result.ok && result.scale != null) currentScale = result.scale;
+
+// 错误：16ms 轮询无条件只设位置，分数 DPI 下可能累积尺寸取整漂移。
+win.setPosition(x, y);
+
+// 正确：静止时跳过调用；移动时显式保持拖拽开始时的实际尺寸。
+if (x !== current.x || y !== current.y) {
+  win.setBounds({ x, y, width: dragBounds.width, height: dragBounds.height });
+}
 ```
 
 ## Pet renderer
