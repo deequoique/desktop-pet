@@ -449,3 +449,37 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: 修复 Windows 桌宠点击尺寸漂移
+
+**Date**: 2026-08-01
+**Task**: 修复 Windows 桌宠点击尺寸漂移
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+根据 Windows 125% DPI 诊断日志定位 16ms 拖拽轮询中的 setPosition 尺寸取整漂移；改为静止时跳过调用、移动时使用拖拽开始冻结的实际 bounds，并补充回归测试与 Electron 规范。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4919c82` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
-- **Last Active**: 2026-07-28
+- **Total Sessions**: 14
+- **Last Active**: 2026-08-01
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~451 | Active |
+| `journal-1.md` | ~485 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-08-01 | 修复 Windows 桌宠点击尺寸漂移 | `4919c82` | `master` |
 | 13 | 2026-07-28 | 实现异步桌面便签 | `b21daf4` | `master` |
 | 12 | 2026-07-22 | Simplify floating media UI | `bbc3c94` | `master` |
 | 11 | 2026-07-19 | Camera and floating media window | `2bc0f7d` | `master` |
