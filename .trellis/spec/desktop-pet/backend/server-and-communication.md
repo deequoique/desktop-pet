@@ -28,6 +28,70 @@
 
 在线 endpoint、call、TTS job 和 BYOK 凭据不会持久化；成员名称、设备历史和个人音频会跨 server 重启恢复。
 
+## Scenario: Linux 生产持久目录与 server 更新
+
+### 1. Scope / Trigger
+
+- 修改 `PET_DATA_DIR`、Linux/PM2 启动、release bundle、Git 部署更新或 `PersistentStore` 启动顺序时适用。目标是让代码 checkout 与用户数据具有独立生命周期。
+
+### 2. Signatures
+
+```js
+resolveDataDirectory(env, moduleUrl) -> absolutePath
+prepareDataDirectory(env, moduleUrl) -> readableWritableAbsolutePath
+new PersistentStore(prepareDataDirectory(), now, noteLimits)
+```
+
+环境键为 `NODE_ENV` 和 `PET_DATA_DIR`；PM2 与 `start-linux.sh` 必须让 Linux 部署进入 `production`。
+
+### 3. Contracts
+
+- `NODE_ENV=production` 且未设置 `PET_DATA_DIR` 时，默认目录是 `/var/lib/desktop-pet`；非生产环境默认 `server/data`。
+- 生产环境显式 `PET_DATA_DIR` 必须是绝对路径。启动时先创建/验证目录，再构造 `PersistentStore`。
+- 若生产目标没有 `registry.json`，但 legacy `server/data/registry.json` 存在，必须拒绝启动并要求停服后迁移整个目录；不得只复制 registry 或自动创建第二份空数据。
+- 整体迁移必须包含 `registry.json`、`audio/` 和 `notes/`。未知/损坏 registry 继续 fail closed。
+- `server.started.context.dataDir` 记录实际路径；公共 health response 不暴露文件系统路径。
+- 标准 Git 更新使用同一 checkout 的 `git pull --ff-only`；`server/data/` 必须被 Git 忽略，release 不包含 `.env` 或运行时数据。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 行为 |
+| --- | --- |
+| 生产未配置 `PET_DATA_DIR` | 使用 `/var/lib/desktop-pet` |
+| 非生产未配置 `PET_DATA_DIR` | 使用包内 `server/data` |
+| 生产配置相对路径 | 启动失败，提示必须使用绝对路径 |
+| 目标目录不可创建/读写/访问 | 启动失败，提示给真实运行用户授权 |
+| 目标 registry 缺失、legacy registry 存在 | 启动失败，提示两个路径和全目录迁移 |
+| 目标 registry 已迁移 | 正常交给 `PersistentStore` 加载 |
+| registry 损坏或版本未知 | 保留原文件并拒绝启动 |
+
+### 5. Good/Base/Bad Cases
+
+- Good：数据位于 `/var/lib/desktop-pet`，操作者备份后 pull、安装依赖并 PM2 reload，名称、音频和便签保持。
+- Base：本地 `npm run dev:server` 未配置路径，继续使用 `server/data`，不要求 root 权限。
+- Bad：更新脚本删除整个 checkout，或 server 发现 legacy registry 后仍在空目标创建新 registry，使 UI 看起来全部清零。
+
+### 6. Tests Required
+
+- data-directory unit：生产/开发默认、显式绝对 override、生产相对路径拒绝、legacy 冲突、已迁移目标和目录创建失败。
+- store unit：同一次重启恢复必须断言成员名称、设备、个人音频、便签 metadata 与图片附件。
+- integration/static：`npm test --prefix server`、`bash -n server/start-linux.sh`、`git check-ignore server/data/registry.json`，并检查 release 文件清单不含 `.env`/runtime data。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```js
+const store = new PersistentStore(new URL('../data', import.meta.url).pathname);
+```
+
+#### Correct
+
+```js
+const dataDir = prepareDataDirectory();
+const store = new PersistentStore(dataDir, () => Date.now(), noteLimits);
+```
+
 ## Scenario: v2 双成员、多设备和个人音频契约
 
 ### 1. Scope / Trigger
@@ -113,7 +177,7 @@ CosyVoice 使用 duplex WebSocket，ElevenLabs 使用 `fetch` stream，但两者
 
 客户端可见的运行失败使用稳定的小写错误码，例如 `room_full`、`peer_not_ready`、`tts_queue_full` 和 `tts_upstream_rate_limited`。provider 细节只写 server warning，客户端只接收受控错误码。
 
-日志使用简短 subsystem 前缀，如 `[socket]`、`[tts]`、`[webrtc]`，并使用 `console.log`、`console.warn` 或 `console.error`。禁止记录房间密钥、API key、包含凭据的 Socket.IO payload、完整 TTS 文本或音频。房间日志只使用 hash 的短前缀。
+业务日志通过 `server/src/diagnostics.js` 输出逐行 JSON；字段、关联 ID、脱敏、限频与 PM2 保留规则遵循共享的[诊断与 Incident 契约](../shared/diagnostics-and-incidents.md)。只保留兼容进程探活所需的少量启动文本，新增业务路径不得退回零散 subsystem `console.*`。禁止记录房间密钥、API key、包含凭据的 Socket.IO payload、完整 TTS 文本、音频、SDP 或原始 ICE candidate。
 
 ## 测试
 

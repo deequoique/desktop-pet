@@ -5,4 +5,5 @@ if [[ ! -f .env ]]; then
   echo "Missing .env. Copy .env.example to .env and configure ROOM_SECRET or ROOM_SECRETS first." >&2
   exit 1
 fi
+export NODE_ENV="${NODE_ENV:-production}"
 exec node src/index.js

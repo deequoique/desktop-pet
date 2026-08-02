@@ -22,7 +22,7 @@ renderer 不得直接导入 Electron 或 Node API。普通功能变更不要顺�
 
 会参与渲染的值使用 `useState`。不应触发渲染的外部可变资源使用 `useRef`，例如 `RTCPeerConnection`、`MediaStream`、DOM media element、待处理 ICE candidate、call ID 和 timer handle。函数进入 effect dependency 或管理长生命周期资源时使用 `useCallback`。
 
-effect 用于安装外部 listener 或同步外部状态；如果 effect 创建资源，就必须返回 cleanup。`App.tsx` 中的现有例子会清空 API listener、拆除 call、用 flag 取消异步声音加载，并清除 interval。
+effect 用于安装外部 listener 或同步外部状态；如果 effect 创建资源，就必须只清理它拥有的资源。Socket listener effect 的 cleanup 只清空 API listener，不能同时 teardown call，否则 state/callback dependency 变化会在重绑 listener 时误停 tracks 和 peer connection。Call teardown 由挂断/call end/error 或独立的 component-unmount effect 持有。异步声音/WebRTC 初始化还要用取消 flag 或 generation identity 丢弃过期 continuation。
 
 当前仓库不使用 router、context store、Redux/Zustand、React Query/SWR、form library、component library 或项目自定义 hook。小型局部改动不要引入这些体系。
 

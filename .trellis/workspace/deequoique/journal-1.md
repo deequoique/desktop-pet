@@ -20,7 +20,10 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Main Changes
 
-- Detailed change bullets were not supplied; see the summary above.
+- Camera negotiation now uses a fixed offerer and bidirectional `sendrecv`; each controller captures, previews, toggles, and releases only its own camera.
+- Socket listener cleanup no longer tears down an active call; async call/camera continuations use generation guards and serialized sender mutation.
+- TURN relay applies fixed screen 640×360/5fps/240 kbit/s and camera 320×180/10fps/120 kbit/s limits, with machine-readable media quality and fail-closed video behavior.
+- Server routing tests, profile unit tests, UI status, Trellis contracts, troubleshooting, release, and coturn capacity docs were updated.
 
 ### Git Commits
 
@@ -30,7 +33,11 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Testing
 
-- Validation was not recorded for this session.
+- `npm test --prefix server` — 11 passed.
+- `npm test --prefix pet` — 26 passed.
+- `npm run build:web` and `npm run build:pet` — passed.
+- `bash -n server/deploy/install-coturn-ubuntu.sh` and `git diff --check` — passed.
+- Electron control-panel smoke test through CDP — no runtime/console errors.
 
 ### Status
 
@@ -38,7 +45,7 @@ Inspected the current Electron desktop-pet architecture, corrected the Trellis p
 
 ### Next Steps
 
-- None - task complete
+- Run the documented two-device forced-relay 10-minute matrix against the real coturn host and record outbound RTP/coturn throughput evidence.
 
 
 ## Session 2: 双栈 WebRTC 与 TURN 音频兜底
@@ -451,7 +458,181 @@ Made the system media float a freely resizable, pure screen/camera canvas with c
 - None - task complete
 
 
-## Session 14: 修复 Windows 桌宠点击尺寸漂移
+## Session 14: 双向摄像头与 TURN 低清视频
+
+**Date**: 2026-07-29
+**Task**: 双向摄像头与 TURN 低清视频
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+修复通话 listener cleanup 误 teardown，升级为双方仅控制本机的双向摄像头，并为 TURN 屏幕与摄像头增加固定 relay-low profile、质量状态、测试和部署说明。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e13dfa6` | (see git log) |
+| `596f6eb` | (see git log) |
+| `5d7d964` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 15: WebRTC 五档自适应与有效 TURN 判路
+
+**Date**: 2026-07-29
+**Task**: WebRTC 五档自适应与有效 TURN 判路
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+根据 A/B 诊断确认 NAT 后 TURN prflx 被误判为 P2P；实现统一 effective relay 判定、五档快降慢升画质、实时 RTT/码率/帧率 UI、有界 RTP 诊断和 coturn external-ip 验证，并准备 v1.6.1-beta.2。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef0048f` | (see git log) |
+| `440b9e2` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 16: 修复 WebRTC P2P 带宽估算自锁
+
+**Date**: 2026-07-29
+**Task**: 修复 WebRTC P2P 带宽估算自锁
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+将 P2P 屏幕共享改为480p30至2K90的双维自适应状态机，availableOutgoingBitrate降为软信号，TURN保留360p/5fps硬上限；补齐诊断、回归测试和网络规范。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e0af588` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 17: 修复服务器更新后的持久数据丢失
+
+**Date**: 2026-07-30
+**Task**: 修复服务器更新后的持久数据丢失
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+将 Linux 生产数据默认迁移到 /var/lib/desktop-pet，新增 legacy 数据冲突保护、完整目录迁移回归测试，以及 Git pull/备份/恢复部署文档。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e9d3ad7` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 18: TURN bandwidth and camera relay policy
+
+**Date**: 2026-07-30
+**Task**: TURN bandwidth and camera relay policy
+**Package**: desktop-pet
+**Branch**: `codex/call-video-reliability`
+
+### Summary
+
+Implemented bounded TURN screen adaptation through 720p45, disabled camera video on relay with delayed prewarm and manual recovery, synchronized server/status contracts and UI behavior, added regression coverage, and prepared v1.6.1-beta.4 test packages.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7ae3caf` | (see git log) |
+| `511e0e4` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 19: 修复 Windows 桌宠点击尺寸漂移
 
 **Date**: 2026-08-01
 **Task**: 修复 Windows 桌宠点击尺寸漂移

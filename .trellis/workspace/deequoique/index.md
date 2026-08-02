@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
+- **Total Sessions**: 19
 - **Last Active**: 2026-08-01
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~485 | Active |
+| `journal-1.md` | ~666 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,7 +29,12 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
-| 14 | 2026-08-01 | 修复 Windows 桌宠点击尺寸漂移 | `4919c82` | `master` |
+| 19 | 2026-08-01 | 修复 Windows 桌宠点击尺寸漂移 | `4919c82` | `master` |
+| 18 | 2026-07-30 | TURN bandwidth and camera relay policy | `7ae3caf`, `511e0e4` | `codex/call-video-reliability` |
+| 17 | 2026-07-30 | 修复服务器更新后的持久数据丢失 | `e9d3ad7` | `codex/call-video-reliability` |
+| 16 | 2026-07-29 | 修复 WebRTC P2P 带宽估算自锁 | `e0af588` | `codex/call-video-reliability` |
+| 15 | 2026-07-29 | WebRTC 五档自适应与有效 TURN 判路 | `ef0048f`, `440b9e2` | `codex/call-video-reliability` |
+| 14 | 2026-07-29 | 双向摄像头与 TURN 低清视频 | `e13dfa6`, `596f6eb`, `5d7d964` | `codex/call-video-reliability` |
 | 13 | 2026-07-28 | 实现异步桌面便签 | `b21daf4` | `master` |
 | 12 | 2026-07-22 | Simplify floating media UI | `bbc3c94` | `master` |
 | 11 | 2026-07-19 | Camera and floating media window | `2bc0f7d` | `master` |

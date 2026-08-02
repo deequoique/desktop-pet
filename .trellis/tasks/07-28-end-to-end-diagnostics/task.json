@@ -1,0 +1,30 @@
+{
+  "id": "end-to-end-diagnostics",
+  "name": "end-to-end-diagnostics",
+  "title": "构建端到端诊断与故障采集系统",
+  "description": "统一服务端、Electron 主进程、renderer 与 WebRTC 的结构化日志、错误分级、关联标识、崩溃留证和诊断导出。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": "desktop-pet",
+  "priority": "P1",
+  "creator": "deequoique",
+  "assignee": "deequoique",
+  "createdAt": "2026-07-28",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "07-28-server-observability",
+    "07-28-client-crash-diagnostics",
+    "07-28-diagnose-ipv4-webrtc-p2p"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Product decisions: diagnostics/incidents are local-only and user-exported; no background upload. Crash recovery does not pop up or auto-open control; a persistent export/dismiss banner appears when the user next opens control. User-approved exports may include exact ICE IP/port/related-address metadata with an explicit warning. Settings gets a dedicated diagnostics section; settings, tray, and crash banner share one JSON export handler.",
+  "meta": {}
+}

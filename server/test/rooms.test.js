@@ -42,12 +42,20 @@ function emitAck(socket, event, payload) {
 
 server = spawn(process.execPath, ['src/index.js'], {
   cwd: new URL('..', import.meta.url),
-  env: { ...process.env, PORT: String(port), ROOM_SECRETS: 'alpha,beta', ROOM_GRACE_MS: '40', PET_DATA_DIR: dataDir },
+  env: {
+    ...process.env,
+    NODE_ENV: 'test',
+    PORT: String(port),
+    ROOM_SECRETS: 'alpha,beta',
+    ROOM_GRACE_MS: '40',
+    PET_DATA_DIR: dataDir,
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error('server start timeout')), 4000);
-  server.once('exit', (code) => reject(new Error(`server exited ${code}`)));
+  const timer = setTimeout(() => reject(new Error('server start timeout')), 10_000);
+  server.once('error', (error) => { clearTimeout(timer); reject(error); });
+  server.once('exit', (code) => { clearTimeout(timer); reject(new Error(`server exited ${code}`)); });
   server.stdout.on('data', (chunk) => { if (String(chunk).includes('pet server listening')) { clearTimeout(timer); resolve(); } });
   server.stderr.on('data', (chunk) => process.stderr.write(chunk));
 });
@@ -67,7 +75,9 @@ try {
   const bPet1 = await join({ role: 'pet', memberId: 'b', deviceId: 'b-pc' });
   const bController1 = await join({ role: 'controller', memberId: 'b', deviceId: 'b-pc' });
   const bPet2 = await join({ role: 'pet', memberId: 'b', deviceId: 'b-tablet' });
+  const betaController = await join({ secret: 'beta', role: 'controller', memberId: 'a', deviceId: 'beta-a' });
   assert.equal(bPet2.response.ok, true);
+  assert.equal(betaController.response.ok, true);
   assert.equal(aController.response.peers.peerOnline, false);
 
   await new Promise((resolve) => aController.socket.emit('room:rename-member', { memberId: 'b', displayName: '小明' }, resolve));
@@ -87,8 +97,10 @@ try {
   const [aCall, bCall] = await Promise.all([aCallStart, bCallStart]);
   assert.equal(aCall.callId, started.callId);
   assert.equal(aCall.peerDeviceId, 'b-pc');
+  assert.equal(aCall.cameraOffererDeviceId, 'a-laptop');
   assert.equal(aCall.cameraSenderDeviceId, 'b-pc');
   assert.equal(bCall.peerDeviceId, 'a-laptop');
+  assert.equal(bCall.cameraOffererDeviceId, 'a-laptop');
   assert.equal(bCall.cameraSenderDeviceId, 'b-pc');
 
   const screenControl = once(bPet1.socket, 'webrtc:media-control');
@@ -103,14 +115,18 @@ try {
   bPet2.socket.off('webrtc:media-control', onLeakedScreenControl);
   assert.equal(leakedScreenControl, false);
 
-  const cameraControl = once(bController1.socket, 'webrtc:media-control');
-  assert.deepEqual(await emitAck(aController.socket, 'webrtc:media-control', {
+  let leakedCameraControl = false;
+  const onLeakedCameraControl = () => { leakedCameraControl = true; };
+  bController1.socket.on('webrtc:media-control', onLeakedCameraControl);
+  assert.equal((await emitAck(aController.socket, 'webrtc:media-control', {
     callId: started.callId, media: 'camera', enabled: true,
-  }), { ok: true });
-  assert.deepEqual(await cameraControl, { callId: started.callId, media: 'camera', enabled: true });
+  })).code, 'invalid_media');
   assert.equal((await emitAck(bController1.socket, 'webrtc:media-control', {
     callId: started.callId, media: 'camera', enabled: false,
-  })).code, 'not_allowed');
+  })).code, 'invalid_media');
+  await wait(20);
+  bController1.socket.off('webrtc:media-control', onLeakedCameraControl);
+  assert.equal(leakedCameraControl, false);
   assert.equal((await emitAck(aController.socket, 'webrtc:media-control', {
     callId: 'stale-call', media: 'screen', enabled: true,
   })).code, 'not_in_call');
@@ -124,20 +140,81 @@ try {
   });
   assert.equal((await cameraSignal).description.sdp, 'camera-offer');
 
+  const cameraAnswer = once(aController.socket, 'webrtc:camera-signal');
+  bController1.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, description: { type: 'answer', sdp: 'camera-answer' },
+  });
+  assert.equal((await cameraAnswer).description.sdp, 'camera-answer');
+
   const cameraStatus = once(aController.socket, 'webrtc:media-status');
   bController1.socket.emit('webrtc:media-status', {
-    callId: started.callId, media: 'camera', state: 'unavailable', reason: 'controller_disabled',
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'controller_disabled', sourceDeviceId: 'a-laptop', quality: 'ultra', qualityLevel: 9,
   });
   assert.deepEqual(await cameraStatus, {
-    callId: started.callId, media: 'camera', state: 'unavailable', reason: 'controller_disabled',
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'controller_disabled', sourceDeviceId: 'b-pc',
   });
+
+  const relayDisabledCameraStatus = once(aController.socket, 'webrtc:media-status');
+  bController1.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'relay_disabled', sourceDeviceId: 'a-laptop', quality: 'relay-low', qualityLevel: 1,
+  });
+  assert.deepEqual(await relayDisabledCameraStatus, {
+    callId: started.callId, media: 'camera', state: 'unavailable',
+    reason: 'relay_disabled', sourceDeviceId: 'b-pc', quality: 'relay-low', qualityLevel: 1,
+  });
+
+  const reverseCameraStatus = once(bController1.socket, 'webrtc:media-status');
+  aController.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'available',
+    sourceDeviceId: 'b-pc', quality: 'relay-low', qualityLevel: 1,
+  });
+  assert.deepEqual(await reverseCameraStatus, {
+    callId: started.callId, media: 'camera', state: 'available',
+    sourceDeviceId: 'a-laptop', quality: 'relay-low', qualityLevel: 1,
+  });
+
+  let thirdDeviceCameraLeak = false;
+  const onThirdDeviceCameraLeak = () => { thirdDeviceCameraLeak = true; };
+  bController1.socket.on('webrtc:camera-signal', onThirdDeviceCameraLeak);
+  bController1.socket.on('webrtc:media-status', onThirdDeviceCameraLeak);
+  aController.socket.on('webrtc:camera-signal', onThirdDeviceCameraLeak);
+  aController.socket.on('webrtc:media-status', onThirdDeviceCameraLeak);
+  aController2.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, description: { type: 'offer', sdp: 'third-device-offer' },
+  });
+  aController2.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'available',
+  });
+  bPet2.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, description: { type: 'offer', sdp: 'wrong-role-offer' },
+  });
+  bPet2.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'available',
+  });
+  betaController.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, description: { type: 'offer', sdp: 'other-room-offer' },
+  });
+  betaController.socket.emit('webrtc:media-status', {
+    callId: started.callId, media: 'camera', state: 'available',
+  });
+  await wait(20);
+  bController1.socket.off('webrtc:camera-signal', onThirdDeviceCameraLeak);
+  bController1.socket.off('webrtc:media-status', onThirdDeviceCameraLeak);
+  aController.socket.off('webrtc:camera-signal', onThirdDeviceCameraLeak);
+  aController.socket.off('webrtc:media-status', onThirdDeviceCameraLeak);
+  assert.equal(thirdDeviceCameraLeak, false);
 
   const screenStatus = once(aController.socket, 'webrtc:media-status');
   bPet1.socket.emit('webrtc:media-status', {
-    callId: started.callId, media: 'screen', state: 'paused', reason: 'controller_disabled',
+    callId: started.callId, media: 'screen', state: 'paused',
+    reason: 'controller_disabled', quality: 'normal', qualityLevel: 3,
   });
   assert.deepEqual(await screenStatus, {
-    callId: started.callId, media: 'screen', state: 'paused', reason: 'controller_disabled',
+    callId: started.callId, media: 'screen', state: 'paused',
+    reason: 'controller_disabled', quality: 'normal', qualityLevel: 3,
   });
 
   let unrelatedStatusReceived = false;

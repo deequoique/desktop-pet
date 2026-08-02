@@ -27,7 +27,7 @@ export function connect(serverUrl, secret, identity) {
             }
             else {
                 listeners.onStatus?.('rejected');
-                listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败');
+                listeners.onError?.(res?.code === 'upgrade_required' ? '客户端版本过旧，必须升级' : res?.error || '加入失败', res?.code || 'socket_join_rejected');
             }
         });
     };
@@ -35,24 +35,24 @@ export function connect(serverUrl, secret, identity) {
     s.on('disconnect', () => listeners.onStatus?.('disconnected'));
     s.on('connect_error', (e) => {
         listeners.onStatus?.('disconnected');
-        listeners.onError?.(`连接出错：${e.message}`);
+        listeners.onError?.(`连接出错：${e.message}`, 'socket_connect_error');
     });
     s.on('room:peers', (p) => listeners.onPeers?.(p));
     s.on('room:kicked', (r) => {
-        listeners.onError?.(`被踢出：${r?.reason || ''}`);
+        listeners.onError?.(`被踢出：${r?.reason || ''}`, `socket_kicked_${r?.reason || 'unknown'}`);
         listeners.onStatus?.('rejected');
     });
     s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));
     s.on('webrtc:camera-signal', (signal) => listeners.onCameraSignal?.(signal));
-    s.on('webrtc:media-control', (control) => listeners.onMediaControl?.(control));
     s.on('webrtc:hangup', () => listeners.onHangup?.());
     s.on('webrtc:error', (payload) => {
         listeners.onRtcError?.(payload?.message || '通话出错');
     });
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('call:start', (payload) => {
-        if (payload?.callId)
-            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraSenderDeviceId);
+        if (payload?.callId) {
+            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraOffererDeviceId, payload.cameraSenderDeviceId);
+        }
     });
     s.on('call:end', (payload) => {
         listeners.onCallEnd?.(payload?.callId, payload?.reason);

@@ -2,22 +2,90 @@
 
 ## Linux server
 
-服务器需要 Node.js 20。Release 中的 Linux 压缩包已包含生产依赖；解压、复制 `.env.example` 为 `.env`、填写配置后运行 `./start-linux.sh`。源码部署也可以执行：
+服务器需要 Node.js 20。推荐使用同一个 Git checkout 部署，后续更新只需 fast-forward pull，不替换整个应用目录。以下示例假设 server 由当前登录用户运行；若 PM2 使用其他用户，先把 `DESKTOP_PET_APP_USER` 和 `DESKTOP_PET_APP_GROUP` 改成真实值。
 
 ```bash
+DESKTOP_PET_APP_USER="$(id -un)"
+DESKTOP_PET_APP_GROUP="$(id -gn)"
+sudo install -d -m 0755 -o "$DESKTOP_PET_APP_USER" -g "$DESKTOP_PET_APP_GROUP" /opt/desktop-pet
+git clone https://github.com/deequoique/desktop-pet.git /opt/desktop-pet
+cd /opt/desktop-pet
+cp server/.env.example server/.env
+chmod 600 server/.env
+editor server/.env
+sudo install -d -m 0750 -o "$DESKTOP_PET_APP_USER" -g "$DESKTOP_PET_APP_GROUP" /var/lib/desktop-pet
 npm ci --prefix server --omit=dev
-npm start --prefix server
+cd server
+pm2 startOrReload ecosystem.config.cjs --update-env
+bash deploy/configure-pm2-logs.sh
+pm2 save
+curl --fail http://127.0.0.1:3030/api/health
 ```
 
-建议用 systemd 守护进程，并在 Caddy 或 Nginx 后提供 HTTPS。普通 HTTP 会导致浏览器麦克风权限和 WebRTC 受限。
+`server/.env` 默认包含 `NODE_ENV=production` 和 `PET_DATA_DIR=/var/lib/desktop-pet`。代码在生产模式未显式配置 `PET_DATA_DIR` 时也使用该目录；本地非生产开发才回退到 `server/data`。首次启动若目录不存在或运行用户不可读写，server 会直接拒绝启动，不会等到用户写入名称或便签时才失败。
 
-公网两端无法稳定 P2P 时，按 [Ubuntu 24.04 coturn 部署手册](./ubuntu-coturn-deployment.md) 配置自建 STUN 与 TURN 音频兜底。Release 的 `server/deploy/` 已包含幂等部署脚本和配置模板。
+Release 中的 Linux 压缩包仍可用于无 Git 部署：解压后复制 `.env.example` 为 `.env`、先创建 `/var/lib/desktop-pet`，再运行 `./start-linux.sh`。该脚本默认设置 `NODE_ENV=production`。生产环境建议用 PM2 或 systemd 守护进程，并在 Caddy 或 Nginx 后提供 HTTPS；普通 HTTP 会导致浏览器麦克风权限和 WebRTC 受限。
+
+公网两端无法稳定 P2P 时，按 [Ubuntu 24.04 coturn 部署手册](./ubuntu-coturn-deployment.md) 配置自建 STUN 与 TURN 低清视频兜底。Release 的 `server/deploy/` 已包含幂等部署脚本和配置模板。
+
+## 日常更新
+
+更新前先确认 checkout 干净并备份持久目录。备份名称请替换为当前日期时间，且不要覆盖已有备份。
+
+```bash
+cd /opt/desktop-pet
+git status --short
+sudo cp -a /var/lib/desktop-pet /var/backups/desktop-pet-data-YYYYMMDD-HHMMSS
+git pull --ff-only
+npm ci --prefix server --omit=dev
+cd server
+pm2 startOrReload ecosystem.config.cjs --update-env
+pm2 save
+curl --fail http://127.0.0.1:3030/api/health
+```
+
+不要在部署 checkout 中运行 `git clean -fdx`，也不要通过删除目录再 clone 的方式更新。`git pull --ff-only` 不会删除 `.env` 或未跟踪文件；不过权威数据仍必须放在 `/var/lib/desktop-pet`，不能依赖这一行为保护包内数据。
+
+## 从旧版 `server/data` 迁移
+
+升级前检查旧目录。只要存在 `server/data/registry.json`，就必须迁移整个 `server/data`，包括 `audio/` 和 `notes/`。新 server 检测到 legacy registry、但 `/var/lib/desktop-pet/registry.json` 不存在时会拒绝启动并显示两个目录，防止误建空 registry。
+
+先确认 PM2 的实际工作目录和运行用户：
+
+```bash
+pm2 describe desktop-pet-server
+ps -o user= -p "$(pm2 pid desktop-pet-server)"
+```
+
+然后停服、备份并迁移。以下命令假设实际 checkout 是 `/opt/desktop-pet`，且目标 registry 尚不存在：
+
+```bash
+DESKTOP_PET_APP_USER="$(ps -o user= -p "$(pm2 pid desktop-pet-server)" | xargs)"
+DESKTOP_PET_APP_GROUP="$(id -gn "$DESKTOP_PET_APP_USER")"
+cd /opt/desktop-pet
+pm2 stop desktop-pet-server
+sudo test -f server/data/registry.json
+sudo test ! -e /var/lib/desktop-pet/registry.json
+sudo cp -a server/data /var/backups/desktop-pet-data-legacy-YYYYMMDD-HHMMSS
+sudo install -d -m 0750 -o "$DESKTOP_PET_APP_USER" -g "$DESKTOP_PET_APP_GROUP" /var/lib/desktop-pet
+sudo cp -a server/data/. /var/lib/desktop-pet/
+sudo chown -R "$DESKTOP_PET_APP_USER:$DESKTOP_PET_APP_GROUP" /var/lib/desktop-pet
+sudo -u "$DESKTOP_PET_APP_USER" test -r /var/lib/desktop-pet/registry.json
+sudo -u "$DESKTOP_PET_APP_USER" test -w /var/lib/desktop-pet
+cd server
+pm2 startOrReload ecosystem.config.cjs --update-env
+curl --fail http://127.0.0.1:3030/api/health
+```
+
+启动后从双方控制面板核对成员名称、待处理便签、历史/收藏和个人音频。确认稳定前保留 legacy 目录与备份；不要让旧目录和 `/var/lib/desktop-pet` 同时接受写入。回滚应用代码时保留 `/var/lib/desktop-pet`，不得删除或降级 registry。
 
 ## 房间配置
 
 `ROOM_SECRETS` 使用英文逗号配置多个允许的密钥；未设置时使用 `ROOM_SECRET`。房间密钥只用于入房，不会以明文广播。每个密钥对应固定的 A/B 两名成员，但每名成员可连接多台设备。新版协议与旧客户端不兼容，部署时必须同时升级所有客户端。
 
-生产环境应将 `PET_DATA_DIR` 指向可写且持久化的目录。成员名称、设备历史和“我的音频”都会保存在这里；设备离线超过 30 天后自动清理，音频不会随设备清理而删除。
+生产持久目录保存成员名称、设备历史、“我的音频”、便签、回复、收藏和图片附件；设备离线超过 30 天后自动清理，音频不会随设备清理而删除。
+
+registry 以房间密钥的 SHA-256 hash 作为房间 key。更新后若 `/var/lib/desktop-pet/registry.json` 存在且非空，但界面同时恢复成“用户 A/用户 B”且便签为空，先对比更新前后的 `.env` 和备份，确认 `ROOM_SECRET(S)` 没有被替换、删除或切换。不要通过反复改名或新建便签“修复”，否则会在错误的房间 key 下产生第二组数据。
 
 ## ElevenLabs 托管模式
 

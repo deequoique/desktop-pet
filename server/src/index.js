@@ -7,9 +7,12 @@ import { Readable } from 'stream';
 import fs from 'node:fs';
 import { Server as SocketIOServer } from 'socket.io';
 import WebSocket from 'ws';
+import { prepareDataDirectory } from './data-directory.js';
 import { PersistentStore } from './persistent-store.js';
+import { createServerDiagnostics, normalizeHttpRoute } from './diagnostics.js';
 
 const PORT = process.env.PORT || 3030;
+const diagnostics = createServerDiagnostics();
 
 function csvEnv(name) {
   return String(process.env[name] || '').split(',').map((value) => value.trim()).filter(Boolean);
@@ -112,15 +115,58 @@ const NOTE_LIMITS = {
   roomImageMaxBytes: boundedIntEnv('NOTE_ROOM_IMAGE_MAX_BYTES', 2 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024),
   historyTtlMs: boundedIntEnv('NOTE_HISTORY_TTL_DAYS', 30, 3650) * 24 * 60 * 60 * 1000,
 };
+const STORE_DATA_DIR = prepareDataDirectory();
 const store = new PersistentStore(
-  process.env.PET_DATA_DIR || new URL('../data', import.meta.url).pathname,
+  STORE_DATA_DIR,
   () => Date.now(),
   NOTE_LIMITS,
 );
 
 const app = express();
+const httpLogWindows = new Map();
+function shouldLogHttpRequest(method, route) {
+  const key = `${method}:${route}`;
+  const now = Date.now();
+  let window = httpLogWindows.get(key);
+  if (!window || now - window.startedAt >= 60_000) {
+    if (window?.suppressed) {
+      diagnostics.warn('app', 'http.requests-suppressed', {
+        recoverability: 'automatic',
+        context: { method, route, count: window.suppressed, windowMs: 60_000 },
+      });
+    }
+    window = { startedAt: now, emitted: 0, suppressed: 0 };
+    httpLogWindows.set(key, window);
+  }
+  if (window.emitted < 60) {
+    window.emitted += 1;
+    return true;
+  }
+  window.suppressed += 1;
+  return false;
+}
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use((req, res, next) => {
+  const requestId = String(req.get('x-request-id') || randomUUID()).slice(0, 128);
+  const startedAt = Date.now();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  res.on('finish', () => {
+    const route = normalizeHttpRoute(req);
+    if (!shouldLogHttpRequest(req.method, route)) return;
+    diagnostics.info('app', 'http.request-completed', {
+      correlation: { requestId },
+      context: {
+        method: req.method,
+        route,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      },
+    });
+  });
+  next();
+});
 
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -144,6 +190,53 @@ const io = new SocketIOServer(httpServer, {
 // roomHash -> { participants: Map<participantId, participant>, callId }
 // 密钥只用于入房并立即哈希，内存与日志均不保留明文。
 const rooms = new Map();
+const rtcSignalSummaries = new Map();
+
+function candidateType(candidate) {
+  const match = String(candidate?.candidate || '').match(/\btyp\s+(host|srflx|prflx|relay)\b/i);
+  return match?.[1]?.toLowerCase() || 'unknown';
+}
+
+function noteRtcSignal(callId, mediaKind, role, payload, forwarded) {
+  if (!callId) return;
+  let summary = rtcSignalSummaries.get(callId);
+  if (!summary) {
+    summary = {
+      startedAt: Date.now(),
+      main: { offers: 0, answers: 0, candidates: {}, forwarded: 0, rejected: 0 },
+      camera: { offers: 0, answers: 0, candidates: {}, forwarded: 0, rejected: 0 },
+      byRole: {},
+    };
+    rtcSignalSummaries.set(callId, summary);
+  }
+  const bucket = summary[mediaKind];
+  const descriptionType = payload?.description?.type;
+  if (descriptionType === 'offer') bucket.offers += 1;
+  else if (descriptionType === 'answer') bucket.answers += 1;
+  if (payload?.candidate) {
+    const type = candidateType(payload.candidate);
+    bucket.candidates[type] = (bucket.candidates[type] || 0) + 1;
+  }
+  bucket[forwarded ? 'forwarded' : 'rejected'] += 1;
+  const roleKey = `${role || 'unknown'}:${mediaKind}`;
+  summary.byRole[roleKey] = (summary.byRole[roleKey] || 0) + 1;
+}
+
+function flushRtcSignalSummary(callId, reason) {
+  const summary = rtcSignalSummaries.get(callId);
+  if (!summary) return;
+  rtcSignalSummaries.delete(callId);
+  diagnostics.info('webrtc', 'webrtc.signaling-summary', {
+    correlation: { callId },
+    context: {
+      reason,
+      durationMs: Date.now() - summary.startedAt,
+      main: summary.main,
+      camera: summary.camera,
+      byRole: summary.byRole,
+    },
+  });
+}
 
 function hashSecret(secret) {
   return createHash('sha256').update(secret).digest('hex');
@@ -299,6 +392,11 @@ function endRoomCall(room, reason = 'ended') {
   }
   room.callId = null;
   room.call = null;
+  flushRtcSignalSummary(callId, reason);
+  diagnostics.info('call', 'call.ended', {
+    correlation: { callId },
+    context: { reason },
+  });
 }
 
 // === TTS jobs ===
@@ -338,6 +436,11 @@ function dispatchNextTts(queue) {
   const room = rooms.get(job.roomHash);
   const target = room?.participants.get(job.targetId);
   if (!target?.pet) {
+    diagnostics.warn('tts', 'tts.dispatch-failed', {
+      errorCode: 'peer_pet_offline',
+      recoverability: 'retryable',
+      correlation: { jobId: job.id },
+    });
     emitTtsStatus(job, 'error', 'peer_pet_offline');
     ttsJobs.delete(job.id);
     return dispatchNextTts(queue);
@@ -351,6 +454,10 @@ function dispatchNextTts(queue) {
     text: job.text,
     streamUrl: `/api/tts/jobs/${job.id}`,
   });
+  diagnostics.info('tts', 'tts.dispatched', {
+    correlation: { jobId: job.id },
+    context: { provider: job.provider, credentialMode: job.credentialMode },
+  });
   emitTtsStatus(job, 'dispatched');
 }
 
@@ -359,6 +466,13 @@ function finishTtsJob(job, state, error) {
   job.finished = true;
   if (job.expiryTimer) clearTimeout(job.expiryTimer);
   emitTtsStatus(job, state, error);
+  const fields = {
+    correlation: { jobId: job.id },
+    context: { state, provider: job.provider, errorCode: error },
+    ...(error ? { errorCode: error, recoverability: 'retryable' } : {}),
+  };
+  if (error) diagnostics.warn('tts', 'tts.finished-with-error', fields);
+  else diagnostics.info('tts', 'tts.finished', fields);
   ttsJobs.delete(job.id);
   const queue = ttsQueues.get(ttsQueueKey(job.roomHash, job.targetId));
   if (!queue) return;
@@ -612,6 +726,10 @@ app.get('/api/tts/jobs/:jobId', async (req, res) => {
 });
 
 io.on('connection', (socket) => {
+  diagnostics.info('socket', 'socket.connected', {
+    correlation: { socketId: socket.id },
+    context: { transport: socket.conn.transport.name },
+  });
   socket.on('pairing:discover', (data, ack) => {
     if (data?.protocolVersion !== 2) {
       if (typeof ack === 'function') ack({ ok: false, code: 'upgrade_required' });
@@ -631,17 +749,32 @@ io.on('connection', (socket) => {
     const roomHash = hashSecret(secret);
     if (!ROOM_SECRET_HASHES.has(roomHash)) {
       if (typeof ack === 'function') ack({ ok: false, code: 'bad_secret', error: 'bad secret' });
+      diagnostics.warn('socket', 'socket.join-rejected', {
+        errorCode: 'bad_secret',
+        recoverability: 'user_action',
+        correlation: { socketId: socket.id },
+      });
       console.warn('[socket] reject bad secret from', socket.id);
       return;
     }
     if (role !== 'controller' && role !== 'pet') {
       if (typeof ack === 'function') ack({ ok: false, code: 'bad_role', error: 'bad role' });
+      diagnostics.warn('socket', 'socket.join-rejected', {
+        errorCode: 'bad_role',
+        recoverability: 'user_action',
+        correlation: { socketId: socket.id },
+      });
       return;
     }
 
     if (data?.protocolVersion !== 2 || !['a', 'b'].includes(data?.memberId)
       || !String(data?.deviceId || '').trim() || !String(data?.deviceName || '').trim()) {
       if (typeof ack === 'function') ack({ ok: false, code: 'upgrade_required', error: 'protocol v2 required' });
+      diagnostics.warn('socket', 'socket.join-rejected', {
+        errorCode: 'upgrade_required',
+        recoverability: 'user_action',
+        correlation: { socketId: socket.id },
+      });
       return;
     }
     let room = rooms.get(roomHash);
@@ -654,6 +787,11 @@ io.on('connection', (socket) => {
     let participant = room.participants.get(participantId);
     if (participant && participant.memberId !== memberId) {
       if (typeof ack === 'function') ack({ ok: false, code: 'device_identity_conflict' });
+      diagnostics.warn('socket', 'socket.join-rejected', {
+        errorCode: 'device_identity_conflict',
+        recoverability: 'user_action',
+        correlation: { socketId: socket.id, deviceId: participantId },
+      });
       return;
     }
     if (!participant) {
@@ -683,7 +821,10 @@ io.on('connection', (socket) => {
     socket.join(roomChannel(roomHash));
     if (typeof ack === 'function') ack({ ok: true, peers: peerSnapshot(room, participantId) });
     emitPeerSnapshots(room);
-    console.log(`[socket] ${role} joined room=${roomHash.slice(0, 8)} member=${memberId} device=${participantId}`);
+    diagnostics.info('socket', 'socket.joined', {
+      correlation: { socketId: socket.id, deviceId: participantId },
+      context: { role, memberId, room: roomHash.slice(0, 8) },
+    });
   });
 
   socket.on('room:rename-member', (payload, ack) => {
@@ -1081,6 +1222,10 @@ io.on('connection', (socket) => {
       state: 'queued', consumed: false, finished: false, expiresAt: 0, expiryTimer: null,
     };
     ttsJobs.set(job.id, job);
+    diagnostics.info('tts', 'tts.queued', {
+      correlation: { jobId: job.id },
+      context: { provider: job.provider, credentialMode, queuedAhead: queue.pending.length },
+    });
     queue.pending.push(job.id);
     dispatchNextTts(queue);
     const position = queue.active === job.id ? 0 : queue.pending.indexOf(job.id) + 1;
@@ -1100,24 +1245,38 @@ io.on('connection', (socket) => {
   socket.on('webrtc:signal', (payload) => {
     const room = roomForSocket(socket);
     if (!room) return;
-    if (payload?.callId && payload.callId !== room.callId) return;
+    if (payload?.callId && payload.callId !== room.callId) {
+      noteRtcSignal(payload.callId, 'main', socket.data?.role, payload, false);
+      return;
+    }
     const role = socket.data?.role;
     const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
     const pairedDeviceId = room.call && (socket.data.participantId === room.call.initiatorDeviceId
       ? room.call.targetDeviceId : room.call.initiatorDeviceId);
     const targetId = targetRole && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId || pairedDeviceId)?.[targetRole];
-    if (!targetId) return;
+    if (!targetId) {
+      noteRtcSignal(room.callId, 'main', role, payload, false);
+      return;
+    }
+    noteRtcSignal(room.callId, 'main', role, payload, true);
     io.to(targetId).emit('webrtc:signal', payload);
   });
 
   socket.on('webrtc:camera-signal', (payload) => {
     const room = roomForSocket(socket);
     const call = room?.call;
-    if (!room || socket.data?.role !== 'controller' || !call || payload?.callId !== room.callId) return;
-    if (![call.initiatorDeviceId, call.targetDeviceId].includes(socket.data.participantId)) return;
+    if (!room || socket.data?.role !== 'controller' || !call || payload?.callId !== room.callId) {
+      noteRtcSignal(payload?.callId, 'camera', socket.data?.role, payload, false);
+      return;
+    }
+    if (![call.initiatorDeviceId, call.targetDeviceId].includes(socket.data.participantId)) {
+      noteRtcSignal(room.callId, 'camera', socket.data?.role, payload, false);
+      return;
+    }
     const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
       ? call.targetDeviceId : call.initiatorDeviceId;
     const targetId = room.participants.get(targetDeviceId)?.controller;
+    noteRtcSignal(room.callId, 'camera', socket.data?.role, payload, !!targetId);
     if (targetId) io.to(targetId).emit('webrtc:camera-signal', payload);
   });
 
@@ -1130,7 +1289,7 @@ io.on('connection', (socket) => {
       return;
     }
     const media = String(payload?.media || '');
-    if (!['screen', 'camera'].includes(media) || typeof payload?.enabled !== 'boolean') {
+    if (media !== 'screen' || typeof payload?.enabled !== 'boolean') {
       reject('invalid_media');
       return;
     }
@@ -1138,17 +1297,9 @@ io.on('connection', (socket) => {
       reject('not_allowed');
       return;
     }
-    let targetId = null;
-    if (media === 'screen') {
-      const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
-        ? call.targetDeviceId : call.initiatorDeviceId;
-      targetId = room.participants.get(targetDeviceId)?.pet;
-    } else if (socket.data.participantId === call.initiatorDeviceId) {
-      targetId = room.participants.get(call.targetDeviceId)?.controller;
-    } else {
-      reject('not_allowed');
-      return;
-    }
+    const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
+      ? call.targetDeviceId : call.initiatorDeviceId;
+    const targetId = room.participants.get(targetDeviceId)?.pet;
     if (!targetId) {
       reject('peer_unavailable');
       return;
@@ -1177,8 +1328,11 @@ io.on('connection', (socket) => {
     if (!['available', 'paused', 'unavailable'].includes(state)) return;
     let targetId = null;
     if (media === 'camera') {
-      if (socket.data?.role !== 'controller' || socket.data.participantId !== room.call.targetDeviceId) return;
-      targetId = room.participants.get(room.call.initiatorDeviceId)?.controller;
+      if (socket.data?.role !== 'controller') return;
+      if (![room.call.initiatorDeviceId, room.call.targetDeviceId].includes(socket.data.participantId)) return;
+      const peerDeviceId = socket.data.participantId === room.call.initiatorDeviceId
+        ? room.call.targetDeviceId : room.call.initiatorDeviceId;
+      targetId = room.participants.get(peerDeviceId)?.controller;
     } else {
       if (socket.data?.role !== 'pet') return;
       if (![room.call.initiatorDeviceId, room.call.targetDeviceId].includes(socket.data.participantId)) return;
@@ -1188,12 +1342,20 @@ io.on('connection', (socket) => {
     }
     if (!targetId) return;
     const allowedReasons = new Set([
-      'relay_audio_only', 'controller_disabled', 'capture_failed',
-      'permission_denied', 'device_lost', 'track_ended',
+      'controller_disabled', 'capture_failed', 'permission_denied',
+      'device_lost', 'track_ended', 'profile_failed', 'relay_disabled',
     ]);
     const reason = allowedReasons.has(payload?.reason) ? payload.reason : undefined;
+    const quality = ['normal', 'relay-low'].includes(payload?.quality) ? payload.quality : undefined;
+    const qualityLevel = Number.isInteger(payload?.qualityLevel)
+      && payload.qualityLevel >= 1 && payload.qualityLevel <= 5
+      ? payload.qualityLevel : undefined;
     io.to(targetId).emit('webrtc:media-status', {
-      callId: room.callId, media, state, ...(reason ? { reason } : {}),
+      callId: room.callId, media, state,
+      ...(media === 'camera' ? { sourceDeviceId: socket.data.participantId } : {}),
+      ...(reason ? { reason } : {}),
+      ...(quality ? { quality } : {}),
+      ...(qualityLevel ? { qualityLevel } : {}),
     });
   });
 
@@ -1215,12 +1377,17 @@ io.on('connection', (socket) => {
     }
     if (!room.callId) {
       room.callId = randomUUID();
-      room.call = { initiatorDeviceId: self.id, targetDeviceId: peer.id };
+      room.call = { initiatorDeviceId: self.id, targetDeviceId: peer.id, startedAt: Date.now() };
+      diagnostics.info('call', 'call.started', {
+        correlation: { callId: room.callId },
+        context: { initiatorDeviceId: self.id, targetDeviceId: peer.id },
+      });
     }
     for (const participant of [self, peer]) if (participant.controller) {
       io.to(participant.controller).emit('call:start', {
         callId: room.callId,
         peerDeviceId: participant.id === self.id ? peer.id : self.id,
+        cameraOffererDeviceId: room.call.initiatorDeviceId,
         cameraSenderDeviceId: room.call.targetDeviceId,
       });
     }
@@ -1267,7 +1434,10 @@ io.on('connection', (socket) => {
       }, ROOM_GRACE_MS);
     }
     emitPeerSnapshots(room);
-    console.log(`[socket] ${role} left participant=${participant.id}`);
+    diagnostics.info('socket', 'socket.disconnected', {
+      correlation: { socketId: socket.id, deviceId: participant?.id },
+      context: { role, reason: socket.conn?.closeReason },
+    });
   });
 });
 
@@ -1282,13 +1452,71 @@ setInterval(() => {
       }
     }
   } catch (error) {
+    diagnostics.error('storage', 'storage.prune-failed', {
+      errorCode: 'storage_prune_failed',
+      recoverability: 'user_action',
+      exception: error,
+    });
     console.warn('[note] prune failed:', error?.message || error);
   }
 }, 60 * 60 * 1000).unref();
 
+httpServer.on('error', (error) => {
+  diagnostics.fatal('app', 'http.server-error', {
+    errorCode: error?.code || 'http_server_error',
+    recoverability: 'fatal',
+    exception: error,
+  });
+});
+
+io.engine.on('connection_error', (error) => {
+  diagnostics.warn('socket', 'socket.transport-error', {
+    errorCode: error?.code || 'socket_transport_error',
+    recoverability: 'retryable',
+    context: {
+      message: error?.message,
+      transport: error?.context?.transport,
+    },
+  });
+});
+
+process.on('uncaughtExceptionMonitor', (error, origin) => {
+  diagnostics.fatal('app', 'process.uncaught-exception', {
+    errorCode: 'server_uncaught_exception',
+    recoverability: 'fatal',
+    context: { origin },
+    exception: error,
+  });
+});
+
+process.on('unhandledRejection', (error) => {
+  diagnostics.error('app', 'process.unhandled-rejection', {
+    errorCode: 'server_unhandled_rejection',
+    recoverability: 'user_action',
+    exception: error,
+  });
+});
+
 httpServer.listen(PORT, () => {
+  diagnostics.info('app', 'server.started', {
+    context: {
+      port: Number(PORT),
+      ttsProvider: TTS_PROVIDER,
+      ttsReady: managedTtsReady(),
+      socketReady: true,
+      configuredRooms: ROOM_SECRET_HASHES.size,
+      dataDir: STORE_DATA_DIR,
+      rtc: {
+        stunCount: RTC_STUN_URLS.length,
+        turnCount: RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET ? RTC_TURN_URLS.length : 0,
+        iceTransportPolicy: RTC_ICE_TRANSPORT_POLICY,
+        realm: RTC_TURN_REALM || undefined,
+      },
+    },
+  });
   console.log(`pet server listening on :${PORT}`);
   console.log(`  tts:    ${managedTtsReady() ? `${TTS_PROVIDER} managed (${managedTtsModel()}, voices=${ALLOWED_VOICES.length})` : `${TTS_PROVIDER} managed disabled`}${TTS_PROVIDER === 'elevenlabs' ? '; BYOK available' : ''}`);
   console.log(`  socket: ready @ /socket.io  (configured rooms=${ROOM_SECRET_HASHES.size})`);
+  console.log(`  data:   ${STORE_DATA_DIR}`);
   console.log(`  rtc:    stun=${RTC_STUN_URLS.length} turn=${RTC_TURN_URLS.length && RTC_TURN_SHARED_SECRET ? RTC_TURN_URLS.length : 0} policy=${RTC_ICE_TRANSPORT_POLICY}${RTC_TURN_REALM ? ` realm=${RTC_TURN_REALM}` : ''}`);
 });
