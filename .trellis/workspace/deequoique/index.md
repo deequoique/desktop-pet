@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 19
-- **Last Active**: 2026-08-01
+- **Total Sessions**: 20
+- **Last Active**: 2026-08-02
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~666 | Active |
+| `journal-1.md` | ~700 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 20 | 2026-08-02 | 发布 1.6.1 正式版 | `47b7be7` | `master` |
 | 19 | 2026-08-01 | 修复 Windows 桌宠点击尺寸漂移 | `4919c82` | `master` |
 | 18 | 2026-07-30 | TURN bandwidth and camera relay policy | `7ae3caf`, `511e0e4` | `codex/call-video-reliability` |
 | 17 | 2026-07-30 | 修复服务器更新后的持久数据丢失 | `e9d3ad7` | `codex/call-video-reliability` |

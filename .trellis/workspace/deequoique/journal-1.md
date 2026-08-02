@@ -664,3 +664,37 @@ Implemented bounded TURN screen adaptation through 720p45, disabled camera video
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: 发布 1.6.1 正式版
+
+**Date**: 2026-08-02
+**Task**: 发布 1.6.1 正式版
+**Package**: desktop-pet
+**Branch**: `master`
+
+### Summary
+
+合并 v1.6.1-beta.1 至 beta.4 与 Windows 125% DPI 桌宠尺寸漂移修复，版本升级为 1.6.1；通过 server/pet 测试、web/pet 构建和多平台发布流水线，推送 master 与 v1.6.1 标签，并按既有正式版风格发布包含 Windows、macOS 和 Linux server 资产的 GitHub Release。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `47b7be7` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
