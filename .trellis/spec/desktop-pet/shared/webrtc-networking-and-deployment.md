@@ -414,3 +414,74 @@ webPreferences: {
 }
 const compressed = deflateSync(Buffer.from(JSON.stringify(userSigDocument)));
 ```
+
+## 11. Scenario: TRTC cross-platform release assets
+
+### 1. Scope / Trigger
+
+- Trigger：修改 Electron 原生依赖、`pet/package-lock.json`、macOS target、Linux server bundle 或 tag 发布工作流时。
+- TRTC 版本不能只交付 Windows 安装器；同一预发布 tag 必须产出 Windows、macOS 和 Linux server 三类资产，否则视为不完整发布。
+
+### 2. Signatures
+
+```yaml
+# .github/workflows/pet-release.yml
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-pet-windows: windows-latest
+  build-pet-macos: macos-latest
+  build-server-linux: ubuntu-latest
+```
+
+客户端安装命令固定为 `npm ci --legacy-peer-deps`；Web 继续使用 `npm ci --prefix ../web`。Linux server 使用 `npm ci --omit=dev`，产物名为 `desktop-pet-server-${GITHUB_REF_NAME}-linux-x64.tar.gz`。
+
+### 3. Contracts
+
+- `trtc-electron-sdk` 的 peer dependency 安装策略必须在本地锁文件验证、Windows runner 和 macOS runner 中保持一致。普通 `npm ci` 会以 `EUSAGE` 拒绝当前锁文件，不能只在开发机使用 `--legacy-peer-deps`。
+- Windows job 先创建/更新 tag 对应的 GitHub Release；macOS job 在同一 Release 上传 DMG/ZIP；Ubuntu job最后上传 Linux server tarball。上游 job 失败会跳过所有 `needs` 下游，因此发布成功必须检查资产清单，不能只看 tag 或 Windows exe。
+- macOS 产物必须由 `macos-latest` 构建，Windows 不得伪造 DMG。未配置签名时设置 `CSC_IDENTITY_AUTO_DISCOVERY=false`，产物是未签名预发布测试包。
+- Linux server bundle 必须在 Ubuntu runner 上执行生产依赖安装后组装，包含 `src/`、`deploy/`、生产 `node_modules/`、`package.json`、`package-lock.json`、`.env.example`、`start-linux.sh` 和 `ecosystem.config.cjs`。
+- Linux bundle 不得包含 `.env`、`data/`、registry、音频、便签附件、Git metadata 或客户端 SecretKey。shell 脚本在归档前必须具有可执行位。
+- Release tag、`pet/package.json` version 和客户端资产版本必须一致。已经公开的 tag 不强制移动；修复发布流程时递增 prerelease 版本。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 结果 |
+| --- | --- |
+| `npm ci` 报 lock/peer dependency `EUSAGE` | 使用并保留 `npm ci --legacy-peer-deps`；不得跳过依赖校验 |
+| Windows job 失败 | macOS/Linux 因 `needs` 被跳过；Release 不得宣称跨平台完整 |
+| macOS 没有可用原生 TRTC binary | macOS job 失败并停止发布；不得上传无 SDK 的冒名产物 |
+| `PET_SERVER_URL` secret 缺失 | Windows/macOS 在构建前 fail closed |
+| Linux bundle 包含 `.env` 或 runtime data | 拒绝上传并重新组装 |
+| tag 与 package version 不一致 | 拒绝发布，先递增并同步版本 |
+
+### 5. Good/Base/Bad Cases
+
+- Good：tag 触发三个 runner，Release 同时存在 Windows installer/blockmap/update manifest、macOS DMG/ZIP 和 Linux server tarball，三端均来自同一提交。
+- Base：本地 Windows 先验证功能，但正式跨平台 Release 仍等待 Actions 三个 job 全部成功后才报告完成。
+- Bad：手动上传 Windows exe 后只看 Release 页面存在就宣称完成；普通 `npm ci` 在首个 job 失败，Mac/Linux 永远被跳过。
+
+### 6. Tests Required
+
+- 本地：`npm ci --legacy-peer-deps --dry-run --prefix pet`、server/pet tests、web/pet production build、workflow YAML parse。
+- Actions：三个 job conclusion 均为 `success`；检查每个 build step 和最终 Release asset name/size。
+- Linux tar：列出归档内容，断言必需文件齐全、`.env`/`data`/`.git` 不存在，并在 Ubuntu 上执行 `bash -n start-linux.sh deploy/*.sh`。
+- macOS：检查 DMG/ZIP、架构、Info.plist 权限说明和包内 TRTC native addon；未签名包在 Release notes 中明确标注。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```yaml
+- run: npm ci # 本地曾使用 legacy-peer-deps，CI 首步失败
+```
+
+#### Correct
+
+```yaml
+- name: Install pet dependencies
+  run: npm ci --legacy-peer-deps
+```

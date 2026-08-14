@@ -30,7 +30,7 @@ jobs:
       - name: Install pet dependencies
         env:
           npm_config_cache: ${{ runner.temp }}\npm-cache-pet
-        run: npm ci
+        run: npm ci --legacy-peer-deps
 
       - name: Install web dependencies
         env:
@@ -77,7 +77,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm ci
+          npm ci --legacy-peer-deps
           npm ci --prefix ../web
 
       - name: Validate release secrets
