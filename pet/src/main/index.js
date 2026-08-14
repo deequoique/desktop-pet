@@ -883,6 +883,8 @@ function createControlWindow() {
       preload: path.join(__dirname, 'control-preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // TRTC's native Electron addon must be loaded by preload; keep the page isolated and Node disabled.
+      sandbox: false,
     },
   });
   controlWin.webContents.setWindowOpenHandler(({ url, frameName }) => {

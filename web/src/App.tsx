@@ -9,11 +9,13 @@ import {
   endCall,
   requestCall,
   requestRtcConfig,
+  requestTrtcConfig,
   sendCommand,
   sendSignal,
   sendCameraSignal,
   sendMediaStatus,
   requestMediaControl,
+  sendTrtcMediaStatus,
   setListeners,
   setTtsCredentials,
   addPersonalAudio, deletePersonalAudio, listPersonalAudio, playPersonalAudio, renamePersonalAudio,
@@ -29,6 +31,7 @@ import {
   type TtsVoice,
   type WebRtcSignal,
   type MediaStatus,
+  type TrtcConfig,
   type PersonalAudio, type PairingMember, type DesktopNote, type NoteImageInput,
 } from './api';
 import {
@@ -50,14 +53,14 @@ type Status = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'rejected';
 type CallState = 'idle' | 'requesting-media' | 'calling' | 'in-call' | 'error';
 type ActiveView = 'control' | 'send' | 'notes' | 'call' | 'settings';
 type SendView = 'tts' | 'audio';
-type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown' | 'failed';
+type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay' | 'trtc' | 'unknown' | 'failed';
 type MemberId = 'a' | 'b';
 type SetupStage = 'server' | 'identity' | 'complete';
 
 type RtcRoute = {
   candidateType: CandidateType;
   relayed: boolean;
-  path: 'IPv4 P2P' | 'IPv6 P2P' | 'TURN 自适应视频' | '选路中' | '失败';
+  path: 'IPv4 P2P' | 'IPv6 P2P' | 'TURN 自适应视频' | 'TRTC 云端' | '选路中' | '失败';
   detail: string;
 };
 
@@ -83,6 +86,35 @@ type DiagnosticIncidentSummary = {
   level: 'fatal';
 };
 type DiagnosticStatus = { pendingIncidents: DiagnosticIncidentSummary[] };
+type TrtcEvent = {
+  event: 'error' | 'enter-room' | 'exit-room' | 'connection-lost' | 'reconnecting' | 'connection-recovered'
+    | 'substream-available' | 'first-video-frame' | 'first-local-video-frame' | 'system-audio-error' | 'statistics';
+  errorCode?: number;
+  errorMessage?: string;
+  elapsed?: number;
+  userId?: string;
+  available?: boolean;
+  width?: number;
+  height?: number;
+  rtt?: number;
+  upLoss?: number;
+  downLoss?: number;
+  appCpu?: number;
+  local?: { width?: number; height?: number; frameRate?: number; videoBitrate?: number } | null;
+  remote?: { width?: number; height?: number; frameRate?: number; videoBitrate?: number } | null;
+};
+type TrtcBridgeResult = { ok: boolean; error?: string; version?: string; sourceName?: string; profile?: string };
+type TrtcBridge = {
+  isAvailable: () => TrtcBridgeResult;
+  onEvent: (callback: (event: TrtcEvent) => void) => () => void;
+  enterRoom: (config: TrtcConfig) => TrtcBridgeResult;
+  startScreenShare: (profile: '720p30' | '1080p30') => TrtcBridgeResult;
+  setScreenEnabled: (enabled: boolean) => TrtcBridgeResult;
+  startRemoteView: (userId: string) => TrtcBridgeResult;
+  setMicrophoneEnabled: (enabled: boolean) => TrtcBridgeResult;
+  setRemoteAudioMuted: (userId: string, muted: boolean) => TrtcBridgeResult;
+  leaveRoom: () => TrtcBridgeResult;
+};
 
 declare global {
   interface Window {
@@ -104,6 +136,7 @@ declare global {
       openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
       onMediaFloatClosed: (cb: () => void) => () => void;
       onOpenNoteComposer: (cb: () => void) => () => void;
+      trtc?: TrtcBridge;
     };
   }
 }
@@ -435,6 +468,7 @@ export default function App() {
   const [diagnosticStatus, setDiagnosticStatus] = useState<DiagnosticStatus>({ pendingIncidents: [] });
   const [petScale, setPetScaleState] = useState(1);
   const [callState, setCallState] = useState<CallState>('idle');
+  const [mediaTransport, setMediaTransport] = useState<'webrtc' | 'trtc'>('webrtc');
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
   const [remoteSystemMuted, setRemoteSystemMuted] = useState(true);
   const [micEnabled, setMicEnabledState] = useState(false);
@@ -482,9 +516,9 @@ export default function App() {
   const localCameraStreamRef = useRef<MediaStream | null>(null);
   const remoteCameraStreamRef = useRef<MediaStream | null>(null);
   const cameraPendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const cameraDeferredSignalsRef = useRef<WebRtcSignal[]>([]);
-  const cameraPrewarmReadyRef = useRef(false);
-  const cameraPrewarmStartedCallIdRef = useRef('');
+  const cameraNegotiationStartedCallIdRef = useRef('');
+  const cameraTransportGenerationRef = useRef(0);
+  const remoteCameraDesiredRef = useRef(false);
   const cameraOffererDeviceIdRef = useRef('');
   const selfDeviceIdRef = useRef('');
   const memberIdRef = useRef<MemberId | ''>('');
@@ -503,6 +537,8 @@ export default function App() {
   const recoveryTimerRef = useRef<number | null>(null);
   const iceRestartedRef = useRef(false);
   const rtcConfigurationRef = useRef<RTCConfiguration>();
+  const trtcConfigRef = useRef<TrtcConfig | null>(null);
+  const trtcActiveRef = useRef(false);
 
   const showToast = useCallback((msg: string, err = false) => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
@@ -549,7 +585,46 @@ export default function App() {
     if (localCameraVideoRef.current) localCameraVideoRef.current.srcObject = null;
   }, []);
 
+  const teardownCameraTransport = useCallback((reason: string) => {
+    cameraTransportGenerationRef.current += 1;
+    cameraDiagnosticsRef.current?.close(reason);
+    cameraDiagnosticsRef.current = null;
+    try { cameraPcRef.current?.close(); } catch {}
+    cameraPcRef.current = null;
+    cameraPcInitRef.current = null;
+    cameraSenderRef.current = null;
+    cameraPendingCandidatesRef.current = [];
+    cameraNegotiationStartedCallIdRef.current = '';
+    cameraRouteProfileRef.current = 'unknown';
+    setCameraRouteState('unknown');
+    cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
+    cameraProfileGenerationRef.current += 1;
+    cameraProfileApplyChainRef.current = Promise.resolve();
+    for (const track of remoteCameraStreamRef.current?.getTracks() ?? []) track.stop();
+    remoteCameraStreamRef.current = null;
+    setRemoteCameraStatus('unavailable');
+    setRemoteCameraQuality(undefined);
+    setRemoteCameraQualityLevel(undefined);
+    if (remoteCameraVideoRef.current) remoteCameraVideoRef.current.srcObject = null;
+  }, []);
+
   const setMicEnabled = useCallback((enabled: boolean) => {
+    if (trtcActiveRef.current) {
+      const result = window.desktopPetControl?.trtc?.setMicrophoneEnabled(enabled);
+      if (result && !result.ok) {
+        recordControlDiagnostic({
+          event: 'media.trtc-microphone-control-failed',
+          domain: 'media',
+          level: 'warn',
+          errorCode: 'media_trtc_microphone_control_failed',
+          recoverability: 'retryable',
+          correlation: { callId: currentCallIdRef.current || undefined },
+          context: { message: result.error },
+        });
+      }
+      setMicEnabledState(enabled && result?.ok !== false);
+      return;
+    }
     for (const track of localAudioRef.current?.getAudioTracks() ?? []) {
       track.enabled = enabled;
     }
@@ -558,6 +633,10 @@ export default function App() {
 
   const teardownCall = useCallback((opts?: { sendRemoteHangup?: boolean; nextState?: CallState }) => {
     if (opts?.sendRemoteHangup) endCall(currentCallIdRef.current || undefined);
+    if (trtcActiveRef.current) window.desktopPetControl?.trtc?.leaveRoom();
+    trtcActiveRef.current = false;
+    trtcConfigRef.current = null;
+    setMediaTransport('webrtc');
     rtcDiagnosticsRef.current?.close('call-teardown');
     rtcDiagnosticsRef.current = null;
     try { rtcPcRef.current?.close(); } catch {}
@@ -565,22 +644,9 @@ export default function App() {
     recoveryTimerRef.current = null;
     iceRestartedRef.current = false;
     rtcPcRef.current = null;
-    cameraDiagnosticsRef.current?.close('call-teardown');
-    cameraDiagnosticsRef.current = null;
-    try { cameraPcRef.current?.close(); } catch {}
-    cameraPcRef.current = null;
-    cameraPcInitRef.current = null;
-    cameraSenderRef.current = null;
-    cameraPendingCandidatesRef.current = [];
-    cameraDeferredSignalsRef.current = [];
-    cameraPrewarmReadyRef.current = false;
-    cameraPrewarmStartedCallIdRef.current = '';
-    cameraRouteProfileRef.current = 'unknown';
-    setCameraRouteState('unknown');
-    cameraQualityLevelRef.current = cameraQualityControllerRef.current.reset(DEFAULT_QUALITY_LEVEL);
-    cameraProfileGenerationRef.current += 1;
-    cameraProfileApplyChainRef.current = Promise.resolve();
+    teardownCameraTransport('call-teardown');
     cameraOffererDeviceIdRef.current = '';
+    remoteCameraDesiredRef.current = false;
     stopLocalCameraCapture();
     remoteCameraStreamRef.current = null;
     cameraDesiredRef.current = false;
@@ -620,7 +686,152 @@ export default function App() {
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     if (remoteMicAudioRef.current) remoteMicAudioRef.current.srcObject = null;
     if (remoteSystemAudioRef.current) remoteSystemAudioRef.current.srcObject = null;
-  }, [setMicEnabled, stopLocalAudio, stopLocalCameraCapture]);
+  }, [setMicEnabled, stopLocalAudio, stopLocalCameraCapture, teardownCameraTransport]);
+
+  useEffect(() => {
+    const bridge = window.desktopPetControl?.trtc;
+    if (!bridge) return;
+    return bridge.onEvent((event) => {
+      if (!trtcActiveRef.current) return;
+      const config = trtcConfigRef.current;
+      const callId = currentCallIdRef.current;
+      if (!config || !callId) return;
+      if (event.event === 'enter-room') {
+        if ((event.elapsed ?? -1) < 0) {
+          recordControlDiagnostic({
+            event: 'call.trtc-enter-room-failed',
+            domain: 'call',
+            level: 'error',
+            errorCode: 'call_trtc_enter_room_failed',
+            recoverability: 'retryable',
+            correlation: { callId },
+            context: { errorCode: event.elapsed },
+          });
+          showToast(`TRTC 进房失败：${event.elapsed}`, true);
+          setCallState('error');
+          return;
+        }
+        setCallState('in-call');
+        setRtcRoute({ candidateType: 'trtc', relayed: true, path: 'TRTC 云端', detail: '腾讯云实时音视频' });
+        if (config.publishScreen) {
+          const result = bridge.startScreenShare(config.videoProfile || '720p30');
+          if (!result.ok) {
+            sendTrtcMediaStatus({ callId, media: 'screen', state: 'unavailable', reason: 'capture_failed' });
+            showToast(`TRTC 屏幕共享启动失败：${result.error || 'unknown'}`, true);
+          }
+        } else if (config.remoteUserId) {
+          bridge.setRemoteAudioMuted(config.remoteUserId, false);
+          setRemoteMicMuted(false);
+          setRemoteSystemMuted(false);
+        }
+        recordControlDiagnostic({
+          event: 'call.trtc-entered',
+          domain: 'call',
+          correlation: { callId },
+          context: { publishScreen: !!config.publishScreen, videoProfile: config.videoProfile },
+        });
+        return;
+      }
+      if (event.event === 'substream-available' && event.userId === config.remoteUserId) {
+        if (!event.available) {
+          setScreenStatus('unavailable');
+          setRemoteReady(false);
+          return;
+        }
+        const attach = (attempt = 0) => {
+          if (!trtcActiveRef.current || currentCallIdRef.current !== callId || !config.remoteUserId) return;
+          const result = bridge.startRemoteView(config.remoteUserId);
+          if (!result.ok && result.error === 'remote_view_unavailable' && attempt < 10) {
+            window.setTimeout(() => attach(attempt + 1), 50);
+          } else if (!result.ok) {
+            showToast(`TRTC 远端画面挂载失败：${result.error || 'unknown'}`, true);
+          }
+        };
+        attach();
+        return;
+      }
+      if (event.event === 'first-video-frame' && event.userId === config.remoteUserId) {
+        setScreenStatus('available');
+        setRemoteReady(true);
+        setRemoteTrackSummary(`TRTC 辅流 ${event.width || 0}×${event.height || 0} + 系统声音`);
+        setScreenQuality('normal');
+        setScreenQualityLevel(config.videoProfile === '1080p30' ? 5 : 3);
+        return;
+      }
+      if (event.event === 'first-local-video-frame' && config.publishScreen) {
+        setScreenStatus('available');
+        setScreenQuality('normal');
+        setScreenQualityLevel(config.videoProfile === '1080p30' ? 5 : 3);
+        sendTrtcMediaStatus({
+          callId,
+          media: 'screen',
+          state: 'available',
+          quality: 'normal',
+          qualityLevel: config.videoProfile === '1080p30' ? 5 : 3,
+        });
+        return;
+      }
+      if (event.event === 'statistics') {
+        const remote = event.remote;
+        const local = event.local;
+        setRtcNetworkSample({
+          sampledAt: new Date().toISOString(),
+          connected: true,
+          effectiveRelayed: true,
+          roundTripTimeMs: event.rtt,
+          lossRatio: event.downLoss != null ? event.downLoss / 100 : undefined,
+          ...(remote ? {
+            inboundVideo: {
+              bitrateKbps: remote.videoBitrate,
+              framesPerSecond: remote.frameRate,
+              frameWidth: remote.width,
+              frameHeight: remote.height,
+            },
+          } : {}),
+          ...(local ? {
+            outboundVideo: {
+              bitrateKbps: local.videoBitrate,
+              framesPerSecond: local.frameRate,
+              frameWidth: local.width,
+              frameHeight: local.height,
+            },
+          } : {}),
+        });
+        return;
+      }
+      if (event.event === 'connection-lost') {
+        setRtcRoute({ candidateType: 'failed', relayed: true, path: '失败', detail: 'TRTC 连接中断，等待自动恢复' });
+        setCallState('calling');
+        return;
+      }
+      if (event.event === 'reconnecting') {
+        setCallState('calling');
+        return;
+      }
+      if (event.event === 'connection-recovered') {
+        setRtcRoute({ candidateType: 'trtc', relayed: true, path: 'TRTC 云端', detail: 'TRTC 连接已恢复' });
+        setCallState('in-call');
+        return;
+      }
+      if (event.event === 'system-audio-error') {
+        sendTrtcMediaStatus({ callId, media: 'screen', state: 'unavailable', reason: 'capture_failed' });
+        showToast(`TRTC 系统声音采集失败：${event.errorCode}`, true);
+        return;
+      }
+      if (event.event === 'error') {
+        recordControlDiagnostic({
+          event: 'call.trtc-error',
+          domain: 'call',
+          level: 'error',
+          errorCode: 'call_trtc_error',
+          recoverability: 'retryable',
+          correlation: { callId },
+          context: { trtcErrorCode: event.errorCode, message: event.errorMessage },
+        });
+        showToast(`TRTC 错误 ${event.errorCode ?? ''}：${event.errorMessage || 'unknown'}`, true);
+      }
+    });
+  }, [showToast]);
 
   const sendRtcSignal = useCallback((signal: WebRtcSignal) => {
     return sendSignal({ ...signal, callId: currentCallIdRef.current || undefined }, callTargetIdRef.current || undefined);
@@ -926,6 +1137,8 @@ export default function App() {
     if (generation !== cameraProfileGenerationRef.current || currentCallIdRef.current !== callId) return;
     stopLocalCameraCapture();
     reportCameraStatus('unavailable', 'relay_disabled');
+    sendCameraSignal({ callId, cameraDesired: false });
+    if (!remoteCameraDesiredRef.current) teardownCameraTransport('camera-relay-disabled');
     if (newlyBlocked) {
       recordControlDiagnostic({
         event: 'webrtc.camera-relay-disabled',
@@ -934,7 +1147,7 @@ export default function App() {
         context: { mediaKind: 'camera', effectiveRelayed: true },
       });
     }
-  }, [reportCameraStatus, stopLocalCameraCapture]);
+  }, [reportCameraStatus, stopLocalCameraCapture, teardownCameraTransport]);
 
   const syncCameraSenderTrack = useCallback(async () => {
     const generation = ++cameraProfileGenerationRef.current;
@@ -993,102 +1206,16 @@ export default function App() {
     await operation;
   }, [disableCameraForRelay, reportCameraStatus]);
 
-  const setLocalCameraEnabled = useCallback(async (enabled: boolean) => {
-    const callId = currentCallIdRef.current;
-    if (!callId) return;
-    cameraProfileGenerationRef.current += 1;
-    cameraDesiredRef.current = enabled;
-    cameraCapturePendingRef.current = enabled;
-    setCameraDesired(enabled);
-    if (!enabled) {
-      try { await cameraSenderRef.current?.replaceTrack(null); } catch {}
-      stopLocalCameraCapture();
-      reportCameraStatus('unavailable', 'controller_disabled');
-      return;
-    }
-    if (cameraRouteProfileRef.current !== 'normal') {
-      cameraDesiredRef.current = false;
-      setCameraDesired(false);
-      cameraCapturePendingRef.current = false;
-      if (cameraRouteProfileRef.current === 'relay-low') {
-        reportCameraStatus('unavailable', 'relay_disabled');
-        showToast('摄像头通道使用 TURN，为保证屏幕和声音已关闭', true);
-      } else {
-        reportCameraStatus('paused');
-        showToast('正在检测摄像头网络路径，请稍后再试', true);
-      }
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      cameraDesiredRef.current = false;
-      setCameraDesired(false);
-      reportCameraStatus('unavailable', 'capture_failed');
-      showToast('当前环境不支持摄像头', true);
-      cameraCapturePendingRef.current = false;
-      return;
-    }
-    try {
-      for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          ...(selectedCameraId ? { deviceId: { exact: selectedCameraId } } : {}),
-          width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 24 },
-        },
-        audio: false,
-      });
-      if (currentCallIdRef.current !== callId || !cameraDesiredRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      localCameraStreamRef.current = stream;
-      const track = stream.getVideoTracks()[0];
-      track.addEventListener('ended', () => {
-        if (localCameraStreamRef.current !== stream) return;
-        localCameraStreamRef.current = null;
-        reportCameraStatus('unavailable', 'device_lost');
-        void refreshCameraDevices();
-        showToast('摄像头已断开，正在尝试默认设备', true);
-      }, { once: true });
-      if (localCameraVideoRef.current) {
-        localCameraVideoRef.current.srcObject = stream;
-        void localCameraVideoRef.current.play().catch(() => {});
-      }
-      await refreshCameraDevices();
-      if (currentCallIdRef.current !== callId || localCameraStreamRef.current !== stream) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      await syncCameraSenderTrack();
-      cameraCapturePendingRef.current = false;
-    } catch (error: any) {
-      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
-      const errorCode = denied ? 'media_camera_permission_denied' : 'media_camera_capture_failed';
-      recordControlDiagnostic({
-        event: 'media.camera-capture-failed',
-        domain: 'media',
-        level: 'warn',
-        errorCode,
-        recoverability: 'user_action',
-        correlation: { callId: currentCallIdRef.current || undefined },
-        exception: normalizeDiagnosticError(error),
-      });
-      cameraDesiredRef.current = false;
-      setCameraDesired(false);
-      reportCameraStatus('unavailable', denied ? 'permission_denied' : 'capture_failed');
-      showToast(
-        denied ? `没有获得摄像头权限（${errorCode}）` : `摄像头打开失败（${errorCode}）：${error?.message || error}`,
-        true,
-      );
-      cameraCapturePendingRef.current = false;
-    }
-  }, [refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, stopLocalCameraCapture, syncCameraSenderTrack]);
-
   const ensureCameraPeerConnection = useCallback(async (offererSide: boolean, callId: string) => {
     if (cameraPcRef.current) return cameraPcRef.current;
     if (cameraPcInitRef.current) return cameraPcInitRef.current;
+    const transportGeneration = cameraTransportGenerationRef.current;
     const initialization = (async () => {
       const rtcConfig = await requestRtcConfig();
-      if (currentCallIdRef.current !== callId) throw new Error('camera call superseded');
+      if (currentCallIdRef.current !== callId
+        || cameraTransportGenerationRef.current !== transportGeneration) {
+        throw new Error('camera call superseded');
+      }
       const pc = new RTCPeerConnection(rtcConfig);
       cameraPcRef.current = pc;
       cameraDiagnosticsRef.current = attachRtcDiagnostics(pc, {
@@ -1275,39 +1402,194 @@ export default function App() {
 
   const beginCameraCall = useCallback(async (callId: string, cameraOffererDeviceId: string) => {
     if (currentCallIdRef.current !== callId) return;
+    if (!cameraOffererDeviceId) throw new Error('camera offerer unavailable');
     cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
-    cameraRouteProfileRef.current = 'unknown';
-    setCameraRouteState('unknown');
     const offererSide = selfDeviceIdRef.current === cameraOffererDeviceId;
-    setCameraDesired(false);
-    cameraDesiredRef.current = false;
-    setLocalCameraStatus('unavailable');
-    setLocalCameraQuality(undefined);
-    setRemoteCameraStatus('unavailable');
-    setRemoteCameraQuality(undefined);
-    await refreshCameraDevices();
-    if (currentCallIdRef.current !== callId) return;
-    const pc = await ensureCameraPeerConnection(offererSide, callId);
-    if (!offererSide || currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
-    await pc.setLocalDescription(await pc.createOffer());
-    if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
-    sendCameraSignal({ callId, description: pc.localDescription });
-  }, [ensureCameraPeerConnection, refreshCameraDevices]);
+    if (offererSide && cameraNegotiationStartedCallIdRef.current === callId) return;
+    if (offererSide) cameraNegotiationStartedCallIdRef.current = callId;
+    try {
+      const pc = await ensureCameraPeerConnection(offererSide, callId);
+      if (!offererSide || currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
+      await pc.setLocalDescription(await pc.createOffer());
+      if (currentCallIdRef.current !== callId || cameraPcRef.current !== pc) return;
+      sendCameraSignal({ callId, description: pc.localDescription });
+    } catch (error) {
+      if (offererSide && cameraNegotiationStartedCallIdRef.current === callId) {
+        cameraNegotiationStartedCallIdRef.current = '';
+      }
+      if (currentCallIdRef.current !== callId
+        || (!cameraDesiredRef.current && !remoteCameraDesiredRef.current)) return;
+      throw error;
+    }
+  }, [ensureCameraPeerConnection]);
 
   const handleCameraSignal = useCallback(async (signal: WebRtcSignal) => {
     if (!signal?.callId || signal.callId !== currentCallIdRef.current) return;
-    if (!cameraPrewarmReadyRef.current) {
-      cameraDeferredSignalsRef.current.push(signal);
+    if (typeof signal.cameraDesired === 'boolean') {
+      remoteCameraDesiredRef.current = signal.cameraDesired;
+      if (signal.cameraDesired) {
+        await beginCameraCall(signal.callId, cameraOffererDeviceIdRef.current);
+      } else if (!cameraDesiredRef.current) {
+        teardownCameraTransport('both-cameras-disabled');
+      }
+    }
+    if (!signal.description && !signal.candidate) return;
+    if (!cameraDesiredRef.current && !remoteCameraDesiredRef.current) return;
+    await processCameraSignal(signal);
+  }, [beginCameraCall, processCameraSignal, teardownCameraTransport]);
+
+  const setLocalCameraEnabled = useCallback(async (enabled: boolean) => {
+    const callId = currentCallIdRef.current;
+    if (!callId) return;
+    cameraProfileGenerationRef.current += 1;
+    cameraDesiredRef.current = enabled;
+    cameraCapturePendingRef.current = enabled;
+    setCameraDesired(enabled);
+    if (!enabled) {
+      try { await cameraSenderRef.current?.replaceTrack(null); } catch {}
+      stopLocalCameraCapture();
+      reportCameraStatus('unavailable', 'controller_disabled');
+      sendCameraSignal({ callId, cameraDesired: false });
+      if (!remoteCameraDesiredRef.current) teardownCameraTransport('both-cameras-disabled');
       return;
     }
-    await processCameraSignal(signal);
-  }, [processCameraSignal]);
 
-  const beginMediaCall = useCallback(async (callId: string, cameraOffererDeviceId: string) => {
-    if (currentCallIdRef.current === callId && rtcPcRef.current) return;
+    reportCameraStatus('paused');
+    sendCameraSignal({ callId, cameraDesired: true });
+    try {
+      await beginCameraCall(callId, cameraOffererDeviceIdRef.current);
+    } catch (error) {
+      if (currentCallIdRef.current !== callId || !cameraDesiredRef.current) return;
+      cameraDesiredRef.current = false;
+      cameraCapturePendingRef.current = false;
+      setCameraDesired(false);
+      reportCameraStatus('unavailable', 'capture_failed');
+      sendCameraSignal({ callId, cameraDesired: false });
+      if (!remoteCameraDesiredRef.current) teardownCameraTransport('camera-start-failed');
+      recordControlDiagnostic({
+        event: 'webrtc.camera-start-failed',
+        domain: 'webrtc',
+        level: 'warn',
+        errorCode: 'webrtc_camera_start_failed',
+        recoverability: 'retryable',
+        correlation: { callId },
+        exception: normalizeDiagnosticError(error),
+      });
+      showToast('摄像头连接建立失败，屏幕和声音不受影响', true);
+      return;
+    }
+
+    if (currentCallIdRef.current !== callId || !cameraDesiredRef.current) return;
+    if (cameraRouteProfileRef.current === 'relay-low' || cameraRouteProfileRef.current === 'failed') {
+      cameraDesiredRef.current = false;
+      cameraCapturePendingRef.current = false;
+      setCameraDesired(false);
+      const relayed = cameraRouteProfileRef.current === 'relay-low';
+      reportCameraStatus('unavailable', relayed ? 'relay_disabled' : 'capture_failed');
+      sendCameraSignal({ callId, cameraDesired: false });
+      if (!remoteCameraDesiredRef.current) teardownCameraTransport(relayed ? 'camera-relay-disabled' : 'camera-route-failed');
+      showToast(relayed ? '摄像头通道使用 TURN，为保证屏幕和声音已关闭' : '摄像头连接不可用，请稍后重试', true);
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      cameraDesiredRef.current = false;
+      setCameraDesired(false);
+      reportCameraStatus('unavailable', 'capture_failed');
+      sendCameraSignal({ callId, cameraDesired: false });
+      if (!remoteCameraDesiredRef.current) teardownCameraTransport('camera-unsupported');
+      showToast('当前环境不支持摄像头', true);
+      cameraCapturePendingRef.current = false;
+      return;
+    }
+    try {
+      for (const track of localCameraStreamRef.current?.getTracks() ?? []) track.stop();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          ...(selectedCameraId ? { deviceId: { exact: selectedCameraId } } : {}),
+          width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 24 },
+        },
+        audio: false,
+      });
+      if (currentCallIdRef.current !== callId || !cameraDesiredRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      localCameraStreamRef.current = stream;
+      const track = stream.getVideoTracks()[0];
+      track.addEventListener('ended', () => {
+        if (localCameraStreamRef.current !== stream) return;
+        localCameraStreamRef.current = null;
+        reportCameraStatus('unavailable', 'device_lost');
+        void refreshCameraDevices();
+        showToast('摄像头已断开，正在尝试默认设备', true);
+      }, { once: true });
+      if (localCameraVideoRef.current) {
+        localCameraVideoRef.current.srcObject = stream;
+        void localCameraVideoRef.current.play().catch(() => {});
+      }
+      await refreshCameraDevices();
+      if (currentCallIdRef.current !== callId || localCameraStreamRef.current !== stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      await syncCameraSenderTrack();
+      cameraCapturePendingRef.current = false;
+    } catch (error: any) {
+      const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+      const errorCode = denied ? 'media_camera_permission_denied' : 'media_camera_capture_failed';
+      recordControlDiagnostic({
+        event: 'media.camera-capture-failed',
+        domain: 'media',
+        level: 'warn',
+        errorCode,
+        recoverability: 'user_action',
+        correlation: { callId: currentCallIdRef.current || undefined },
+        exception: normalizeDiagnosticError(error),
+      });
+      cameraDesiredRef.current = false;
+      setCameraDesired(false);
+      reportCameraStatus('unavailable', denied ? 'permission_denied' : 'capture_failed');
+      sendCameraSignal({ callId, cameraDesired: false });
+      if (!remoteCameraDesiredRef.current) teardownCameraTransport('camera-capture-failed');
+      showToast(
+        denied ? `没有获得摄像头权限（${errorCode}）` : `摄像头打开失败（${errorCode}）：${error?.message || error}`,
+        true,
+      );
+      cameraCapturePendingRef.current = false;
+    }
+  }, [beginCameraCall, refreshCameraDevices, reportCameraStatus, selectedCameraId, showToast, stopLocalCameraCapture, syncCameraSenderTrack, teardownCameraTransport]);
+
+  const beginMediaCall = useCallback(async (callId: string, cameraOffererDeviceId: string, requestedMode: 'webrtc' | 'trtc' = 'webrtc') => {
+    if (currentCallIdRef.current === callId && (rtcPcRef.current || trtcActiveRef.current)) return;
     teardownCall({ nextState: 'requesting-media' });
     currentCallIdRef.current = callId;
     cameraOffererDeviceIdRef.current = cameraOffererDeviceId;
+    if (requestedMode === 'trtc') {
+      const trtcConfig = await requestTrtcConfig(callId);
+      if (currentCallIdRef.current !== callId) return;
+      if (!trtcConfig.ok || trtcConfig.mode !== 'trtc') {
+        throw new Error(`TRTC 配置不可用：${trtcConfig.code || 'unknown'}`);
+      }
+      const bridge = window.desktopPetControl?.trtc;
+      if (!bridge) throw new Error('当前客户端未包含 TRTC Electron SDK，请升级两端客户端');
+      const availability = bridge.isAvailable();
+      if (!availability.ok) throw new Error(`TRTC SDK 加载失败：${availability.error || 'unknown'}`);
+      trtcConfigRef.current = trtcConfig;
+      trtcActiveRef.current = true;
+      setMediaTransport('trtc');
+      setScreenDesired(true);
+      setScreenQualityLevel(trtcConfig.videoProfile === '1080p30' ? 5 : 3);
+      setRtcRoute({ candidateType: 'trtc', relayed: true, path: 'TRTC 云端', detail: `正在进入 TRTC 房间 · SDK ${availability.version || ''}` });
+      const entered = bridge.enterRoom(trtcConfig);
+      if (!entered.ok) {
+        trtcActiveRef.current = false;
+        trtcConfigRef.current = null;
+        throw new Error(`TRTC 进房启动失败：${entered.error || 'unknown'}`);
+      }
+      setCallState('calling');
+      return;
+    }
+    setMediaTransport('webrtc');
     const pc = await ensurePeerConnection();
     if (currentCallIdRef.current !== callId || rtcPcRef.current !== pc) return;
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
@@ -1316,42 +1598,6 @@ export default function App() {
     sendRtcSignal({ description: pc.localDescription });
     setCallState('calling');
   }, [ensurePeerConnection, sendRtcSignal, teardownCall]);
-
-  useEffect(() => {
-    const callId = currentCallIdRef.current;
-    const pc = rtcPcRef.current;
-    if (!callId || !pc) return;
-    const mainConnected = pc.connectionState === 'connected';
-    if (!mainConnected
-      || rtcRoute.candidateType === 'unknown' || rtcRoute.candidateType === 'failed') return;
-    if (!cameraOffererDeviceIdRef.current || cameraPrewarmStartedCallIdRef.current === callId) return;
-    cameraPrewarmStartedCallIdRef.current = callId;
-    void beginCameraCall(callId, cameraOffererDeviceIdRef.current).then(async () => {
-      if (currentCallIdRef.current !== callId) return;
-      cameraPrewarmReadyRef.current = true;
-      const deferred = cameraDeferredSignalsRef.current;
-      cameraDeferredSignalsRef.current = [];
-      for (const signal of deferred) {
-        if (currentCallIdRef.current !== callId) return;
-        await processCameraSignal(signal);
-      }
-    }).catch((error) => {
-      if (currentCallIdRef.current !== callId) return;
-      recordControlDiagnostic({
-        event: 'webrtc.camera-prewarm-failed',
-        domain: 'webrtc',
-        level: 'warn',
-        errorCode: 'webrtc_camera_prewarm_failed',
-        recoverability: 'retryable',
-        correlation: { callId },
-        exception: normalizeDiagnosticError(error),
-      });
-      cameraRouteProfileRef.current = 'failed';
-      setCameraRouteState('failed');
-      console.warn('[webrtc] camera prewarm failed:', error);
-      showToast('摄像头网络预热失败，屏幕和声音不受影响', true);
-    });
-  }, [beginCameraCall, processCameraSignal, rtcRoute, showToast]);
 
   useEffect(() => {
     setListeners({
@@ -1474,7 +1720,30 @@ export default function App() {
           if (payload.reason === 'relay_disabled') showToast('对方摄像头通道使用 TURN，已自动关闭');
         }
       },
-      onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId) => {
+      onTrtcMediaControl: (control) => {
+        if (!trtcActiveRef.current || control.callId !== currentCallIdRef.current || control.media !== 'screen') return;
+        const result = window.desktopPetControl?.trtc?.setScreenEnabled(control.enabled);
+        const state = result?.ok ? (control.enabled ? 'available' : 'paused') : 'unavailable';
+        sendTrtcMediaStatus({
+          callId: control.callId,
+          media: 'screen',
+          state,
+          ...(result?.ok ? (control.enabled ? {} : { reason: 'controller_disabled' as const }) : { reason: 'profile_failed' as const }),
+        });
+        if (!result?.ok) showToast(`TRTC 屏幕控制失败：${result?.error || 'unknown'}`, true);
+      },
+      onTrtcMediaStatus: (payload) => {
+        if (!trtcActiveRef.current || payload.callId !== currentCallIdRef.current || payload.media !== 'screen') return;
+        setScreenStatus(payload.state);
+        setScreenQuality('normal');
+        setScreenQualityLevel(payload.qualityLevel);
+        setScreenControlPending(false);
+        if (payload.reason === 'controller_disabled') setScreenDesired(false);
+        else if (payload.state === 'available') setScreenDesired(true);
+        setRemoteReady(payload.state === 'available');
+        if (payload.reason === 'capture_failed') showToast('对方 TRTC 屏幕或系统声音采集失败', true);
+      },
+      onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId, requestedMediaMode) => {
         callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
         const offererDeviceId = cameraOffererDeviceId || (legacyCameraSenderDeviceId
           ? legacyCameraSenderDeviceId === selfDeviceIdRef.current
@@ -1483,7 +1752,7 @@ export default function App() {
           : '') || '';
         setActiveView('call');
         if (!offererDeviceId) showToast('摄像头协议不兼容，请升级双方客户端', true);
-        beginMediaCall(callId, offererDeviceId).catch((e) => {
+        beginMediaCall(callId, offererDeviceId, requestedMediaMode || 'webrtc').catch((e) => {
           console.warn('[webrtc] start coordinated call failed:', e);
           showToast(`通话失败：${e?.message || e}`, true);
           teardownCall({ nextState: 'error' });
@@ -1657,6 +1926,18 @@ export default function App() {
     const audio = isMic ? remoteMicAudioRef.current : remoteSystemAudioRef.current;
     const currentlyMuted = isMic ? remoteMicMuted : remoteSystemMuted;
     const nextMuted = !currentlyMuted;
+    if (trtcActiveRef.current) {
+      const remoteUserId = trtcConfigRef.current?.remoteUserId;
+      if (!remoteUserId) return;
+      const result = window.desktopPetControl?.trtc?.setRemoteAudioMuted(remoteUserId, nextMuted);
+      if (!result?.ok) {
+        showToast(`TRTC 远端声音控制失败：${result?.error || 'unknown'}`, true);
+        return;
+      }
+      setRemoteMicMuted(nextMuted);
+      setRemoteSystemMuted(nextMuted);
+      return;
+    }
     if (isMic) setRemoteMicMuted(nextMuted);
     else setRemoteSystemMuted(nextMuted);
     if (!audio) return;
@@ -2201,20 +2482,29 @@ export default function App() {
   const selfName = selfMember?.displayName || '我';
   const callActive = callState === 'requesting-media' || callState === 'calling' || callState === 'in-call';
   const remoteCameraAvailable = remoteCameraStatus === 'available';
-  const cameraCanOpen = cameraRouteState === 'normal';
+  const cameraCanOpen = !!cameraOffererDeviceIdRef.current && (
+    cameraRouteState === 'normal'
+      || (!cameraPcRef.current
+        && rtcRoute.candidateType !== 'unknown'
+        && rtcRoute.candidateType !== 'failed')
+  );
   const liveNetworkLevel = networkLevel(rtcNetworkSample);
   const inboundVideo = rtcNetworkSample?.inboundVideo;
+  const trtcPublishing = mediaTransport === 'trtc' && !!trtcConfigRef.current?.publishScreen;
+  const displayedVideoStats = trtcPublishing ? rtcNetworkSample?.outboundVideo : inboundVideo;
   const effectivePrimary: 'screen' | 'camera' = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
     ? 'camera'
     : !cameraHidden && preferredPrimary === 'camera' && remoteCameraAvailable ? 'camera' : 'screen';
   const mediaStage = callActive ? (
     <section className={`video-stage-new unified-media-stage ${floatContainer ? 'detached' : ''}`} ref={videoStageRef}>
       <div className={`media-surface screen-surface ${effectivePrimary === 'screen' ? 'primary' : 'inset'} ${screenStatus === 'available' ? 'available' : ''}`}>
-        <video ref={bindScreenVideo} playsInline autoPlay muted />
+        <video ref={bindScreenVideo} playsInline autoPlay muted style={mediaTransport === 'trtc' ? { display: 'none' } : undefined} />
+        {mediaTransport === 'trtc' && !trtcPublishing && <div id="trtc-remote-screen" className="trtc-remote-screen" />}
+        {trtcPublishing && <div className="surface-label">正在通过 TRTC 分享本机主屏幕和系统声音</div>}
         {!floatContainer && screenStatus !== 'available' && <div className="surface-label">屏幕{screenStatus === 'paused' ? '已暂停' : '不可用'}</div>}
         {!floatContainer && screenStatus === 'available' && screenQualityLevel && (
           <div className="quality-badge">
-            屏幕 · {qualityLevelLabel(screenQualityLevel)}{screenQuality === 'relay-low' ? ' · TURN' : ''}
+            屏幕 · {qualityLevelLabel(screenQualityLevel)}{mediaTransport === 'trtc' ? ' · TRTC' : screenQuality === 'relay-low' ? ' · TURN' : ''}
           </div>
         )}
       </div>
@@ -2228,11 +2518,13 @@ export default function App() {
       </div>}
       {!floatContainer && screenStatus !== 'available' && !remoteCameraAvailable && <div className="call-placeholder"><div className="pet-face small">˶ᵔ ᵕ ᵔ˶</div><strong>音频通话中</strong></div>}
       {!floatContainer && <div className="call-controls media-controls">
-        <button disabled={screenControlPending} onClick={() => void toggleRemoteScreen()}>{screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享'}</button>
+        {trtcPublishing
+          ? <button disabled>正在共享本机屏幕</button>
+          : <button disabled={screenControlPending} onClick={() => void toggleRemoteScreen()}>{screenControlPending ? '处理中…' : screenDesired ? '停止屏幕共享' : '恢复屏幕共享'}</button>}
         <button disabled={cameraControlPending || (!cameraDesired && !cameraCanOpen)} onClick={() => void toggleCamera()}>{cameraControlPending ? '处理中…' : cameraDesired ? '关闭摄像头' : '打开摄像头'}</button>
         {remoteCameraAvailable && <button onClick={() => setCameraHidden((hidden) => !hidden)}>{cameraHidden ? '显示摄像头' : '隐藏摄像头'}</button>}
         {remoteCameraAvailable && !cameraHidden && <button onClick={() => setPreferredPrimary((value) => value === 'screen' ? 'camera' : 'screen')}>交换画面</button>}
-        {window.desktopPetControl && <button onClick={openMediaFloat}>系统浮窗</button>}
+        {window.desktopPetControl && mediaTransport !== 'trtc' && <button onClick={openMediaFloat}>系统浮窗</button>}
         <button disabled={!remoteReady && !remoteCameraAvailable} onClick={() => void toggleFullscreen()}>全屏</button>
         <button className="hangup" onClick={onEndCall}>结束</button>
       </div>}
@@ -2393,8 +2685,12 @@ export default function App() {
                   <section className="card">
                     <h2>通话控制</h2>
                     <label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label>
-                    <label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
-                    <label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label>
+                    {mediaTransport === 'trtc' ? (
+                      <label>对方声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
+                    ) : <>
+                      <label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
+                      <label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label>
+                    </>}
                   </section>
                   <section className="card camera-preview-card">
                     <div className="section-title">
@@ -2430,8 +2726,8 @@ export default function App() {
                     <dl>
                       <div><dt>延迟</dt><dd>{rtcNetworkSample?.roundTripTimeMs != null ? `${rtcNetworkSample.roundTripTimeMs} ms` : '检测中'}</dd></div>
                       <div><dt>屏幕档位</dt><dd>{qualityLevelLabel(screenQualityLevel)}</dd></div>
-                      <div><dt>接收码率</dt><dd>{inboundVideo?.bitrateKbps != null ? `${inboundVideo.bitrateKbps} kbps` : '检测中'}</dd></div>
-                      <div><dt>接收帧率</dt><dd>{inboundVideo?.framesPerSecond != null ? `${Math.round(inboundVideo.framesPerSecond)} fps` : '检测中'}</dd></div>
+                      <div><dt>{trtcPublishing ? '发送码率' : '接收码率'}</dt><dd>{displayedVideoStats?.bitrateKbps != null ? `${displayedVideoStats.bitrateKbps} kbps` : '检测中'}</dd></div>
+                      <div><dt>{trtcPublishing ? '发送帧率' : '接收帧率'}</dt><dd>{displayedVideoStats?.framesPerSecond != null ? `${Math.round(displayedVideoStats.framesPerSecond)} fps` : '检测中'}</dd></div>
                     </dl>
                   </section>
                 </aside>

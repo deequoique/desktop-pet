@@ -1,0 +1,31 @@
+{
+  "id": "evaluate-trtc-game-sharing",
+  "name": "evaluate-trtc-game-sharing",
+  "title": "评估 TRTC 游戏共享迁移",
+  "description": "评估以至少 30fps 的 TRTC 云端媒体链路承载游戏画面与系统声音，并核算迁移范围、POC 门槛和月度成本。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "TRTC hybrid/main-media migration architecture, Tencent Cloud pricing model, Electron/Web/server integration plan; no SDK implementation",
+  "package": "desktop-pet",
+  "priority": "P2",
+  "creator": "deequoique",
+  "assignee": "deequoique",
+  "createdAt": "2026-08-12",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "pet/src/renderer/main.ts",
+    "web/src/App.tsx",
+    "server/src/index.js",
+    ".trellis/spec/desktop-pet/shared/webrtc-networking-and-deployment.md"
+  ],
+  "notes": "",
+  "meta": {}
+}

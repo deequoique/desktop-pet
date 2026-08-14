@@ -10,6 +10,7 @@ import WebSocket from 'ws';
 import { prepareDataDirectory } from './data-directory.js';
 import { PersistentStore } from './persistent-store.js';
 import { createServerDiagnostics, normalizeHttpRoute } from './diagnostics.js';
+import { generateTrtcUserSig } from './trtc-user-sig.js';
 
 const PORT = process.env.PORT || 3030;
 const diagnostics = createServerDiagnostics();
@@ -24,6 +25,54 @@ const RTC_TURN_SHARED_SECRET = String(process.env.RTC_TURN_SHARED_SECRET || '').
 const RTC_TURN_REALM = String(process.env.RTC_TURN_REALM || '').trim();
 const RTC_TURN_CREDENTIAL_TTL_SEC = Math.max(300, Number(process.env.RTC_TURN_CREDENTIAL_TTL_SEC || 43_200));
 const RTC_ICE_TRANSPORT_POLICY = process.env.RTC_ICE_TRANSPORT_POLICY === 'relay' ? 'relay' : 'all';
+
+const TRTC_MEDIA_MODE = process.env.TRTC_MEDIA_MODE === 'trtc' ? 'trtc' : 'webrtc';
+const TRTC_SDK_APP_ID = Number(process.env.TRTC_SDK_APP_ID || 0);
+const TRTC_SECRET_KEY = String(process.env.TRTC_SECRET_KEY || '').trim();
+const trtcUserSigTtl = Number(process.env.TRTC_USER_SIG_TTL_SEC || 900);
+const TRTC_USER_SIG_TTL_SEC = Number.isSafeInteger(trtcUserSigTtl) && trtcUserSigTtl >= 300 && trtcUserSigTtl <= 3600
+  ? trtcUserSigTtl : 900;
+const TRTC_VIDEO_PROFILE = process.env.TRTC_VIDEO_PROFILE === '1080p30' ? '1080p30' : '720p30';
+
+function trtcReady() {
+  return TRTC_MEDIA_MODE === 'trtc'
+    && Number.isSafeInteger(TRTC_SDK_APP_ID)
+    && TRTC_SDK_APP_ID > 0
+    && !!TRTC_SECRET_KEY;
+}
+
+function trtcRoomId(callId) {
+  const value = createHash('sha256').update(`trtc-room:${callId}`).digest().readUInt32BE(0) & 0x7fffffff;
+  return value || 1;
+}
+
+function trtcUserId(callId, deviceId) {
+  return `c_${createHash('sha256').update(`trtc-user:${callId}:${deviceId}`).digest('hex').slice(0, 24)}`;
+}
+
+function trtcConfigFor(room, participantId) {
+  const call = room.call;
+  if (!call || !room.callId || ![call.initiatorDeviceId, call.targetDeviceId].includes(participantId)) return null;
+  const peerDeviceId = participantId === call.initiatorDeviceId ? call.targetDeviceId : call.initiatorDeviceId;
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const userId = trtcUserId(room.callId, participantId);
+  return {
+    sdkAppId: TRTC_SDK_APP_ID,
+    roomId: trtcRoomId(room.callId),
+    userId,
+    userSig: generateTrtcUserSig({
+      sdkAppId: TRTC_SDK_APP_ID,
+      secretKey: TRTC_SECRET_KEY,
+      userId,
+      expiresInSeconds: TRTC_USER_SIG_TTL_SEC,
+      issuedAt,
+    }),
+    expiresAt: (issuedAt + TRTC_USER_SIG_TTL_SEC) * 1000,
+    publishScreen: participantId === call.targetDeviceId,
+    remoteUserId: trtcUserId(room.callId, peerDeviceId),
+    videoProfile: TRTC_VIDEO_PROFILE,
+  };
+}
 
 function rtcConfigFor(participantId) {
   const iceServers = [];
@@ -175,6 +224,8 @@ app.get('/api/health', (_req, res) => {
     ttsProvider: TTS_PROVIDER,
     ttsVoices: ALLOWED_VOICES.length,
     socket: 'ready',
+    mediaMode: TRTC_MEDIA_MODE,
+    trtc: trtcReady() ? 'ready' : 'disabled',
   });
 });
 
@@ -1299,12 +1350,13 @@ io.on('connection', (socket) => {
     }
     const targetDeviceId = socket.data.participantId === call.initiatorDeviceId
       ? call.targetDeviceId : call.initiatorDeviceId;
-    const targetId = room.participants.get(targetDeviceId)?.pet;
+    const useTrtc = trtcReady();
+    const targetId = room.participants.get(targetDeviceId)?.[useTrtc ? 'controller' : 'pet'];
     if (!targetId) {
       reject('peer_unavailable');
       return;
     }
-    io.to(targetId).emit('webrtc:media-control', {
+    io.to(targetId).emit(useTrtc ? 'trtc:media-control' : 'webrtc:media-control', {
       callId: room.callId, media, enabled: payload.enabled,
     });
     if (typeof ack === 'function') ack({ ok: true });
@@ -1317,6 +1369,49 @@ io.on('connection', (socket) => {
       return;
     }
     ack({ ok: true, ...rtcConfigFor(socket.data.participantId) });
+  });
+
+  socket.on('trtc:get-config', (payload, ack) => {
+    if (typeof ack !== 'function') return;
+    const room = roomForSocket(socket);
+    if (!room || socket.data?.role !== 'controller') {
+      ack({ ok: false, code: 'not_joined' });
+      return;
+    }
+    if (payload?.callId !== room.callId || !room.call) {
+      ack({ ok: false, code: 'not_in_call' });
+      return;
+    }
+    if (!trtcReady()) {
+      ack({ ok: false, code: 'trtc_not_configured', mode: 'webrtc' });
+      return;
+    }
+    const config = trtcConfigFor(room, socket.data.participantId);
+    if (!config) {
+      ack({ ok: false, code: 'not_allowed' });
+      return;
+    }
+    ack({ ok: true, mode: 'trtc', ...config });
+  });
+
+  socket.on('trtc:media-status', (payload) => {
+    const room = roomForSocket(socket);
+    const call = room?.call;
+    if (!room || !call || socket.data?.role !== 'controller' || payload?.callId !== room.callId) return;
+    if (socket.data.participantId !== call.targetDeviceId) return;
+    const state = String(payload?.state || '');
+    if (!['available', 'paused', 'unavailable'].includes(state)) return;
+    const targetId = room.participants.get(call.initiatorDeviceId)?.controller;
+    if (!targetId) return;
+    const reason = ['controller_disabled', 'capture_failed', 'track_ended', 'profile_failed'].includes(payload?.reason)
+      ? payload.reason : undefined;
+    io.to(targetId).emit('trtc:media-status', {
+      callId: room.callId,
+      media: 'screen',
+      state,
+      ...(reason ? { reason } : {}),
+      qualityLevel: TRTC_VIDEO_PROFILE === '1080p30' ? 5 : 3,
+    });
   });
 
   socket.on('webrtc:media-status', (payload) => {
@@ -1386,6 +1481,7 @@ io.on('connection', (socket) => {
     for (const participant of [self, peer]) if (participant.controller) {
       io.to(participant.controller).emit('call:start', {
         callId: room.callId,
+        mediaMode: trtcReady() ? 'trtc' : 'webrtc',
         peerDeviceId: participant.id === self.id ? peer.id : self.id,
         cameraOffererDeviceId: room.call.initiatorDeviceId,
         cameraSenderDeviceId: room.call.targetDeviceId,

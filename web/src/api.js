@@ -49,9 +49,11 @@ export function connect(serverUrl, secret, identity) {
         listeners.onRtcError?.(payload?.message || '通话出错');
     });
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
+    s.on('trtc:media-control', (payload) => listeners.onTrtcMediaControl?.(payload));
+    s.on('trtc:media-status', (payload) => listeners.onTrtcMediaStatus?.(payload));
     s.on('call:start', (payload) => {
         if (payload?.callId) {
-            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraOffererDeviceId, payload.cameraSenderDeviceId);
+            listeners.onCallStart?.(payload.callId, payload.peerDeviceId, payload.cameraOffererDeviceId, payload.cameraSenderDeviceId, payload.mediaMode);
         }
     });
     s.on('call:end', (payload) => {
@@ -171,6 +173,24 @@ export function requestRtcConfig() {
                 });
         });
     });
+}
+export function requestTrtcConfig(callId) {
+    return new Promise((resolve) => {
+        if (!socket?.connected)
+            return resolve({ ok: false, code: 'disconnected' });
+        socket.timeout(4000).emit('trtc:get-config', { callId }, (err, response) => {
+            if (err)
+                resolve({ ok: false, code: 'timeout' });
+            else
+                resolve(response || { ok: false, code: 'trtc_config_failed' });
+        });
+    });
+}
+export function sendTrtcMediaStatus(status) {
+    if (!socket?.connected)
+        return false;
+    socket.emit('trtc:media-status', status);
+    return true;
 }
 export function sendHangup() {
     if (!socket || !socket.connected)

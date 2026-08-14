@@ -49,6 +49,10 @@ server = spawn(process.execPath, ['src/index.js'], {
     ROOM_SECRETS: 'alpha,beta',
     ROOM_GRACE_MS: '40',
     PET_DATA_DIR: dataDir,
+    TRTC_MEDIA_MODE: 'trtc',
+    TRTC_SDK_APP_ID: '1600157176',
+    TRTC_SECRET_KEY: 'integration-test-secret',
+    TRTC_VIDEO_PROFILE: '720p30',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -96,24 +100,54 @@ try {
   assert.equal(started.ok, true);
   const [aCall, bCall] = await Promise.all([aCallStart, bCallStart]);
   assert.equal(aCall.callId, started.callId);
+  assert.equal(aCall.mediaMode, 'trtc');
   assert.equal(aCall.peerDeviceId, 'b-pc');
   assert.equal(aCall.cameraOffererDeviceId, 'a-laptop');
   assert.equal(aCall.cameraSenderDeviceId, 'b-pc');
   assert.equal(bCall.peerDeviceId, 'a-laptop');
+  assert.equal(bCall.mediaMode, 'trtc');
   assert.equal(bCall.cameraOffererDeviceId, 'a-laptop');
   assert.equal(bCall.cameraSenderDeviceId, 'b-pc');
 
-  const screenControl = once(bPet1.socket, 'webrtc:media-control');
+  const [aTrtc, bTrtc] = await Promise.all([
+    emitAck(aController.socket, 'trtc:get-config', { callId: started.callId }),
+    emitAck(bController1.socket, 'trtc:get-config', { callId: started.callId }),
+  ]);
+  assert.equal(aTrtc.ok, true);
+  assert.equal(aTrtc.mode, 'trtc');
+  assert.equal(aTrtc.sdkAppId, 1600157176);
+  assert.equal(aTrtc.roomId, bTrtc.roomId);
+  assert.equal(aTrtc.remoteUserId, bTrtc.userId);
+  assert.equal(bTrtc.remoteUserId, aTrtc.userId);
+  assert.doesNotMatch(aTrtc.userId, /a-laptop|b-pc/);
+  assert.doesNotMatch(bTrtc.userId, /a-laptop|b-pc/);
+  assert.equal(aTrtc.publishScreen, false);
+  assert.equal(bTrtc.publishScreen, true);
+  assert.equal(aTrtc.videoProfile, '720p30');
+  assert.ok(aTrtc.userSig);
+  assert.ok(aTrtc.expiresAt > Date.now());
+  assert.equal((await emitAck(aController.socket, 'trtc:get-config', { callId: 'stale-call' })).code, 'not_in_call');
+  assert.equal((await emitAck(aPet.socket, 'trtc:get-config', { callId: started.callId })).code, 'not_joined');
+
+  const screenControl = once(bController1.socket, 'trtc:media-control');
   let leakedScreenControl = false;
   const onLeakedScreenControl = () => { leakedScreenControl = true; };
-  bPet2.socket.on('webrtc:media-control', onLeakedScreenControl);
+  bPet2.socket.on('trtc:media-control', onLeakedScreenControl);
   assert.deepEqual(await emitAck(aController.socket, 'webrtc:media-control', {
     callId: started.callId, media: 'screen', enabled: false,
   }), { ok: true });
   assert.deepEqual(await screenControl, { callId: started.callId, media: 'screen', enabled: false });
   await wait(20);
-  bPet2.socket.off('webrtc:media-control', onLeakedScreenControl);
+  bPet2.socket.off('trtc:media-control', onLeakedScreenControl);
   assert.equal(leakedScreenControl, false);
+
+  const trtcScreenStatus = once(aController.socket, 'trtc:media-status');
+  bController1.socket.emit('trtc:media-status', {
+    callId: started.callId, media: 'screen', state: 'available',
+  });
+  assert.deepEqual(await trtcScreenStatus, {
+    callId: started.callId, media: 'screen', state: 'available', qualityLevel: 3,
+  });
 
   let leakedCameraControl = false;
   const onLeakedCameraControl = () => { leakedCameraControl = true; };
@@ -139,6 +173,14 @@ try {
     callId: started.callId, description: { type: 'offer', sdp: 'camera-offer' },
   });
   assert.equal((await cameraSignal).description.sdp, 'camera-offer');
+
+  const cameraDesired = once(bController1.socket, 'webrtc:camera-signal');
+  aController.socket.emit('webrtc:camera-signal', {
+    callId: started.callId, cameraDesired: true,
+  });
+  assert.deepEqual(await cameraDesired, {
+    callId: started.callId, cameraDesired: true,
+  });
 
   const cameraAnswer = once(aController.socket, 'webrtc:camera-signal');
   bController1.socket.emit('webrtc:camera-signal', {

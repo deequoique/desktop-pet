@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const { createTrtcPreloadBridge } = require('./trtc-preload-bridge');
 
 contextBridge.exposeInMainWorld('desktopPetControl', {
   getPairingConfig: () => ipcRenderer.invoke('pet:pairing-config'),
@@ -34,4 +35,5 @@ contextBridge.exposeInMainWorld('desktopPetControl', {
     ipcRenderer.on('note:open-composer', handler);
     return () => ipcRenderer.removeListener('note:open-composer', handler);
   },
+  trtc: createTrtcPreloadBridge(),
 });

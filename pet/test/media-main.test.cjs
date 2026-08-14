@@ -64,16 +64,16 @@ test('TURN keeps bounded adaptive screen video while camera relay fails closed',
   assert.doesNotMatch(petRendererSource, /screenRouteIsP2P|relay_audio_only/);
 });
 
-test('camera ICE prewarms only after the main route is selected and early signals stay call-scoped', () => {
-  assert.match(appSource, /cameraPrewarmReadyRef/);
-  assert.match(appSource, /cameraPrewarmStartedCallIdRef/);
-  assert.match(appSource, /cameraDeferredSignalsRef/);
-  assert.match(appSource, /pc\.connectionState === 'connected'/);
-  assert.match(appSource, /rtcRoute\.candidateType === 'unknown' \|\| rtcRoute\.candidateType === 'failed'/);
-  assert.match(appSource, /cameraPrewarmStartedCallIdRef\.current = callId;[\s\S]*?beginCameraCall/);
-  assert.match(appSource, /if \(!cameraPrewarmReadyRef\.current\)[\s\S]*?cameraDeferredSignalsRef\.current\.push\(signal\)/);
-  assert.match(appSource, /cameraDeferredSignalsRef\.current = \[\]/);
-  assert.match(appSource, /currentCallIdRef\.current !== callId/);
+test('camera transport is lazy and closes immediately after both sides disable it', () => {
+  assert.doesNotMatch(appSource, /cameraPrewarm|webrtc\.camera-prewarm/);
+  assert.match(appSource, /sendCameraSignal\(\{ callId, cameraDesired: true \}\);[\s\S]*?await beginCameraCall/);
+  assert.match(appSource, /typeof signal\.cameraDesired === 'boolean'[\s\S]*?remoteCameraDesiredRef\.current = signal\.cameraDesired/);
+  assert.match(appSource, /if \(signal\.cameraDesired\) \{[\s\S]*?await beginCameraCall/);
+  assert.match(appSource, /sendCameraSignal\(\{ callId, cameraDesired: false \}\);[\s\S]*?if \(!remoteCameraDesiredRef\.current\) teardownCameraTransport\('both-cameras-disabled'\)/);
+  assert.match(appSource, /else if \(!cameraDesiredRef\.current\) \{[\s\S]*?teardownCameraTransport\('both-cameras-disabled'\)/);
+  assert.match(appSource, /const teardownCameraTransport = useCallback[\s\S]*?cameraPcRef\.current\?\.close\(\)[\s\S]*?cameraPcRef\.current = null/);
+  assert.match(appSource, /cameraTransportGenerationRef\.current !== transportGeneration/);
+  assert.match(appSource, /cameraNegotiationStartedCallIdRef\.current = ''/);
 });
 
 test('camera surface only mounts for available remote video', () => {
