@@ -344,7 +344,10 @@ int wmain(int argc, wchar_t** argv) {
       const size_t offset = accumulator.size();
       accumulator.resize(offset + bytes);
       if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {
-        std::fill(accumulator.begin() + static_cast<std::ptrdiff_t>(offset), accumulator.end(), 0);
+        std::fill(
+            accumulator.begin() + static_cast<std::ptrdiff_t>(offset),
+            accumulator.end(),
+            uint8_t{0});
       } else {
         std::copy(data, data + bytes, accumulator.begin() + static_cast<std::ptrdiff_t>(offset));
       }
