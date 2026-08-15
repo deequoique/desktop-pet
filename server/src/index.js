@@ -50,15 +50,12 @@ function trtcUserId(callId, deviceId) {
   return `c_${createHash('sha256').update(`trtc-user:${callId}:${deviceId}`).digest('hex').slice(0, 24)}`;
 }
 
-function trtcConfigFor(room, participantId) {
-  const call = room.call;
-  if (!call || !room.callId || ![call.initiatorDeviceId, call.targetDeviceId].includes(participantId)) return null;
-  const peerDeviceId = participantId === call.initiatorDeviceId ? call.targetDeviceId : call.initiatorDeviceId;
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const userId = trtcUserId(room.callId, participantId);
+function trtcSystemUserId(callId, deviceId) {
+  return `s_${createHash('sha256').update(`trtc-system-user:${callId}:${deviceId}`).digest('hex').slice(0, 24)}`;
+}
+
+function trtcSignedIdentity(userId, issuedAt) {
   return {
-    sdkAppId: TRTC_SDK_APP_ID,
-    roomId: trtcRoomId(room.callId),
     userId,
     userSig: generateTrtcUserSig({
       sdkAppId: TRTC_SDK_APP_ID,
@@ -67,9 +64,27 @@ function trtcConfigFor(room, participantId) {
       expiresInSeconds: TRTC_USER_SIG_TTL_SEC,
       issuedAt,
     }),
+  };
+}
+
+function trtcConfigFor(room, participantId) {
+  const call = room.call;
+  if (!call || !room.callId || ![call.initiatorDeviceId, call.targetDeviceId].includes(participantId)) return null;
+  const peerDeviceId = participantId === call.initiatorDeviceId ? call.targetDeviceId : call.initiatorDeviceId;
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const userId = trtcUserId(room.callId, participantId);
+  const publishScreen = participantId === call.targetDeviceId;
+  const systemUserId = trtcSystemUserId(room.callId, call.targetDeviceId);
+  return {
+    sdkAppId: TRTC_SDK_APP_ID,
+    roomId: trtcRoomId(room.callId),
+    ...trtcSignedIdentity(userId, issuedAt),
     expiresAt: (issuedAt + TRTC_USER_SIG_TTL_SEC) * 1000,
-    publishScreen: participantId === call.targetDeviceId,
+    publishScreen,
     remoteUserId: trtcUserId(room.callId, peerDeviceId),
+    ...(publishScreen
+      ? { localSystemAudio: trtcSignedIdentity(systemUserId, issuedAt) }
+      : { remoteSystemUserId: systemUserId }),
     videoProfile: TRTC_VIDEO_PROFILE,
   };
 }
@@ -1399,6 +1414,8 @@ io.on('connection', (socket) => {
     const call = room?.call;
     if (!room || !call || socket.data?.role !== 'controller' || payload?.callId !== room.callId) return;
     if (socket.data.participantId !== call.targetDeviceId) return;
+    const media = String(payload?.media || '');
+    if (!['screen', 'system-audio'].includes(media)) return;
     const state = String(payload?.state || '');
     if (!['available', 'paused', 'unavailable'].includes(state)) return;
     const targetId = room.participants.get(call.initiatorDeviceId)?.controller;
@@ -1407,10 +1424,10 @@ io.on('connection', (socket) => {
       ? payload.reason : undefined;
     io.to(targetId).emit('trtc:media-status', {
       callId: room.callId,
-      media: 'screen',
+      media,
       state,
       ...(reason ? { reason } : {}),
-      qualityLevel: TRTC_VIDEO_PROFILE === '1080p30' ? 5 : 3,
+      ...(media === 'screen' ? { qualityLevel: TRTC_VIDEO_PROFILE === '1080p30' ? 5 : 3 } : {}),
     });
   });
 

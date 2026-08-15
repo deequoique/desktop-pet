@@ -119,13 +119,22 @@ try {
   assert.equal(aTrtc.roomId, bTrtc.roomId);
   assert.equal(aTrtc.remoteUserId, bTrtc.userId);
   assert.equal(bTrtc.remoteUserId, aTrtc.userId);
+  assert.equal(aTrtc.remoteSystemUserId, bTrtc.localSystemAudio.userId);
+  assert.match(aTrtc.remoteSystemUserId, /^s_[a-f0-9]{24}$/);
+  assert.ok(bTrtc.localSystemAudio.userSig);
+  assert.equal(aTrtc.localSystemAudio, undefined);
+  assert.equal(bTrtc.remoteSystemUserId, undefined);
+  assert.equal(aTrtc.userSig === bTrtc.localSystemAudio.userSig, false);
   assert.doesNotMatch(aTrtc.userId, /a-laptop|b-pc/);
   assert.doesNotMatch(bTrtc.userId, /a-laptop|b-pc/);
+  assert.doesNotMatch(aTrtc.remoteSystemUserId, /a-laptop|b-pc/);
   assert.equal(aTrtc.publishScreen, false);
   assert.equal(bTrtc.publishScreen, true);
   assert.equal(aTrtc.videoProfile, '720p30');
   assert.ok(aTrtc.userSig);
   assert.ok(aTrtc.expiresAt > Date.now());
+  const repeatedTargetTrtc = await emitAck(bController1.socket, 'trtc:get-config', { callId: started.callId });
+  assert.equal(repeatedTargetTrtc.localSystemAudio.userId, bTrtc.localSystemAudio.userId);
   assert.equal((await emitAck(aController.socket, 'trtc:get-config', { callId: 'stale-call' })).code, 'not_in_call');
   assert.equal((await emitAck(aPet.socket, 'trtc:get-config', { callId: started.callId })).code, 'not_joined');
 
@@ -147,6 +156,14 @@ try {
   });
   assert.deepEqual(await trtcScreenStatus, {
     callId: started.callId, media: 'screen', state: 'available', qualityLevel: 3,
+  });
+
+  const trtcSystemStatus = once(aController.socket, 'trtc:media-status');
+  bController1.socket.emit('trtc:media-status', {
+    callId: started.callId, media: 'system-audio', state: 'unavailable', reason: 'capture_failed',
+  });
+  assert.deepEqual(await trtcSystemStatus, {
+    callId: started.callId, media: 'system-audio', state: 'unavailable', reason: 'capture_failed',
   });
 
   let leakedCameraControl = false;

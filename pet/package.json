@@ -15,9 +15,11 @@
     "test": "node --test test/*.test.cjs",
     "typecheck": "tsc -p tsconfig.json",
     "build:renderer": "npm run typecheck && node ../scripts/run-vite.cjs build && node ../scripts/build-control.cjs",
+    "build:native:win": "cmake -S native/windows-process-loopback -B native/windows-process-loopback/build -A x64 && cmake --build native/windows-process-loopback/build --config Release && node scripts/verify-windows-process-loopback.cjs",
     "pack": "npm run build:renderer && electron-builder --dir",
     "dist": "npm run build:renderer && electron-builder",
-    "dist:win": "npm run build:renderer && electron-builder --win nsis",
+    "dist:win:package": "electron-builder --win nsis",
+    "dist:win": "npm run build:renderer && npm run build:native:win && npm run dist:win:package",
     "start": "electron ."
   },
   "build": {
@@ -46,6 +48,12 @@
     ],
     "win": {
       "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "native/windows-process-loopback/build/Release/desktop-pet-process-loopback.exe",
+          "to": "native/desktop-pet-process-loopback.exe"
+        }
+      ],
       "target": [
         {
           "target": "nsis",

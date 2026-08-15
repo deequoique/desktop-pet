@@ -76,6 +76,8 @@ export type TrtcConfig = {
   expiresAt?: number;
   publishScreen?: boolean;
   remoteUserId?: string;
+  remoteSystemUserId?: string;
+  localSystemAudio?: { userId: string; userSig: string };
   videoProfile?: '720p30' | '1080p30';
 };
 export type MediaStatus = {

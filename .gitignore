@@ -22,6 +22,7 @@ AGENTS.md
 *.app/
 pet/release/
 release/
+pet/native/windows-process-loopback/build/
 
 # server runtime data (registry, private audio, and note attachments)
 server/data/

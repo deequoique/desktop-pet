@@ -5,6 +5,12 @@ const os = require('os');
 const { randomUUID } = require('crypto');
 const { shouldShowControlOnStartup } = require('./pairing-config');
 const {
+  createFrameDeliveryQueue,
+  createWindowsProcessLoopbackManager,
+  processLoopbackCapability,
+  resolveHelperPath,
+} = require('./windows-process-loopback');
+const {
   acknowledgeIncidents,
   appendDiagnosticEntry,
   beginDiagnosticSession,
@@ -254,6 +260,26 @@ function defaultBottomRight() {
 let win = null;
 let controlWin = null;
 let mediaFloatWin = null;
+let processLoopbackManager = null;
+const systemAudioFrameDelivery = createFrameDeliveryQueue({
+  onDeliver: (frame) => {
+    if (!controlWin || controlWin.isDestroyed()) return;
+    try { controlWin.webContents.send('trtc:system-audio-frame', frame); } catch {}
+  },
+  onDrop: (droppedFrames, generation) => {
+    if (droppedFrames !== 1 && droppedFrames % 50 !== 0) return;
+    const status = { event: 'transport-frames-dropped', generation, droppedFrames };
+    diagnostic('media.trtc-system-loopback-helper', status, {
+      level: 'warn',
+      domain: 'media',
+      errorCode: 'media_trtc_system_loopback_transport_frames_dropped',
+      recoverability: 'automatic',
+    });
+    if (controlWin && !controlWin.isDestroyed()) {
+      try { controlWin.webContents.send('trtc:system-audio-status', status); } catch {}
+    }
+  },
+});
 const noteWindows = new Map();
 const noteWindowsHiddenForGame = new Set();
 let tray = null;
@@ -268,6 +294,58 @@ let updateState = {
   version: '',
   error: '',
 };
+
+function trustedControlSender(sender) {
+  return !!controlWin && !controlWin.isDestroyed() && sender === controlWin.webContents;
+}
+
+function systemAudioCapability() {
+  return processLoopbackCapability({
+    enabled: process.env.TRTC_SYSTEM_AUDIO_EXCLUSION !== 'disabled',
+  });
+}
+
+function stopProcessLoopback(generation) {
+  processLoopbackManager?.stop(generation);
+  systemAudioFrameDelivery.reset(generation);
+}
+
+function ensureProcessLoopbackManager() {
+  if (processLoopbackManager) return processLoopbackManager;
+  const helperPath = resolveHelperPath({
+    packaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appPath: app.getAppPath(),
+  });
+  processLoopbackManager = createWindowsProcessLoopbackManager({
+    helperPath,
+    rootProcessId: process.pid,
+    onFrame: (frame) => systemAudioFrameDelivery.push(frame),
+    onStatus: (status) => {
+      const helperFailed = ['helper-error', 'protocol-error'].includes(status.event)
+        || (status.event === 'helper-exit' && !status.expected);
+      diagnostic('media.trtc-system-loopback-helper', {
+        event: status.event,
+        generation: status.generation,
+        protocolVersion: status.protocolVersion,
+        code: status.code,
+        error: status.error,
+        droppedFrames: status.droppedFrames,
+        expected: status.expected,
+      }, {
+        level: helperFailed ? 'error' : 'info',
+        domain: 'media',
+        errorCode: helperFailed
+          ? 'media_trtc_system_loopback_helper_failed' : undefined,
+        recoverability: helperFailed ? 'retryable' : undefined,
+      });
+      if (controlWin && !controlWin.isDestroyed()) {
+        try { controlWin.webContents.send('trtc:system-audio-status', status); } catch {}
+      }
+    },
+  });
+  return processLoopbackManager;
+}
 
 function displaySnapshot(display) {
   if (!display) return null;
@@ -946,6 +1024,7 @@ function createControlWindow() {
   else controlWin.loadFile(path.join(__dirname, '../../dist/control/index.html'));
   controlWin.webContents.on('did-finish-load', () => broadcastScaleChanged(currentScale()));
   controlWin.webContents.on('render-process-gone', (_event, details) => {
+    stopProcessLoopback();
     const clean = details?.reason === 'clean-exit';
     diagnostic('app.control-renderer-gone', details, clean ? {
       level: 'info',
@@ -958,6 +1037,9 @@ function createControlWindow() {
       incident: true,
       correlation: { renderer: 'control' },
     });
+  });
+  controlWin.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
+    if (isMainFrame) stopProcessLoopback();
   });
   controlWin.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (!isMainFrame) return;
@@ -1109,6 +1191,33 @@ ipcMain.handle('diagnostics:dismiss', (event, rawId) => {
   const id = String(rawId || '').slice(0, 128);
   if (!id) return { ok: false, error: 'invalid_incident' };
   return { ok: acknowledgeIncidents(diagnosticIncidentFile(), id, 'dismissed') };
+});
+ipcMain.handle('trtc:system-audio-capability', (event) => {
+  if (!trustedControlSender(event.sender)) return { mode: 'unavailable', echoExclusion: 'untrusted-sender' };
+  return systemAudioCapability();
+});
+ipcMain.handle('trtc:system-audio-start', (event, rawGeneration) => {
+  if (!trustedControlSender(event.sender)) return { ok: false, error: 'untrusted_sender' };
+  const capability = systemAudioCapability();
+  if (capability.mode !== 'process-exclusion') return { ok: false, error: 'process_exclusion_unavailable' };
+  const generation = Number(rawGeneration);
+  if (!Number.isSafeInteger(generation) || generation <= 0) return { ok: false, error: 'invalid_generation' };
+  systemAudioFrameDelivery.reset();
+  return ensureProcessLoopbackManager().start(generation);
+});
+ipcMain.handle('trtc:system-audio-stop', (event, rawGeneration) => {
+  if (!trustedControlSender(event.sender)) return { ok: false, error: 'untrusted_sender' };
+  const generation = Number(rawGeneration);
+  if (!Number.isSafeInteger(generation) || generation <= 0) return { ok: false, error: 'invalid_generation' };
+  stopProcessLoopback(generation);
+  return { ok: true };
+});
+ipcMain.on('trtc:system-audio-frame-consumed', (event, rawGeneration, rawSequence) => {
+  if (!trustedControlSender(event.sender)) return;
+  const generation = Number(rawGeneration);
+  const sequence = Number(rawSequence);
+  if (!Number.isSafeInteger(generation) || generation <= 0 || !Number.isSafeInteger(sequence) || sequence < 0) return;
+  systemAudioFrameDelivery.acknowledge(generation, sequence);
 });
 
 // 60Hz 轮询光标位置 → 推给渲染层做 hit-test
@@ -1317,6 +1426,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   app.isQuiting = true;
+  stopProcessLoopback();
   closeNoteWindows();
 });
 

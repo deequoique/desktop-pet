@@ -50,10 +50,13 @@ jobs:
           }
           $config | ConvertTo-Json | Out-File -Encoding utf8 config/production.json
 
+      - name: Build and verify Windows process-loopback helper
+        run: npm run build:native:win
+
       - name: Build installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run dist:win -- --publish always
+        run: npm run build:renderer && npm run dist:win:package -- --publish always
 
   build-pet-macos:
     needs: build-pet-windows

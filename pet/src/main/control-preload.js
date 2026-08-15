@@ -1,6 +1,29 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const { createTrtcPreloadBridge } = require('./trtc-preload-bridge');
 
+const systemAudioTransport = {
+  getCapability: () => ipcRenderer.invoke('trtc:system-audio-capability'),
+  start: (generation) => ipcRenderer.invoke('trtc:system-audio-start', generation),
+  stop: (generation) => ipcRenderer.invoke('trtc:system-audio-stop', generation),
+  onFrame: (callback) => {
+    const handler = (_event, payload) => {
+      try { callback(payload); }
+      finally {
+        ipcRenderer.send('trtc:system-audio-frame-consumed', payload?.generation, payload?.sequence);
+      }
+    };
+    ipcRenderer.on('trtc:system-audio-frame', handler);
+    return () => ipcRenderer.removeListener('trtc:system-audio-frame', handler);
+  },
+  onStatus: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('trtc:system-audio-status', handler);
+    return () => ipcRenderer.removeListener('trtc:system-audio-status', handler);
+  },
+};
+
+const trtcBridge = createTrtcPreloadBridge({ systemAudioTransport });
+
 contextBridge.exposeInMainWorld('desktopPetControl', {
   getPairingConfig: () => ipcRenderer.invoke('pet:pairing-config'),
   savePairingConfig: (config) => ipcRenderer.invoke('pet:save-pairing-config', config),
@@ -35,5 +58,7 @@ contextBridge.exposeInMainWorld('desktopPetControl', {
     ipcRenderer.on('note:open-composer', handler);
     return () => ipcRenderer.removeListener('note:open-composer', handler);
   },
-  trtc: createTrtcPreloadBridge(),
+  trtc: trtcBridge,
 });
+
+window.addEventListener('unload', () => trtcBridge.dispose());

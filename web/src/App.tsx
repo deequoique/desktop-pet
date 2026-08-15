@@ -88,7 +88,8 @@ type DiagnosticIncidentSummary = {
 type DiagnosticStatus = { pendingIncidents: DiagnosticIncidentSummary[] };
 type TrtcEvent = {
   event: 'error' | 'enter-room' | 'exit-room' | 'connection-lost' | 'reconnecting' | 'connection-recovered'
-    | 'substream-available' | 'first-video-frame' | 'first-local-video-frame' | 'system-audio-error' | 'statistics';
+    | 'substream-available' | 'first-video-frame' | 'first-local-video-frame' | 'system-audio-state'
+    | 'system-audio-dropped-frames' | 'statistics';
   errorCode?: number;
   errorMessage?: string;
   elapsed?: number;
@@ -100,6 +101,12 @@ type TrtcEvent = {
   upLoss?: number;
   downLoss?: number;
   appCpu?: number;
+  state?: 'starting' | 'available' | 'unavailable';
+  mode?: 'pending' | 'process-exclusion' | 'trtc-loopback' | 'unavailable';
+  echoExclusion?: string;
+  error?: string;
+  windowsBuild?: number;
+  droppedFrames?: number;
   local?: { width?: number; height?: number; frameRate?: number; videoBitrate?: number } | null;
   remote?: { width?: number; height?: number; frameRate?: number; videoBitrate?: number } | null;
 };
@@ -112,7 +119,8 @@ type TrtcBridge = {
   setScreenEnabled: (enabled: boolean) => TrtcBridgeResult;
   startRemoteView: (userId: string) => TrtcBridgeResult;
   setMicrophoneEnabled: (enabled: boolean) => TrtcBridgeResult;
-  setRemoteAudioMuted: (userId: string, muted: boolean) => TrtcBridgeResult;
+  setRemoteMicrophoneMuted: (muted: boolean) => TrtcBridgeResult;
+  setRemoteSystemAudioMuted: (muted: boolean) => TrtcBridgeResult;
   leaveRoom: () => TrtcBridgeResult;
 };
 
@@ -472,6 +480,13 @@ export default function App() {
   const [remoteMicMuted, setRemoteMicMuted] = useState(true);
   const [remoteSystemMuted, setRemoteSystemMuted] = useState(true);
   const [micEnabled, setMicEnabledState] = useState(false);
+  const [trtcSystemAudioState, setTrtcSystemAudioState] = useState<{
+    state: 'idle' | 'starting' | 'available' | 'unavailable';
+    mode?: string;
+    echoExclusion?: string;
+    error?: string;
+    windowsBuild?: number;
+  }>({ state: 'idle' });
   const [remoteReady, setRemoteReady] = useState(false);
   const [screenStatus, setScreenStatus] = useState<MediaStatus['state']>('unavailable');
   const [screenQuality, setScreenQuality] = useState<MediaStatus['quality']>();
@@ -667,6 +682,9 @@ export default function App() {
     pendingCandidatesRef.current = [];
     stopLocalAudio();
     setMicEnabled(false);
+    setRemoteMicMuted(true);
+    setRemoteSystemMuted(true);
+    setTrtcSystemAudioState({ state: 'idle' });
     setRemoteReady(false);
     setScreenStatus('unavailable');
     setScreenQuality(undefined);
@@ -719,10 +737,6 @@ export default function App() {
             sendTrtcMediaStatus({ callId, media: 'screen', state: 'unavailable', reason: 'capture_failed' });
             showToast(`TRTC 屏幕共享启动失败：${result.error || 'unknown'}`, true);
           }
-        } else if (config.remoteUserId) {
-          bridge.setRemoteAudioMuted(config.remoteUserId, false);
-          setRemoteMicMuted(false);
-          setRemoteSystemMuted(false);
         }
         recordControlDiagnostic({
           event: 'call.trtc-entered',
@@ -753,7 +767,7 @@ export default function App() {
       if (event.event === 'first-video-frame' && event.userId === config.remoteUserId) {
         setScreenStatus('available');
         setRemoteReady(true);
-        setRemoteTrackSummary(`TRTC 辅流 ${event.width || 0}×${event.height || 0} + 系统声音`);
+        setRemoteTrackSummary(`TRTC 辅流 ${event.width || 0}×${event.height || 0}`);
         setScreenQuality('normal');
         setScreenQualityLevel(config.videoProfile === '1080p30' ? 5 : 3);
         return;
@@ -813,9 +827,49 @@ export default function App() {
         setCallState('in-call');
         return;
       }
-      if (event.event === 'system-audio-error') {
-        sendTrtcMediaStatus({ callId, media: 'screen', state: 'unavailable', reason: 'capture_failed' });
-        showToast(`TRTC 系统声音采集失败：${event.errorCode}`, true);
+      if (event.event === 'system-audio-state') {
+        setTrtcSystemAudioState({
+          state: event.state || 'unavailable',
+          mode: event.mode,
+          echoExclusion: event.echoExclusion,
+          error: event.error,
+          windowsBuild: event.windowsBuild,
+        });
+        recordControlDiagnostic({
+          event: 'media.trtc-system-audio-state',
+          domain: 'media',
+          level: event.state === 'unavailable' ? 'warn' : 'info',
+          ...(event.state === 'unavailable' ? {
+            errorCode: 'media_trtc_system_audio_unavailable',
+            recoverability: 'retryable',
+          } : {}),
+          correlation: { callId },
+          context: {
+            state: event.state,
+            mode: event.mode,
+            echoExclusion: event.echoExclusion,
+            windowsBuild: event.windowsBuild,
+            error: event.error,
+          },
+        });
+        if (event.state === 'unavailable') {
+          sendTrtcMediaStatus({ callId, media: 'system-audio', state: 'unavailable', reason: 'capture_failed' });
+          showToast(`TRTC 系统声音采集失败：${event.error || 'unknown'}`, true);
+        } else if (event.state === 'available') {
+          sendTrtcMediaStatus({ callId, media: 'system-audio', state: 'available' });
+        }
+        return;
+      }
+      if (event.event === 'system-audio-dropped-frames') {
+        recordControlDiagnostic({
+          event: 'media.trtc-system-audio-frames-dropped',
+          domain: 'media',
+          level: 'warn',
+          errorCode: 'media_trtc_system_audio_frames_dropped',
+          recoverability: 'automatic',
+          correlation: { callId },
+          context: { droppedFrames: event.droppedFrames },
+        });
         return;
       }
       if (event.event === 'error') {
@@ -1733,15 +1787,25 @@ export default function App() {
         if (!result?.ok) showToast(`TRTC 屏幕控制失败：${result?.error || 'unknown'}`, true);
       },
       onTrtcMediaStatus: (payload) => {
-        if (!trtcActiveRef.current || payload.callId !== currentCallIdRef.current || payload.media !== 'screen') return;
-        setScreenStatus(payload.state);
-        setScreenQuality('normal');
-        setScreenQualityLevel(payload.qualityLevel);
-        setScreenControlPending(false);
-        if (payload.reason === 'controller_disabled') setScreenDesired(false);
-        else if (payload.state === 'available') setScreenDesired(true);
-        setRemoteReady(payload.state === 'available');
-        if (payload.reason === 'capture_failed') showToast('对方 TRTC 屏幕或系统声音采集失败', true);
+        if (!trtcActiveRef.current || payload.callId !== currentCallIdRef.current) return;
+        if (payload.media === 'screen') {
+          setScreenStatus(payload.state);
+          setScreenQuality('normal');
+          setScreenQualityLevel(payload.qualityLevel);
+          setScreenControlPending(false);
+          if (payload.reason === 'controller_disabled') setScreenDesired(false);
+          else if (payload.state === 'available') setScreenDesired(true);
+          setRemoteReady(payload.state === 'available');
+          if (payload.reason === 'capture_failed') showToast('对方 TRTC 屏幕采集失败，声音仍可继续', true);
+        }
+        if (payload.media === 'system-audio') {
+          setTrtcSystemAudioState({ state: payload.state === 'paused' ? 'unavailable' : payload.state });
+          if (payload.state === 'unavailable') {
+            window.desktopPetControl?.trtc?.setRemoteSystemAudioMuted(true);
+            setRemoteSystemMuted(true);
+            if (payload.reason === 'capture_failed') showToast('对方系统声音采集失败，屏幕和麦克风仍可继续', true);
+          }
+        }
       },
       onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId, requestedMediaMode) => {
         callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
@@ -1927,15 +1991,15 @@ export default function App() {
     const currentlyMuted = isMic ? remoteMicMuted : remoteSystemMuted;
     const nextMuted = !currentlyMuted;
     if (trtcActiveRef.current) {
-      const remoteUserId = trtcConfigRef.current?.remoteUserId;
-      if (!remoteUserId) return;
-      const result = window.desktopPetControl?.trtc?.setRemoteAudioMuted(remoteUserId, nextMuted);
+      const result = isMic
+        ? window.desktopPetControl?.trtc?.setRemoteMicrophoneMuted(nextMuted)
+        : window.desktopPetControl?.trtc?.setRemoteSystemAudioMuted(nextMuted);
       if (!result?.ok) {
         showToast(`TRTC 远端声音控制失败：${result?.error || 'unknown'}`, true);
         return;
       }
-      setRemoteMicMuted(nextMuted);
-      setRemoteSystemMuted(nextMuted);
+      if (isMic) setRemoteMicMuted(nextMuted);
+      else setRemoteSystemMuted(nextMuted);
       return;
     }
     if (isMic) setRemoteMicMuted(nextMuted);
@@ -2491,6 +2555,7 @@ export default function App() {
   const liveNetworkLevel = networkLevel(rtcNetworkSample);
   const inboundVideo = rtcNetworkSample?.inboundVideo;
   const trtcPublishing = mediaTransport === 'trtc' && !!trtcConfigRef.current?.publishScreen;
+  const trtcRemoteSystemAvailable = mediaTransport === 'trtc' && !!trtcConfigRef.current?.remoteSystemUserId;
   const displayedVideoStats = trtcPublishing ? rtcNetworkSample?.outboundVideo : inboundVideo;
   const effectivePrimary: 'screen' | 'camera' = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
     ? 'camera'
@@ -2685,12 +2750,23 @@ export default function App() {
                   <section className="card">
                     <h2>通话控制</h2>
                     <label>我的麦克风<input type="checkbox" checked={micEnabled} onChange={toggleLocalMic} /></label>
-                    {mediaTransport === 'trtc' ? (
-                      <label>对方声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
-                    ) : <>
-                      <label>对方系统声音<input type="checkbox" checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
-                      <label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label>
-                    </>}
+                    <label>对方麦克风<input type="checkbox" checked={!remoteMicMuted} onChange={() => void toggleRemoteAudio('mic')} /></label>
+                    {(mediaTransport !== 'trtc' || trtcRemoteSystemAvailable) && (
+                      <label>对方系统声音<input type="checkbox" disabled={trtcSystemAudioState.state === 'unavailable'} checked={!remoteSystemMuted} onChange={() => void toggleRemoteAudio('system')} /></label>
+                    )}
+                    {trtcPublishing && trtcSystemAudioState.state !== 'idle' && (
+                      <small>
+                        {trtcSystemAudioState.state === 'starting'
+                          ? '系统声音正在启动…'
+                          : trtcSystemAudioState.state === 'unavailable'
+                          ? `系统声音不可用：${trtcSystemAudioState.error || '未知错误'}`
+                          : trtcSystemAudioState.echoExclusion === 'unsupported'
+                            ? `系统声音正在共享；Windows build ${trtcSystemAudioState.windowsBuild || '未知'} 不支持数字回环排除，可能出现回声。`
+                            : trtcSystemAudioState.mode === 'process-exclusion'
+                              ? '系统声音正在共享，并已排除本应用/TRTC 的播放。'
+                              : '系统声音正在共享。'}
+                      </small>
+                    )}
                   </section>
                   <section className="card camera-preview-card">
                     <div className="section-title">

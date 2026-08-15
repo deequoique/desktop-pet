@@ -326,6 +326,7 @@ export default function App() {
     const [remoteMicMuted, setRemoteMicMuted] = useState(true);
     const [remoteSystemMuted, setRemoteSystemMuted] = useState(true);
     const [micEnabled, setMicEnabledState] = useState(false);
+    const [trtcSystemAudioState, setTrtcSystemAudioState] = useState({ state: 'idle' });
     const [remoteReady, setRemoteReady] = useState(false);
     const [screenStatus, setScreenStatus] = useState('unavailable');
     const [screenQuality, setScreenQuality] = useState();
@@ -536,6 +537,9 @@ export default function App() {
         pendingCandidatesRef.current = [];
         stopLocalAudio();
         setMicEnabled(false);
+        setRemoteMicMuted(true);
+        setRemoteSystemMuted(true);
+        setTrtcSystemAudioState({ state: 'idle' });
         setRemoteReady(false);
         setScreenStatus('unavailable');
         setScreenQuality(undefined);
@@ -594,11 +598,6 @@ export default function App() {
                         showToast(`TRTC 屏幕共享启动失败：${result.error || 'unknown'}`, true);
                     }
                 }
-                else if (config.remoteUserId) {
-                    bridge.setRemoteAudioMuted(config.remoteUserId, false);
-                    setRemoteMicMuted(false);
-                    setRemoteSystemMuted(false);
-                }
                 recordControlDiagnostic({
                     event: 'call.trtc-entered',
                     domain: 'call',
@@ -630,7 +629,7 @@ export default function App() {
             if (event.event === 'first-video-frame' && event.userId === config.remoteUserId) {
                 setScreenStatus('available');
                 setRemoteReady(true);
-                setRemoteTrackSummary(`TRTC 辅流 ${event.width || 0}×${event.height || 0} + 系统声音`);
+                setRemoteTrackSummary(`TRTC 辅流 ${event.width || 0}×${event.height || 0}`);
                 setScreenQuality('normal');
                 setScreenQualityLevel(config.videoProfile === '1080p30' ? 5 : 3);
                 return;
@@ -690,9 +689,50 @@ export default function App() {
                 setCallState('in-call');
                 return;
             }
-            if (event.event === 'system-audio-error') {
-                sendTrtcMediaStatus({ callId, media: 'screen', state: 'unavailable', reason: 'capture_failed' });
-                showToast(`TRTC 系统声音采集失败：${event.errorCode}`, true);
+            if (event.event === 'system-audio-state') {
+                setTrtcSystemAudioState({
+                    state: event.state || 'unavailable',
+                    mode: event.mode,
+                    echoExclusion: event.echoExclusion,
+                    error: event.error,
+                    windowsBuild: event.windowsBuild,
+                });
+                recordControlDiagnostic({
+                    event: 'media.trtc-system-audio-state',
+                    domain: 'media',
+                    level: event.state === 'unavailable' ? 'warn' : 'info',
+                    ...(event.state === 'unavailable' ? {
+                        errorCode: 'media_trtc_system_audio_unavailable',
+                        recoverability: 'retryable',
+                    } : {}),
+                    correlation: { callId },
+                    context: {
+                        state: event.state,
+                        mode: event.mode,
+                        echoExclusion: event.echoExclusion,
+                        windowsBuild: event.windowsBuild,
+                        error: event.error,
+                    },
+                });
+                if (event.state === 'unavailable') {
+                    sendTrtcMediaStatus({ callId, media: 'system-audio', state: 'unavailable', reason: 'capture_failed' });
+                    showToast(`TRTC 系统声音采集失败：${event.error || 'unknown'}`, true);
+                }
+                else if (event.state === 'available') {
+                    sendTrtcMediaStatus({ callId, media: 'system-audio', state: 'available' });
+                }
+                return;
+            }
+            if (event.event === 'system-audio-dropped-frames') {
+                recordControlDiagnostic({
+                    event: 'media.trtc-system-audio-frames-dropped',
+                    domain: 'media',
+                    level: 'warn',
+                    errorCode: 'media_trtc_system_audio_frames_dropped',
+                    recoverability: 'automatic',
+                    correlation: { callId },
+                    context: { droppedFrames: event.droppedFrames },
+                });
                 return;
             }
             if (event.event === 'error') {
@@ -1674,19 +1714,30 @@ export default function App() {
                     showToast(`TRTC 屏幕控制失败：${result?.error || 'unknown'}`, true);
             },
             onTrtcMediaStatus: (payload) => {
-                if (!trtcActiveRef.current || payload.callId !== currentCallIdRef.current || payload.media !== 'screen')
+                if (!trtcActiveRef.current || payload.callId !== currentCallIdRef.current)
                     return;
-                setScreenStatus(payload.state);
-                setScreenQuality('normal');
-                setScreenQualityLevel(payload.qualityLevel);
-                setScreenControlPending(false);
-                if (payload.reason === 'controller_disabled')
-                    setScreenDesired(false);
-                else if (payload.state === 'available')
-                    setScreenDesired(true);
-                setRemoteReady(payload.state === 'available');
-                if (payload.reason === 'capture_failed')
-                    showToast('对方 TRTC 屏幕或系统声音采集失败', true);
+                if (payload.media === 'screen') {
+                    setScreenStatus(payload.state);
+                    setScreenQuality('normal');
+                    setScreenQualityLevel(payload.qualityLevel);
+                    setScreenControlPending(false);
+                    if (payload.reason === 'controller_disabled')
+                        setScreenDesired(false);
+                    else if (payload.state === 'available')
+                        setScreenDesired(true);
+                    setRemoteReady(payload.state === 'available');
+                    if (payload.reason === 'capture_failed')
+                        showToast('对方 TRTC 屏幕采集失败，声音仍可继续', true);
+                }
+                if (payload.media === 'system-audio') {
+                    setTrtcSystemAudioState({ state: payload.state === 'paused' ? 'unavailable' : payload.state });
+                    if (payload.state === 'unavailable') {
+                        window.desktopPetControl?.trtc?.setRemoteSystemAudioMuted(true);
+                        setRemoteSystemMuted(true);
+                        if (payload.reason === 'capture_failed')
+                            showToast('对方系统声音采集失败，屏幕和麦克风仍可继续', true);
+                    }
+                }
             },
             onCallStart: (callId, peerDeviceId, cameraOffererDeviceId, legacyCameraSenderDeviceId, requestedMediaMode) => {
                 callTargetIdRef.current = peerDeviceId || callTargetIdRef.current;
@@ -1886,16 +1937,17 @@ export default function App() {
         const currentlyMuted = isMic ? remoteMicMuted : remoteSystemMuted;
         const nextMuted = !currentlyMuted;
         if (trtcActiveRef.current) {
-            const remoteUserId = trtcConfigRef.current?.remoteUserId;
-            if (!remoteUserId)
-                return;
-            const result = window.desktopPetControl?.trtc?.setRemoteAudioMuted(remoteUserId, nextMuted);
+            const result = isMic
+                ? window.desktopPetControl?.trtc?.setRemoteMicrophoneMuted(nextMuted)
+                : window.desktopPetControl?.trtc?.setRemoteSystemAudioMuted(nextMuted);
             if (!result?.ok) {
                 showToast(`TRTC 远端声音控制失败：${result?.error || 'unknown'}`, true);
                 return;
             }
-            setRemoteMicMuted(nextMuted);
-            setRemoteSystemMuted(nextMuted);
+            if (isMic)
+                setRemoteMicMuted(nextMuted);
+            else
+                setRemoteSystemMuted(nextMuted);
             return;
         }
         if (isMic)
@@ -2459,6 +2511,7 @@ export default function App() {
     const liveNetworkLevel = networkLevel(rtcNetworkSample);
     const inboundVideo = rtcNetworkSample?.inboundVideo;
     const trtcPublishing = mediaTransport === 'trtc' && !!trtcConfigRef.current?.publishScreen;
+    const trtcRemoteSystemAvailable = mediaTransport === 'trtc' && !!trtcConfigRef.current?.remoteSystemUserId;
     const displayedVideoStats = trtcPublishing ? rtcNetworkSample?.outboundVideo : inboundVideo;
     const effectivePrimary = !cameraHidden && screenStatus !== 'available' && remoteCameraAvailable
         ? 'camera'
@@ -2484,7 +2537,15 @@ export default function App() {
                                                                 setNoteImage(null);
                                                                 setNoteImageName('');
                                                             } if (kind === 'none' || kind === 'image')
-                                                                setNoteLink(''); }, children: ({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind] }, kind)) })] }), noteMediaKind === 'image' && _jsxs("label", { className: "button-like", children: ["\u9009\u62E9\u56FE\u7247", _jsx("input", { hidden: true, type: "file", accept: "image/jpeg,image/png", onChange: (event) => void onSelectNoteImage(event.target.files?.[0]) })] }), _jsx("button", { className: "primary-button large", disabled: status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000, onClick: () => void onSendNote(), children: noteSending ? '投递中…' : `投递给${peerName}` })] })] })), noteSection === 'sent' && _jsxs("section", { className: "note-record-grid", children: [sentNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !sentNotes.length && _jsx("div", { className: "card notes-empty", children: "\u8FD8\u6CA1\u6709\u53D1\u51FA\u7684\u4FBF\u7B7E\u3002" })] }), noteSection === 'history' && _jsxs("section", { className: "note-record-grid", children: [noteHistory.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !noteHistory.length && _jsx("div", { className: "card notes-empty", children: "\u6279\u9605\u540E\u7684\u4FBF\u7B7E\u4F1A\u5728\u8FD9\u91CC\u4FDD\u7559 30 \u5929\u3002" })] }), noteSection === 'favorites' && _jsxs("section", { className: "note-record-grid", children: [favoriteNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !favoriteNotes.length && _jsx("div", { className: "card notes-empty", children: "\u6536\u85CF\u4F1A\u540C\u6B65\u5230\u4F60\u7684\u6240\u6709\u8BBE\u5907\u3002" })] })] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), mediaTransport === 'trtc' ? (_jsxs("label", { children: ["\u5BF9\u65B9\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] })) : _jsxs(_Fragment, { children: [_jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] })] })] }), _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && (_jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) })), _jsx("button", { disabled: cameraControlPending || (!cameraDesired && !cameraCanOpen), onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsxs("small", { children: [cameraRouteState === 'relay-low'
+                                                                setNoteLink(''); }, children: ({ none: '无附件', image: '图片', song: '歌曲链接', video: '视频链接' })[kind] }, kind)) })] }), noteMediaKind === 'image' && _jsxs("label", { className: "button-like", children: ["\u9009\u62E9\u56FE\u7247", _jsx("input", { hidden: true, type: "file", accept: "image/jpeg,image/png", onChange: (event) => void onSelectNoteImage(event.target.files?.[0]) })] }), _jsx("button", { className: "primary-button large", disabled: status !== 'connected' || noteSending || graphemeCount(noteBody) > 1000, onClick: () => void onSendNote(), children: noteSending ? '投递中…' : `投递给${peerName}` })] })] })), noteSection === 'sent' && _jsxs("section", { className: "note-record-grid", children: [sentNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !sentNotes.length && _jsx("div", { className: "card notes-empty", children: "\u8FD8\u6CA1\u6709\u53D1\u51FA\u7684\u4FBF\u7B7E\u3002" })] }), noteSection === 'history' && _jsxs("section", { className: "note-record-grid", children: [noteHistory.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !noteHistory.length && _jsx("div", { className: "card notes-empty", children: "\u6279\u9605\u540E\u7684\u4FBF\u7B7E\u4F1A\u5728\u8FD9\u91CC\u4FDD\u7559 30 \u5929\u3002" })] }), noteSection === 'favorites' && _jsxs("section", { className: "note-record-grid", children: [favoriteNotes.map((note) => _jsx(NoteRecordCard, { note: note, onFavorite: toggleNoteFavorite }, note.id)), !favoriteNotes.length && _jsx("div", { className: "card notes-empty", children: "\u6536\u85CF\u4F1A\u540C\u6B65\u5230\u4F60\u7684\u6240\u6709\u8BBE\u5907\u3002" })] })] })), activeView === 'call' && (_jsxs("main", { className: `page call-page ${callActive ? 'active-call' : ''}`, children: [_jsx("audio", { ref: remoteMicAudioRef, autoPlay: true, muted: remoteMicMuted }), _jsx("audio", { ref: remoteSystemAudioRef, autoPlay: true, muted: remoteSystemMuted }), callActive ? (_jsxs(_Fragment, { children: [!floatContainer && mediaStage, _jsxs("aside", { className: "call-sidebar", children: [_jsxs("section", { className: "card", children: [_jsxs("h2", { children: ["\u6B63\u5728\u548C", peerName, "\u901A\u8BDD"] }), _jsx("p", { children: callState === 'in-call' ? '已连接' : '连接中…' })] }), _jsxs("section", { className: "card", children: [_jsx("h2", { children: "\u901A\u8BDD\u63A7\u5236" }), _jsxs("label", { children: ["\u6211\u7684\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: micEnabled, onChange: toggleLocalMic })] }), _jsxs("label", { children: ["\u5BF9\u65B9\u9EA6\u514B\u98CE", _jsx("input", { type: "checkbox", checked: !remoteMicMuted, onChange: () => void toggleRemoteAudio('mic') })] }), (mediaTransport !== 'trtc' || trtcRemoteSystemAvailable) && (_jsxs("label", { children: ["\u5BF9\u65B9\u7CFB\u7EDF\u58F0\u97F3", _jsx("input", { type: "checkbox", disabled: trtcSystemAudioState.state === 'unavailable', checked: !remoteSystemMuted, onChange: () => void toggleRemoteAudio('system') })] })), trtcPublishing && trtcSystemAudioState.state !== 'idle' && (_jsx("small", { children: trtcSystemAudioState.state === 'starting'
+                                                            ? '系统声音正在启动…'
+                                                            : trtcSystemAudioState.state === 'unavailable'
+                                                                ? `系统声音不可用：${trtcSystemAudioState.error || '未知错误'}`
+                                                                : trtcSystemAudioState.echoExclusion === 'unsupported'
+                                                                    ? `系统声音正在共享；Windows build ${trtcSystemAudioState.windowsBuild || '未知'} 不支持数字回环排除，可能出现回声。`
+                                                                    : trtcSystemAudioState.mode === 'process-exclusion'
+                                                                        ? '系统声音正在共享，并已排除本应用/TRTC 的播放。'
+                                                                        : '系统声音正在共享。' }))] }), _jsxs("section", { className: "card camera-preview-card", children: [_jsxs("div", { className: "section-title", children: [_jsx("h2", { children: "\u6211\u7684\u6444\u50CF\u5934" }), _jsx("button", { onClick: () => setCameraPreviewCollapsed((value) => !value), children: cameraPreviewCollapsed ? '展开预览' : '收起预览' })] }), !cameraPreviewCollapsed && _jsx("video", { ref: bindLocalCameraVideo, autoPlay: true, muted: true, playsInline: true }), cameraDevices.length > 0 && (_jsx("select", { "aria-label": "\u9009\u62E9\u6444\u50CF\u5934", value: selectedCameraId, onChange: (event) => selectCamera(event.target.value), children: cameraDevices.map((device, index) => _jsx("option", { value: device.deviceId, children: device.label || `摄像头 ${index + 1}` }, device.deviceId)) })), _jsx("button", { disabled: cameraControlPending || (!cameraDesired && !cameraCanOpen), onClick: () => void toggleCamera(), children: cameraDesired ? '关闭并释放摄像头' : '打开摄像头' }), _jsxs("small", { children: [cameraRouteState === 'relay-low'
                                                                 ? '摄像头通道使用 TURN，为保证屏幕和声音已关闭。'
                                                                 : cameraRouteState === 'failed'
                                                                     ? '摄像头网络路径不可用，屏幕和声音不受影响。'
