@@ -1,0 +1,6 @@
+{"file":".trellis/spec/desktop-pet/frontend/frontend-and-electron-patterns.md","reason":"Verify bridge isolation, lifecycle cleanup, UI state reset and source-specific controls."}
+{"file":".trellis/spec/desktop-pet/backend/server-and-communication.md","reason":"Verify call-scoped system credentials, authorization failures and acknowledgement behavior."}
+{"file":".trellis/spec/desktop-pet/shared/system-architecture-and-contracts.md","reason":"Verify producer/relay/consumer payload copies remain synchronized."}
+{"file":".trellis/spec/desktop-pet/shared/webrtc-networking-and-deployment.md","reason":"Verify TRTC/WebRTC rollback, cross-platform assets, builds and tests."}
+{"file":".trellis/spec/desktop-pet/shared/diagnostics-and-incidents.md","reason":"Verify no PCM, path, PID or sensitive device data leaks into diagnostics."}
+{"file":".trellis/tasks/08-15-trtc-bidirectional-audio-echo-control/research/trtc-audio-separation-and-aec.md","reason":"Check implementation against pinned TRTC APIs and official Windows exclusion/version constraints."}

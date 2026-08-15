@@ -317,12 +317,12 @@ await applyVideoSenderProfile(
 );
 ```
 
-## 10. Scenario: call-scoped TRTC main media
+## 10. Scenario: call-scoped TRTC screen and independent audio sources
 
 ### 1. Scope / Trigger
 
-- Trigger：修改 `TRTC_MEDIA_MODE`、UserSig、TRTC Electron preload、主屏幕/系统声音媒体层或 WebRTC 回滚路径时。
-- TRTC 只替代主屏幕与音频媒体；Socket.IO call、摄像头按需 WebRTC、房间和控制信令保持原权威边界。
+- Trigger：修改 `TRTC_MEDIA_MODE`、UserSig、TRTC Electron preload、屏幕/麦克风/系统声音路由、Windows 原生音频 helper、音频开关或 WebRTC 回滚路径时。
+- TRTC 只替代主屏幕与音频媒体；Socket.IO call、摄像头按需 WebRTC、房间和控制信令保持原权威边界。屏幕视频与系统声音始终由当前 target 单向发布；双方只对麦克风做全双工发布。
 
 ### 2. Signatures
 
@@ -333,35 +333,50 @@ type CallStart = {
   peerDeviceId:string;
   cameraOffererDeviceId:string;
 };
+type TrtcIdentity = { userId:string; userSig:string };
 type TrtcConfig = {
   ok:true;
   mode:'trtc';
   sdkAppId:number;
   roomId:number;
-  userId:string;
+  userId:string;                 // 本端 main identity
   userSig:string;
   expiresAt:number;
   publishScreen:boolean;
-  remoteUserId:string;
+  remoteUserId:string;           // 对方 main/microphone identity
+  localSystemAudio?:TrtcIdentity; // 仅 target 获得发布凭据
+  remoteSystemUserId?:string;     // 仅 initiator 获得订阅 identity，无 UserSig
   videoProfile:'720p30'|'1080p30';
 };
+type TrtcMediaStatus = {
+  callId:string;
+  media:'screen'|'system-audio';
+  state:'available'|'paused'|'unavailable';
+  reason?:'controller_disabled'|'capture_failed';
+};
+
 socket.emit('trtc:get-config', { callId }, ack);
 socket.emit('trtc:media-status', mediaStatus);
 ```
 
-Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_SECRET_KEY`、`TRTC_USER_SIG_TTL_SEC`（300–3600，默认900）和 `TRTC_VIDEO_PROFILE=720p30|1080p30`。
+Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_SECRET_KEY`、`TRTC_USER_SIG_TTL_SEC`（300–3600，默认900）和 `TRTC_VIDEO_PROFILE=720p30|1080p30`。Electron 可用 `TRTC_SYSTEM_AUDIO_EXCLUSION=disabled` 紧急关闭 Windows 11 系统声音源；该开关不得让 Windows 11 静默退回未排除的整机回环。
 
 ### 3. Contracts
 
-- Server 只有在 mode 为 `trtc` 且 app ID/SecretKey 完整时，才在 `call:start.mediaMode` 宣告 `trtc`；否则宣告 `webrtc`。客户端不得各自静默选择不同媒体层。
-- 旧 server 不提供 `mediaMode` 时客户端立即走 WebRTC，不能先等待未知的 `trtc:get-config` 超时。
-- UserSig 使用 `HMAC-SHA256` 和 zlib `deflate` 的 TLS Sig 2.0 格式。SecretKey 只在 server 环境变量与签名调用栈中出现；客户端、ack 之外的日志、诊断、task和Git不得包含它。
-- TRTC roomId 和 userId 从当前 call/device 单向派生。`trtc:get-config` 只允许当前 call 的 controller；签名短时有效，call end 后即使尚未过期也不再由业务接受新配置请求。
-- 一次通话只由 target device 的内置 control 发布主屏幕辅流与系统声音，initiator control 订阅。每台设备一个 TRTC 身份，pet renderer 不重复进房，避免重复计费和系统声音回路。
-- Native SDK 固定在 control preload 中，通过窄函数桥接给 renderer。Control BrowserWindow 必须保持 `contextIsolation:true`、`nodeIntegration:false`；因 native addon 无法在 sandbox preload 中 `require`，仅该 preload 显式 `sandbox:false`。
-- `trtc-electron-sdk` 必须精确锁版，`app.asar.unpacked` 必须包含 `.node`、`liteav.dll`、`liteav_screen.dll`、`live_kit_engine.dll`、`txffmpeg.dll`、`txsoundtouch.dll` 和 media server。
-- 720p30 使用1800kbps，1080p30使用4000kbps；不得在弱网时降到30fps以下。系统声音 loopback 为核心媒体；麦克风默认采集音量0，用户明确开启后才设为100。
-- TRTC teardown 必须停止屏幕、系统 loopback、本地音频、远端 view并退出房间；camera teardown仍由独立 WebRTC 生命周期负责。
+- Server 只有在 mode 为 `trtc` 且 app ID/SecretKey 完整时，才在 `call:start.mediaMode` 宣告 `trtc`；否则宣告 `webrtc`。旧 server 不提供 `mediaMode` 时立即走 WebRTC，客户端不得各自静默选择不同媒体层。
+- UserSig 使用 `HMAC-SHA256` 和 zlib `deflate` 的 TLS Sig 2.0 格式。SecretKey 只在 server 环境变量与签名调用栈中出现；客户端、日志、诊断、task和Git不得包含它。
+- TRTC roomId、双方 main userId 和 target system userId 都从当前 call/device 单向派生且不暴露原 device ID。`trtc:get-config` 只允许当前 call 的 controller：target 获得 `localSystemAudio.{userId,userSig}`，initiator 只获得同一身份的 `remoteSystemUserId`；system UserSig 不得发给 initiator。
+- 每次通话最多三个 TRTC identity：initiator main、target main、target system。双方 main 都可发布本机麦克风；target main 额外发布屏幕辅流；target system 是 publish-only 子实例，只发布系统声音并在进房前 `setDefaultStreamRecvMode(false,false)`、`muteAllRemoteAudio(true)`。第三身份会增加一路房间用户/纯音频用量，套餐与计费必须以测试房实测为准。
+- Main identity 使用共享实例和 `TRTCAudioQualityDefault`。用户开启“我的麦克风”才 `startLocalAudio()`，关闭时 `stopLocalAudio()`；不得再用 Music quality 或 capture volume 0 伪装关闭，否则会绕开/弱化默认通话 AEC 语义。
+- `remoteUserId` 和 `remoteSystemUserId` 必须分别调用 `muteRemoteAudio()`，不能把两个 UI 开关映射到同一混合 userId。target 只有“对方麦克风”，不得渲染或订阅不存在的“对方系统声音”。本机麦克风、对方麦克风播放和对方系统声音播放在每次新通话都默认关闭，挂断/立即重拨也不得继承。
+- Windows 11（build ≥22000）target system child 启用 custom audio capture。主进程启动固定路径、无 shell 的 x64 helper；helper 使用 WASAPI process loopback `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` 排除 Electron/TRTC 主进程树，输出 48kHz、双声道、s16le、20ms/3840-byte PCM。preload 只把帧注入 system child，绝不能送到 main identity。
+- Windows 10 target system child 继续使用 TRTC 原生空路径 system loopback，并标记 `echoExclusion:'unsupported'`；系统声音仍可用，数字回声不作为该平台失败。macOS 也继续使用 TRTC 原生 system loopback，免提回声消除不是验收门槛，但双向麦克风和独立远端开关必须工作。
+- Windows 11 helper 缺失、协议错、提前退出或 custom send 失败时，system source fail closed 为 unavailable；不得退回整机回环，也不得把 screen 标为 unavailable。主麦克风、远端麦克风和屏幕继续工作。
+- helper 只接受固定 PID/采样率/声道/frame-ms 参数，不访问网络、不写 PCM。native stdout 队列、协议 decoder 和主进程→preload IPC 都必须有界；IPC 同时只投送一帧、等待 preload acknowledgement，最多缓存8帧并丢最旧帧。诊断只记录 protocol、generation、状态、错误和 drop count，不记录 PID、路径、设备名或 PCM。
+- 所有 main/system/helper continuation 都必须同时受 call generation 和具体实例 identity 保护；同 generation 重启 helper 时，旧进程的 stdout/stderr/error/exit 不能停止新进程。停止顺序为 helper/custom capture或原生 loopback → system child exit/destroy → screen/mic/remote view → main exit/destroy，且每步幂等。
+- Native SDK 固定在 control preload，通过窄桥给 renderer；BrowserWindow 保持 `contextIsolation:true`、`nodeIntegration:false`。helper 进程、固定资源路径和 root PID 只归 Electron main，renderer 不获得 `child_process`/文件系统能力。
+- Windows release 必须先以 `/W4 /WX` 构建 helper、校验 PE x64，再由 platform-specific `extraResources` 放到 `resources/native/desktop-pet-process-loopback.exe`。macOS 不构建、不打包、不加载该 exe。`trtc-electron-sdk` 继续精确锁版并完整 unpack native assets。
+- 720p30 使用1800kbps，1080p30使用4000kbps；不得在弱网时降到30fps以下。TRTC camera 仍不在本路径，camera teardown由独立 WebRTC 生命周期负责。
 
 ### 4. Validation & Error Matrix
 
@@ -369,50 +384,56 @@ Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_
 | --- | --- |
 | mode=trtc 但 app ID/SecretKey 缺失 | `call:start.mediaMode=webrtc`，不签发 UserSig |
 | 非 controller、未加入或错误/过期 call | `not_joined` / `not_in_call` / `not_allowed` |
-| SDK 未打包或 preload 加载失败 | 本次 call 显示受控 TRTC 错误；不得单端静默回退 |
-| UserSig userId 超过32字节、TTL越界 | server 签名 helper 拒绝 |
-| TRTC 进房返回负 elapsed | call 进入 error，记录无凭证诊断 |
-| 系统声音 loopback 失败 | 上报 capture failure，画面/错误状态可独立观察 |
-| target 以外 controller 伪造 TRTC screen status | server 丢弃，不向观看端泄漏 |
-| call end/socket disconnect | 两端退出TRTC并释放所有native capture/view资源 |
+| initiator 请求 system 发布凭据 | 不返回 `localSystemAudio`；只返回无签名的 `remoteSystemUserId` |
+| target config 缺失/非法 system identity | preload 拒绝 `invalid_trtc_config`，不启动屏幕/system child |
+| TRTC main 进房返回负 elapsed | call 进入 error，记录无凭证诊断 |
+| Windows build <22000 | 使用 TRTC 整机 loopback并标记 `unsupported`，不得关闭系统声音 |
+| Windows 11 helper 缺失、协议错、提前退出或 kill switch关闭 | system-audio unavailable；屏幕与双向麦克风保持；不做未排除回退 |
+| system child/loopback/custom PCM失败 | 只上报 `media:'system-audio'` capture failure；screen status不变 |
+| PCM header/payload不是协议v1或3840 bytes | 丢弃并停止该system source，不送入main/system cloud |
+| 迟到 old-call callback 或同generation旧helper事件 | 丢弃，只能清理其自身资源，不改变当前call/source |
+| 非target伪造 screen/system status | server 丢弃，不向观看端泄漏 |
+| call end、导航、renderer崩溃或app退出 | 停止helper/capture/playout，销毁child/main并清listener/IPC队列 |
 
 ### 5. Good/Base/Bad Cases
 
-- Good：新加坡 initiator 调用中国 target；两端收到同一TRTC room，只有中国 control 发布720p30/1080p30和系统声音，新加坡显示辅流、RTT/丢包/FPS，camera仍按需P2P。
-- Base：Server默认 `webrtc` 或旧 server 无 `mediaMode`，客户端立即保持原主PC行为；TRTC SDK不创建房间和计费。
-- Bad：SecretKey放进preload；pet/control各进一次房；双方分别判断失败并一端TRTC一端WebRTC；为了加载SDK开启renderer `nodeIntegration`；只检查asar而漏打包DLL。
+- Good：Windows 11 target 同时播放外部游戏声音和 TRTC 远端人声；system child 只上行外部声音。双方 main 麦克风可同时开启并由默认通话 AEC 处理声学回声，initiator 可独立组合收听 target mic/system。
+- Base：Windows 10 target 继续无选择地共享整机声音并明确提示可能数字回声；macOS 保持原生 loopback。三项音频开关每次进房均为off，用户逐项开启。
+- Bad：把 system loopback 和麦克风放在同一 identity；两个远端按钮共同 mute 同一 userId；Windows 11 helper失败后回退整机采集；child播放远端声音；renderer直接spawn exe；IPC无限堆积PCM。
 
 ### 6. Tests Required
 
-- UserSig unit：固定时间解压字段、重算HMAC、拒绝非法输入，并与腾讯官方 generator 的解码JSON一致。
-- Server integration：两端config同room、互指remote user、只有target `publishScreen=true`、身份不含原device ID；wrong role/stale call拒绝；TRTC control/status不跨设备泄漏。
-- Electron unit/smoke：断言窄preload、renderer Node禁用/context隔离、SDK真实加载并报告版本；固定30fps、系统loopback和麦克风音量语义。
-- Package：检查 `app.asar.unpacked/node_modules/trtc-electron-sdk/build/Release` 的完整native文件集合。
-- Build：server/pet tests、web/pet TypeScript build；双机完成中国→新加坡30分钟720p30和1080p30实测。
+- UserSig/server：固定时间解压并重算HMAC；两端config同room且main互指；system identity稳定、无原device ID；target独占system UserSig，initiator只拿remote ID；wrong role/stale call拒绝；screen/system status分别隔离。
+- Bridge behavior：main与system child分离；child publish-only；mic使用Default quality；远端mic/system映射不同userId；全部默认off；custom PCM只进当前system child；hangup/redial迟到continuation不复活；failure只销毁system source。
+- Helper/IPC：Win build gate、协议partial/coalesced/invalid、同generation restart旧事件隔离、bounded queue/drop/ack、无效generation拒绝、parent/stdin退出与资源清理。
+- Package/CI：Windows `/W4 /WX` Release build、PE x64校验、安装包固定helper路径/runtime smoke；macOS产物不含exe且仍包含TRTC native addon。
+- 自动化：`npm test --prefix server`、`npm test --prefix pet`、`npm run build:web`、`npm run build:pet`、`git diff --check`。
+- 双机：Windows 11↔Windows 11 10分钟扬声器全双工与四种远端收听组合、外部应用声/远端人声排除对照、30分钟capture稳定性；Windows 10 fallback；Windows↔macOS双向mic/单向system/独立开关；权限拒绝、设备拔出和窗口关闭；测试房第三identity用量。
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```js
-contextBridge.exposeInMainWorld('secret', process.env.TRTC_SECRET_KEY);
-webPreferences: { nodeIntegration: true };
-const mode = localSdkExists ? 'trtc' : 'webrtc'; // 两端可能分叉
-gzipSync(userSigJson); // TRTC TLS Sig 2.0 要求 deflate
+main.startLocalAudio(TRTCAudioQualityMusic);
+main.startSystemAudioLoopback();
+main.setAudioCaptureVolume(micEnabled ? 100 : 0);
+setRemoteAudioMuted(mainUserId, muted); // mic/system仍是同一混合流
+if (helperFailed) systemChild.startSystemAudioLoopback(); // Windows 11静默失去排除
+ipcRenderer.send('spawn-helper', arbitraryPath);
 ```
 
 #### Correct
 
 ```js
-const mediaMode = trtcReady() ? 'trtc' : 'webrtc';
-io.to(controller).emit('call:start', { callId, mediaMode });
-webPreferences: {
-  preload: controlPreload,
-  contextIsolation: true,
-  nodeIntegration: false,
-  sandbox: false, // 仅为 preload require native addon
-}
-const compressed = deflateSync(Buffer.from(JSON.stringify(userSigDocument)));
+main.startLocalAudio(TRTCAudioQualityDefault);
+main.muteRemoteAudio(remoteMainUserId, remoteMicMuted);
+main.muteRemoteAudio(remoteSystemUserId, remoteSystemMuted);
+systemChild.setDefaultStreamRecvMode(false, false);
+systemChild.muteAllRemoteAudio(true);
+systemChild.enableCustomAudioCapture(true); // Windows 11 only
+systemChild.sendCustomAudioData(frame48kStereo20ms);
+if (helperFailed) emitSystemState('unavailable'); // screen/main保持
 ```
 
 ## 11. Scenario: TRTC cross-platform release assets

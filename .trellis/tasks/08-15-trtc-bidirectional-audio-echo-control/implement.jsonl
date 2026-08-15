@@ -1,0 +1,7 @@
+{"file":".trellis/spec/desktop-pet/frontend/frontend-and-electron-patterns.md","reason":"Electron main/preload ownership, IPC security, React state and generated JS conventions."}
+{"file":".trellis/spec/desktop-pet/backend/server-and-communication.md","reason":"TRTC config signing, call membership, role validation and server test conventions."}
+{"file":".trellis/spec/desktop-pet/shared/system-architecture-and-contracts.md","reason":"Cross-runtime config and control contracts across server, web and Electron."}
+{"file":".trellis/spec/desktop-pet/shared/webrtc-networking-and-deployment.md","reason":"Existing TRTC identity, UserSig, media fallback, packaging and release invariants."}
+{"file":".trellis/spec/desktop-pet/shared/diagnostics-and-incidents.md","reason":"Native helper/source diagnostics envelope and privacy boundaries."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace every new identity, source state, IPC and Socket.IO field end to end."}
+{"file":".trellis/tasks/08-15-trtc-bidirectional-audio-echo-control/research/trtc-audio-separation-and-aec.md","reason":"Pinned SDK contracts plus Microsoft process-loopback exclusion evidence and PCM requirements."}
