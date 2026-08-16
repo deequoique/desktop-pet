@@ -367,6 +367,7 @@ Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_
 - UserSig 使用 `HMAC-SHA256` 和 zlib `deflate` 的 TLS Sig 2.0 格式。SecretKey 只在 server 环境变量与签名调用栈中出现；客户端、日志、诊断、task和Git不得包含它。
 - TRTC roomId、双方 main userId 和 target system userId 都从当前 call/device 单向派生且不暴露原 device ID。`trtc:get-config` 只允许当前 call 的 controller：target 获得 `localSystemAudio.{userId,userSig}`，initiator 只获得同一身份的 `remoteSystemUserId`；system UserSig 不得发给 initiator。
 - 每次通话最多三个 TRTC identity：initiator main、target main、target system。双方 main 都可发布本机麦克风；target main 额外发布屏幕辅流；target system 是 publish-only 子实例，只发布系统声音并在进房前 `setDefaultStreamRecvMode(false,false)`、`muteAllRemoteAudio(true)`。第三身份会增加一路房间用户/纯音频用量，套餐与计费必须以测试房实测为准。
+- “publish-only system child”只约束 child 自身，不会阻止 target main 把同房间的 `localSystemAudio.userId` 当作远端用户自动订阅。target main 必须在进房前、main/system child 进房成功及连接恢复时永久执行 `muteRemoteAudio(localSystemAudio.userId,true)`；该身份不得进入任何可解除静音的 UI/API 路径。远端音频开关失败时必须回滚期望状态，挂断/重拨恢复默认关闭，旧通话回调不得重套策略。
 - Main identity 使用共享实例和 `TRTCAudioQualityDefault`。用户开启“我的麦克风”才 `startLocalAudio()`，关闭时 `stopLocalAudio()`；不得再用 Music quality 或 capture volume 0 伪装关闭，否则会绕开/弱化默认通话 AEC 语义。
 - `remoteUserId` 和 `remoteSystemUserId` 必须分别调用 `muteRemoteAudio()`，不能把两个 UI 开关映射到同一混合 userId。target 只有“对方麦克风”，不得渲染或订阅不存在的“对方系统声音”。本机麦克风、对方麦克风播放和对方系统声音播放在每次新通话都默认关闭，挂断/立即重拨也不得继承。
 - Windows 11（build ≥22000）target system child 启用 custom audio capture。主进程启动固定路径、无 shell 的 x64 helper；helper 使用 WASAPI process loopback `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` 排除 Electron/TRTC 主进程树，输出 48kHz、双声道、s16le、20ms/3840-byte PCM。preload 只把帧注入 system child，绝不能送到 main identity。
@@ -386,6 +387,7 @@ Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_
 | 非 controller、未加入或错误/过期 call | `not_joined` / `not_in_call` / `not_allowed` |
 | initiator 请求 system 发布凭据 | 不返回 `localSystemAudio`；只返回无签名的 `remoteSystemUserId` |
 | target config 缺失/非法 system identity | preload 拒绝 `invalid_trtc_config`，不启动屏幕/system child |
+| target main 看到自己的 system child identity | 始终 `muteRemoteAudio(localSystemAudio.userId,true)`；进房/恢复均重套，任何远端开关都不能解除 |
 | TRTC main 进房返回负 elapsed | call 进入 error，记录无凭证诊断 |
 | Windows build <22000 | 使用 TRTC 整机 loopback并标记 `unsupported`，不得关闭系统声音 |
 | Windows 11 helper 缺失、协议错、提前退出或 kill switch关闭 | system-audio unavailable；屏幕与双向麦克风保持；不做未排除回退 |
@@ -397,14 +399,14 @@ Server 环境变量：`TRTC_MEDIA_MODE=webrtc|trtc`、`TRTC_SDK_APP_ID`、`TRTC_
 
 ### 5. Good/Base/Bad Cases
 
-- Good：Windows 11 target 同时播放外部游戏声音和 TRTC 远端人声；system child 只上行外部声音。双方 main 麦克风可同时开启并由默认通话 AEC 处理声学回声，initiator 可独立组合收听 target mic/system。
+- Good：Windows 11 target 同时播放外部游戏声音和 TRTC 远端人声；system child 只上行外部声音，target main 永久静音自己的 system child identity。双方 main 麦克风可同时开启并由默认通话 AEC 处理声学回声，initiator 可独立组合收听 target mic/system。
 - Base：Windows 10 target 继续无选择地共享整机声音并明确提示可能数字回声；macOS 保持原生 loopback。三项音频开关每次进房均为off，用户逐项开启。
-- Bad：把 system loopback 和麦克风放在同一 identity；两个远端按钮共同 mute 同一 userId；Windows 11 helper失败后回退整机采集；child播放远端声音；renderer直接spawn exe；IPC无限堆积PCM。
+- Bad：把 system loopback 和麦克风放在同一 identity；两个远端按钮共同 mute 同一 userId；只把 system child 设为 publish-only，却允许 target main 自动订阅自己的 child identity；Windows 11 helper失败后回退整机采集；child播放远端声音；renderer直接spawn exe；IPC无限堆积PCM。
 
 ### 6. Tests Required
 
 - UserSig/server：固定时间解压并重算HMAC；两端config同room且main互指；system identity稳定、无原device ID；target独占system UserSig，initiator只拿remote ID；wrong role/stale call拒绝；screen/system status分别隔离。
-- Bridge behavior：main与system child分离；child publish-only；mic使用Default quality；远端mic/system映射不同userId；全部默认off；custom PCM只进当前system child；hangup/redial迟到continuation不复活；failure只销毁system source。
+- Bridge behavior：main与system child分离；child publish-only；target main 在进房、child进房及连接恢复后始终静音自己的system identity且不能由API解除；mic使用Default quality；远端mic/system映射不同userId并在失败时回滚；全部默认off；custom PCM只进当前system child；hangup/redial迟到continuation不复活；failure只销毁system source。
 - Helper/IPC：Win build gate、协议partial/coalesced/invalid、同generation restart旧事件隔离、bounded queue/drop/ack、无效generation拒绝、parent/stdin退出与资源清理。
 - Package/CI：Windows `/W4 /WX` Release build、PE x64校验、安装包固定helper路径/runtime smoke；macOS产物不含exe且仍包含TRTC native addon。
 - 自动化：`npm test --prefix server`、`npm test --prefix pet`、`npm run build:web`、`npm run build:pet`、`git diff --check`。
@@ -429,6 +431,7 @@ ipcRenderer.send('spawn-helper', arbitraryPath);
 main.startLocalAudio(TRTCAudioQualityDefault);
 main.muteRemoteAudio(remoteMainUserId, remoteMicMuted);
 main.muteRemoteAudio(remoteSystemUserId, remoteSystemMuted);
+targetMain.muteRemoteAudio(localSystemAudioUserId, true); // 永久，不暴露解除路径
 systemChild.setDefaultStreamRecvMode(false, false);
 systemChild.muteAllRemoteAudio(true);
 systemChild.enableCustomAudioCapture(true); // Windows 11 only
