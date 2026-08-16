@@ -85,6 +85,23 @@ function createTrtcPreloadBridge(options = {}) {
     record.cloud.muteRemoteAudio(activeConfig.localSystemAudio.userId, true);
   };
 
+  const enableDefaultSpeakerFollowing = (record) => {
+    if (!record || !isCurrent(record)) return;
+    try {
+      const trtcSdk = loadSdk();
+      record.cloud.enableFollowingDefaultAudioDevice(
+        trtcSdk.TRTCDeviceType.TRTCDeviceTypeSpeaker,
+        true,
+      );
+      emit('audio-output-follow-state', { state: 'available' });
+    } catch (error) {
+      emit('audio-output-follow-state', {
+        state: 'unavailable',
+        error: 'enable_following_default_audio_device_failed',
+      });
+    }
+  };
+
   const stopNativeTransport = (recordGeneration) => {
     try {
       const pending = systemAudioTransport?.stop(recordGeneration);
@@ -119,6 +136,7 @@ function createTrtcPreloadBridge(options = {}) {
     cloud.on('onTryToReconnect', () => { if (isCurrent(record)) emit('reconnecting'); });
     cloud.on('onConnectionRecovery', () => {
       if (!isCurrent(record)) return;
+      enableDefaultSpeakerFollowing(record);
       const policy = applyMainRemoteAudioPolicy(record);
       if (policy.localSystemError && systemRecord) {
         failSystemIdentity(systemRecord, 'local_system_audio_mute_failed');
@@ -434,6 +452,7 @@ function createTrtcPreloadBridge(options = {}) {
         params.userId = userId;
         params.userSig = userSig;
         instance.setDefaultStreamRecvMode(true, true);
+        enableDefaultSpeakerFollowing(mainRecord);
         const policy = applyMainRemoteAudioPolicy(mainRecord);
         if (policy.firstError) throw policy.firstError;
         instance.enterRoom(params, loadSdk().TRTCAppScene.TRTCAppSceneAudioCall);

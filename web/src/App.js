@@ -99,6 +99,16 @@ function pairingErrorMessage(code) {
     };
     return messages[code || ''] || '操作失败，请重试';
 }
+function callStartErrorMessage(code) {
+    const messages = {
+        peer_not_ready: '对方或本机的二合一客户端尚未就绪',
+        call_busy: '已有其他通话正在进行',
+        timeout: '创建通话超时，请重试',
+        disconnected: '当前未连接服务器',
+        not_joined: '当前设备尚未加入房间',
+    };
+    return messages[code || ''] || '服务器无法创建通话';
+}
 function noteErrorMessage(code) {
     const messages = {
         disconnected: '尚未连接服务器',
@@ -687,6 +697,20 @@ export default function App() {
             if (event.event === 'connection-recovered') {
                 setRtcRoute({ candidateType: 'trtc', relayed: true, path: 'TRTC 云端', detail: 'TRTC 连接已恢复' });
                 setCallState('in-call');
+                return;
+            }
+            if (event.event === 'audio-output-follow-state') {
+                recordControlDiagnostic({
+                    event: 'media.trtc-audio-output-follow-state',
+                    domain: 'media',
+                    level: event.state === 'unavailable' ? 'warn' : 'info',
+                    ...(event.state === 'unavailable' ? {
+                        errorCode: 'media_trtc_audio_output_follow_unavailable',
+                        recoverability: 'automatic',
+                    } : {}),
+                    correlation: { callId },
+                    context: { state: event.state, error: event.error },
+                });
                 return;
             }
             if (event.event === 'system-audio-state') {
@@ -1651,13 +1675,15 @@ export default function App() {
                     showToast(`摄像头连接失败：${error?.message || error}`, true);
                 });
             },
-            onHangup: () => {
-                if (!currentCallIdRef.current)
+            onHangup: (callId) => {
+                if (!callId || callId !== currentCallIdRef.current)
                     return;
                 teardownCall({ nextState: 'idle' });
                 showToast('通话结束了');
             },
-            onRtcError: (msg) => {
+            onRtcError: (msg, callId) => {
+                if (!callId || callId !== currentCallIdRef.current)
+                    return;
                 showToast(msg, true);
                 teardownCall({ nextState: 'error' });
             },
@@ -1755,11 +1781,18 @@ export default function App() {
                     teardownCall({ nextState: 'error' });
                 });
             },
-            onCallEnd: (callId) => {
-                if (callId && currentCallIdRef.current && callId !== currentCallIdRef.current)
+            onCallEnd: (callId, reason, transferredMemberId) => {
+                if (!callId || callId !== currentCallIdRef.current)
                     return;
                 teardownCall({ nextState: 'idle' });
-                showToast('通话结束了');
+                if (reason === 'transferred') {
+                    showToast(transferredMemberId === memberId
+                        ? '通话已切换到你的另一台设备'
+                        : '对方正在切换通话设备');
+                }
+                else {
+                    showToast('通话结束了');
+                }
             },
             onTtsStatus: (payload) => {
                 const labels = {
@@ -2452,16 +2485,41 @@ export default function App() {
             setCallState('requesting-media');
             callTargetIdRef.current = callTargetId;
             setActiveView('call');
+            recordControlDiagnostic({
+                event: 'call.start-requested',
+                domain: 'call',
+                level: 'info',
+                correlation: { deviceId: participantId },
+            });
             const result = await requestCall(callTargetId);
-            if (!result.ok)
-                throw new Error(result.code === 'peer_not_ready' ? '对方二合一客户端尚未就绪' : '无法创建通话');
+            if (!result.ok) {
+                recordControlDiagnostic({
+                    event: 'call.start-rejected',
+                    domain: 'call',
+                    level: 'warn',
+                    errorCode: `call_start_${result.code || 'failed'}`,
+                    recoverability: 'retryable',
+                    correlation: { deviceId: participantId },
+                    context: { code: result.code || 'failed' },
+                });
+                throw new Error(callStartErrorMessage(result.code));
+            }
+            recordControlDiagnostic({
+                event: result.transferred ? 'call.handoff-accepted' : 'call.start-accepted',
+                domain: 'call',
+                level: 'info',
+                correlation: { deviceId: participantId, callId: result.callId },
+                context: { transferred: !!result.transferred },
+            });
+            if (result.transferred)
+                showToast('正在把通话切换到此设备…');
         }
         catch (e) {
             console.warn('[webrtc] startCall failed:', e);
             showToast(`开通话失败：${e?.message || e}`, true);
             teardownCall({ nextState: 'error' });
         }
-    }, [callTargetId, canCall, showToast, teardownCall]);
+    }, [callTargetId, canCall, participantId, showToast, teardownCall]);
     const onEndCall = useCallback(() => {
         teardownCall({ sendRemoteHangup: true, nextState: 'idle' });
     }, [teardownCall]);

@@ -55,12 +55,35 @@
 - [ ] 故障矩阵：mic permission denied、helper unavailable、Windows 10 旧 loopback 路径、device change、TRTC reconnect、窗口关闭和立即重拨。
 - [ ] 计量测试房的第三 identity 音频用量，记录观察值和套餐影响。
 
+## Phase 7 — Explicit same-member device handoff
+
+- [x] 在 `server/src/index.js` 抽取可复用的 call 创建/结束 helper；`call:start` 分类 normal/idempotent/handoff/busy，handoff 只允许同 member 新设备替换当前端点且目标仍是当前对端。
+- [x] handoff 预检新设备与对端 pet/controller 完整在线，保留 initiator/target 角色，生成新 call ID；按旧 `call:end(reason:'transferred')` → 新 `call:start` 顺序投递，并返回 `transferred:true`。
+- [x] 为所有挂断、媒体控制/状态和信令入口补齐 current call ID + endpoint membership 校验；旧设备迟到事件不能结束或修改新通话。
+- [x] 更新 `web/src/api.ts` / `App.tsx` 的 transfer payload、提示和错误码映射；仅点击开始触发接管，旧设备/当前对端显示不同的切换提示，生成 JS 只由正式构建同步。
+- [x] 扩展 server 测试：initiator 替换、target 替换与屏幕角色保持；幂等重复；真实 busy；未就绪/错误成员/错误目标拒绝；join/reconnect 不抢占；旧 call 的 end/hangup/signal/status 全部隔离。
+
+## Phase 8 — System-default audio output following
+
+- [x] 在 TRTC preload bridge 的 main instance 进房前调用 `enableFollowingDefaultAudioDevice(TRTCDeviceTypeSpeaker, true)`，连接恢复时对当前 generation 重套；system child 不调用。
+- [x] 添加无设备名称的 output-follow available/unavailable 诊断，SDK 调用失败保持主通话和各媒体源运行。
+- [x] 扩展 fake SDK 行为测试：Windows/macOS 共用路径、speaker/true 参数、enterRoom 前顺序、reconnect 重套、旧回调隔离及失败不阻断。
+
+## Phase 9 — Handoff/output validation
+
+- [x] 运行 `npm test --prefix server`、`npm test --prefix pet`、`npm run build:web`、`npm run build:pet` 与 `git diff --check`。
+- [ ] Windows 与 macOS 分别验证：通话中从系统设置切换内置扬声器、耳机/蓝牙或显示器音频，远端麦克风/系统声音立即跟随，订阅开关不变。
+- [ ] 三设备验证：A1↔B 通话中 A2 明确点击开始，1–3 秒内 A1 完整退出、A2↔B 建立新 call；反向替换 target 时新设备承担屏幕/系统声音角色。
+- [ ] 故障验证：新设备未就绪时旧通话保持；切换提交后的旧 call 回调/旧设备挂断无效；真实其他通话仍返回清晰 busy 提示。
+
 ## Risky Files and Rollback Points
 
 - `pet/src/main/trtc-preload-bridge.js`：主要并发/资源风险；先落 session generation + tests，再接 native PCM。
 - `pet/native/windows-process-loopback/`：隐私和稳定性边界；POC 与 helper kill switch 是首要回滚点。
 - `server/src/index.js`：凭据边界；任何 role/TTL 测试失败不得部署。
 - `web/src/App.tsx`：状态漂移风险；每个状态必须能追到 bridge 的独立 userId。
+- `server/src/index.js` / `web/src/api.ts`：handoff 事件顺序与 call ID 权威边界；必须先证明旧 call 事件不能结束新 call，再开放自动接管。
+- `pet/src/main/trtc-preload-bridge.js`：默认输出跟随只属于 main playout；不得应用到 publish-only system child，失败不得升级成全通话错误。
 - `pet/package.json` / release workflow：缺 helper 的安装包必须 fail build，不能运行时才发现。
 
 ## Before `task.py start`

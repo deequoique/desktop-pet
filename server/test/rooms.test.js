@@ -86,6 +86,8 @@ try {
 
   await new Promise((resolve) => aController.socket.emit('room:rename-member', { memberId: 'b', displayName: '小明' }, resolve));
   const aController2 = await join({ role: 'controller', memberId: 'a', deviceId: 'a-phone' });
+  const aPet2 = await join({ role: 'pet', memberId: 'a', deviceId: 'a-phone' });
+  const bController2 = await join({ role: 'controller', memberId: 'b', deviceId: 'b-tablet' });
   const renamed = aController2.response.peers;
   assert.equal(renamed.members.find((member) => member.id === 'b').displayName, '小明');
   assert.equal(renamed.members.find((member) => member.id === 'b').devices.length, 2);
@@ -287,6 +289,144 @@ try {
   assert.equal(unrelatedStatusReceived, false);
 
   aController.socket.emit('call:end', { callId: started.callId });
+  await wait(20);
+
+  const handoffBaseAStart = once(aController.socket, 'call:start');
+  const handoffBaseBStart = once(bController1.socket, 'call:start');
+  const handoffBase = await emitAck(aController.socket, 'call:start', { targetDeviceId: 'b-pc' });
+  assert.equal(handoffBase.ok, true);
+  await Promise.all([handoffBaseAStart, handoffBaseBStart]);
+
+  const wrongTargetBusy = await emitAck(aController2.socket, 'call:start', { targetDeviceId: 'b-tablet' });
+  assert.deepEqual(wrongTargetBusy, { ok: false, code: 'call_busy' });
+  assert.equal((await emitAck(aController.socket, 'trtc:get-config', { callId: handoffBase.callId })).ok, true);
+
+  let joinTriggeredHandoff = false;
+  const onUnexpectedHandoff = (payload) => {
+    if (payload?.callId === handoffBase.callId && payload?.reason === 'transferred') joinTriggeredHandoff = true;
+  };
+  aController.socket.on('call:end', onUnexpectedHandoff);
+  const incompleteController = await join({ role: 'controller', memberId: 'a', deviceId: 'a-watch' });
+  await wait(20);
+  aController.socket.off('call:end', onUnexpectedHandoff);
+  assert.equal(joinTriggeredHandoff, false);
+  assert.deepEqual(await emitAck(incompleteController.socket, 'call:start', { targetDeviceId: 'b-pc' }), {
+    ok: false, code: 'peer_not_ready',
+  });
+  assert.equal((await emitAck(aController.socket, 'trtc:get-config', { callId: handoffBase.callId })).ok, true);
+
+  const oldAEnd = once(aController.socket, 'call:end');
+  const peerEndForA = once(bController1.socket, 'call:end');
+  const newAStart = once(aController2.socket, 'call:start');
+  const peerRestartForA = once(bController1.socket, 'call:start');
+  const initiatorHandoff = await emitAck(aController2.socket, 'call:start', { targetDeviceId: 'b-pc' });
+  assert.equal(initiatorHandoff.ok, true);
+  assert.equal(initiatorHandoff.transferred, true);
+  assert.notEqual(initiatorHandoff.callId, handoffBase.callId);
+  const [oldAEndPayload, peerEndForAPayload, newAStartPayload, peerRestartForAPayload] = await Promise.all([
+    oldAEnd, peerEndForA, newAStart, peerRestartForA,
+  ]);
+  for (const payload of [oldAEndPayload, peerEndForAPayload]) {
+    assert.equal(payload.callId, handoffBase.callId);
+    assert.equal(payload.reason, 'transferred');
+    assert.equal(payload.transferredMemberId, 'a');
+  }
+  assert.equal(newAStartPayload.callId, initiatorHandoff.callId);
+  assert.equal(newAStartPayload.peerDeviceId, 'b-pc');
+  assert.equal(newAStartPayload.cameraOffererDeviceId, 'a-phone');
+  assert.equal(newAStartPayload.cameraSenderDeviceId, 'b-pc');
+  assert.equal(peerRestartForAPayload.peerDeviceId, 'a-phone');
+  assert.equal(peerRestartForAPayload.cameraOffererDeviceId, 'a-phone');
+  assert.equal(peerRestartForAPayload.cameraSenderDeviceId, 'b-pc');
+
+  let staleHandoffLeak = false;
+  const onStaleHandoffLeak = () => { staleHandoffLeak = true; };
+  bController1.socket.on('webrtc:camera-signal', onStaleHandoffLeak);
+  bController1.socket.on('webrtc:media-status', onStaleHandoffLeak);
+  bPet1.socket.on('webrtc:signal', onStaleHandoffLeak);
+  bPet1.socket.on('webrtc:error', onStaleHandoffLeak);
+  aController.socket.emit('call:end', { callId: handoffBase.callId });
+  aController.socket.emit('webrtc:hangup', { callId: handoffBase.callId });
+  aController.socket.emit('webrtc:signal', {
+    callId: handoffBase.callId, description: { type: 'offer', sdp: 'stale-main-offer' },
+  });
+  aController.socket.emit('webrtc:error', {
+    callId: handoffBase.callId, message: 'stale-error',
+  });
+  aController.socket.emit('webrtc:camera-signal', {
+    callId: handoffBase.callId, description: { type: 'offer', sdp: 'stale-handoff-offer' },
+  });
+  aController.socket.emit('webrtc:media-status', {
+    callId: handoffBase.callId, media: 'camera', state: 'available',
+  });
+  await wait(20);
+  bController1.socket.off('webrtc:camera-signal', onStaleHandoffLeak);
+  bController1.socket.off('webrtc:media-status', onStaleHandoffLeak);
+  bPet1.socket.off('webrtc:signal', onStaleHandoffLeak);
+  bPet1.socket.off('webrtc:error', onStaleHandoffLeak);
+  assert.equal(staleHandoffLeak, false);
+  assert.equal((await emitAck(aController.socket, 'webrtc:media-control', {
+    callId: handoffBase.callId, media: 'screen', enabled: false,
+  })).code, 'not_in_call');
+  assert.equal((await emitAck(aController2.socket, 'trtc:get-config', { callId: initiatorHandoff.callId })).ok, true);
+  assert.equal((await emitAck(bController1.socket, 'trtc:get-config', { callId: initiatorHandoff.callId })).ok, true);
+  aController2.socket.emit('webrtc:hangup');
+  await wait(20);
+  assert.equal((await emitAck(aController2.socket, 'trtc:get-config', { callId: initiatorHandoff.callId })).ok, true);
+  aController2.socket.emit('call:end', { callId: initiatorHandoff.callId });
+  await wait(20);
+
+  const targetBaseAStart = once(aController.socket, 'call:start');
+  const targetBaseBStart = once(bController1.socket, 'call:start');
+  const targetBase = await emitAck(aController.socket, 'call:start', { targetDeviceId: 'b-pc' });
+  await Promise.all([targetBaseAStart, targetBaseBStart]);
+  const peerEndForB = once(aController.socket, 'call:end');
+  const oldBEnd = once(bController1.socket, 'call:end');
+  const peerRestartForB = once(aController.socket, 'call:start');
+  const newBStart = once(bController2.socket, 'call:start');
+  const targetHandoff = await emitAck(bController2.socket, 'call:start', { targetDeviceId: 'a-laptop' });
+  assert.equal(targetHandoff.ok, true);
+  assert.equal(targetHandoff.transferred, true);
+  assert.notEqual(targetHandoff.callId, targetBase.callId);
+  const [peerEndForBPayload, oldBEndPayload, peerRestartForBPayload, newBStartPayload] = await Promise.all([
+    peerEndForB, oldBEnd, peerRestartForB, newBStart,
+  ]);
+  for (const payload of [peerEndForBPayload, oldBEndPayload]) {
+    assert.equal(payload.callId, targetBase.callId);
+    assert.equal(payload.reason, 'transferred');
+    assert.equal(payload.transferredMemberId, 'b');
+  }
+  assert.equal(peerRestartForBPayload.peerDeviceId, 'b-tablet');
+  assert.equal(peerRestartForBPayload.cameraOffererDeviceId, 'a-laptop');
+  assert.equal(peerRestartForBPayload.cameraSenderDeviceId, 'b-tablet');
+  assert.equal(newBStartPayload.peerDeviceId, 'a-laptop');
+  assert.equal(newBStartPayload.cameraOffererDeviceId, 'a-laptop');
+  assert.equal(newBStartPayload.cameraSenderDeviceId, 'b-tablet');
+  const [handoffATrtc, handoffBTrtc] = await Promise.all([
+    emitAck(aController.socket, 'trtc:get-config', { callId: targetHandoff.callId }),
+    emitAck(bController2.socket, 'trtc:get-config', { callId: targetHandoff.callId }),
+  ]);
+  assert.equal(handoffATrtc.publishScreen, false);
+  assert.equal(handoffBTrtc.publishScreen, true);
+  assert.equal(handoffATrtc.remoteSystemUserId, handoffBTrtc.localSystemAudio.userId);
+
+  let staleTargetStatusLeak = false;
+  const onStaleTargetStatusLeak = () => { staleTargetStatusLeak = true; };
+  aController.socket.on('trtc:media-status', onStaleTargetStatusLeak);
+  bController1.socket.emit('trtc:media-status', {
+    callId: targetBase.callId, media: 'system-audio', state: 'available',
+  });
+  await wait(20);
+  aController.socket.off('trtc:media-status', onStaleTargetStatusLeak);
+  assert.equal(staleTargetStatusLeak, false);
+
+  const repeatedHandoffCall = await emitAck(bController2.socket, 'call:start', { targetDeviceId: 'a-laptop' });
+  assert.equal(repeatedHandoffCall.ok, true);
+  assert.equal(repeatedHandoffCall.callId, targetHandoff.callId);
+  assert.equal(repeatedHandoffCall.transferred, undefined);
+  bController2.socket.emit('call:end', { callId: targetHandoff.callId });
+  await wait(20);
+  bController2.socket.disconnect();
   await wait(20);
 
   const audio = Buffer.from('test-audio');

@@ -2050,7 +2050,7 @@ function reportRtcError(message: string) {
   console.warn('[webrtc]', message);
   showReply(message, 4000);
   noteRemote(`call err`);
-  remoteSocket?.emit('webrtc:error', { message });
+  remoteSocket?.emit('webrtc:error', { callId: activeCallId || undefined, message });
 }
 
 function cleanupRtc(sendHangup = false) {
@@ -2477,15 +2477,24 @@ function connectRemote() {
     void applyRequestedScreenState();
     showReply(control.enabled ? '控制端恢复了屏幕共享' : '控制端暂停了屏幕共享', 2200);
   });
-  remoteSocket.on('webrtc:hangup', () => {
+  remoteSocket.on('webrtc:hangup', (payload: { callId?: string }) => {
+    if (!activeCallId || payload?.callId !== activeCallId) return;
     cleanupRtc(false);
     showReply('通话结束了', 2200);
   });
-  remoteSocket.on('call:end', () => {
+  remoteSocket.on('call:end', (payload: { callId?: string; reason?: string; transferredMemberId?: 'a' | 'b' }) => {
+    if (!activeCallId || payload?.callId !== activeCallId) return;
     cleanupRtc(false);
-    showReply('通话结束了', 2200);
+    if (payload?.reason === 'transferred') {
+      showReply(payload.transferredMemberId === MEMBER_ID
+        ? '通话已切换到你的另一台设备'
+        : '对方正在切换通话设备', 2200);
+    } else {
+      showReply('通话结束了', 2200);
+    }
   });
-  remoteSocket.on('webrtc:error', (payload: { message?: string }) => {
+  remoteSocket.on('webrtc:error', (payload: { callId?: string; message?: string }) => {
+    if (!activeCallId || payload?.callId !== activeCallId) return;
     const message = payload?.message || '对端通话失败';
     showReply(message, 3500);
   });

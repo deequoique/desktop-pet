@@ -13,6 +13,7 @@ test('TRTC stays behind the isolated control preload and packages native binarie
   const main = read('src/main/index.js');
   const loopbackMain = read('src/main/windows-process-loopback.js');
   const app = read('../web/src/App.tsx');
+  const api = read('../web/src/api.ts');
   assert.equal(manifest.dependencies['trtc-electron-sdk'], '13.3.801');
   assert.ok(manifest.build.asarUnpack.includes('node_modules/trtc-electron-sdk/**/*'));
   assert.match(controlPreload, /createTrtcPreloadBridge\(\{ systemAudioTransport \}\)/);
@@ -30,12 +31,20 @@ test('TRTC stays behind the isolated control preload and packages native binarie
   assert.doesNotMatch(bridge, /TRTCAudioQualityMusic/);
   assert.match(bridge, /setRemoteMicrophoneMuted/);
   assert.match(bridge, /setRemoteSystemAudioMuted/);
+  assert.match(bridge, /enableFollowingDefaultAudioDevice/);
+  assert.match(bridge, /TRTCDeviceTypeSpeaker/);
   assert.match(bridge, /sendCustomAudioData/);
   assert.doesNotMatch(bridge, /child_process|spawn\(/);
   assert.match(loopbackMain, /spawnProcess\(helperPath/);
   assert.match(main, /trustedControlSender/);
   assert.match(app, /setRemoteMicrophoneMuted\(nextMuted\)/);
   assert.match(app, /setRemoteSystemAudioMuted\(nextMuted\)/);
+  assert.match(app, /call_busy: '已有其他通话正在进行'/);
+  assert.match(app, /call\.handoff-accepted/);
+  assert.match(app, /transferredMemberId === memberId/);
+  assert.match(app, /media\.trtc-audio-output-follow-state/);
+  assert.match(api, /transferredMemberId\?: 'a' \| 'b'/);
+  assert.match(api, /transferred\?: boolean/);
   assert.doesNotMatch(app, /setRemoteMicMuted\(nextMuted\);\s*setRemoteSystemMuted\(nextMuted\)/);
   assert.equal(manifest.build.win.extraResources[0].to, 'native/desktop-pet-process-loopback.exe');
   assert.doesNotMatch(bridge, /SDKSECRETKEY|TRTC_SECRET_KEY|localStorage/);

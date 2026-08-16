@@ -109,3 +109,40 @@ Windows 11 上 system helper/child 失败只把系统声音标成 unavailable，
 4. 双机外放确认数字回环被切断；再验证 main SDK AEC 处理扬声器→麦克风的声学路径。
 
 POC 任一项失败时，保留 main 双向麦克风和分源设计；Windows 11 的 system uplink fail closed 并另开 native 音频方案决策，不能把 Windows 11 伪装成 Windows 10 降级。Windows 10 仍按已确认的产品策略使用旧 loopback。
+
+## 11. Explicit Device Handoff
+
+设备接管复用用户在新设备上明确触发的 `call:start { targetDeviceId }`，设备上线、Socket 重连和 peer snapshot 更新不触发接管。server 对请求按以下顺序分类：
+
+1. 房间无通话：按现有路径创建通话。
+2. 请求方和目标已经是当前两个端点：幂等返回当前 call ID。
+3. 目标是当前通话一端，当前另一端与请求方属于同一 member，但设备 ID 不同：执行 handoff。
+4. 其他已有通话：返回 `call_busy`，不得改变现有通话。
+
+handoff 提交前必须验证新设备和当前对端都同时具有 pet/controller socket，并确认新设备替换的旧端点与它属于同一 member。服务端保留原 initiator/target 角色：旧 initiator 被替换时新设备成为 initiator；旧 target 被替换时新设备成为 target，因此屏幕和系统声音发布角色随成员端点正确迁移。
+
+handoff 总是创建新 call ID。事件顺序为：
+
+1. 对旧两个端点发送 `call:end { oldCallId, reason:'transferred', transferredMemberId }`，旧设备立即释放全部媒体；未被替换的对端显示切换状态。
+2. 原子更新 `room.callId/room.call` 为新 call generation。
+3. 只向新设备与当前对端发送新 `call:start`，二者按现有流程重新获取 call-scoped TRTC config/UserSig 并进房。
+4. `call:start` acknowledgement 返回 `{ ok:true, callId:newCallId, transferred:true }`。
+
+Socket.IO 对同一连接保持事件顺序；对端会先同步 teardown 旧 call，再执行新 `beginMediaCall()`。所有 `call:end`、hangup、WebRTC/TRTC control/status/signal 必须同时校验当前 call ID 与端点 membership，保证旧设备或旧异步回调不能终止/污染新 call。前端显示：旧设备“通话已切换到你的另一台设备”，未替换对端“对方正在切换通话设备”，真实冲突显示“已有其他通话正在进行”；`call_busy`、`timeout`、`disconnected` 和 `peer_not_ready` 不再折叠为“无法创建通话”。
+
+预检失败不修改旧通话。新 call 已提交后如果 TRTC/WebRTC 初始化失败，按现有 call error/teardown 处理；首版不跨新旧 call 自动回滚，因为旧实例已经释放且凭据、远端 identity 与屏幕发布角色均已换代。
+
+## 12. Follow the System Default Audio Output
+
+当前锁定的 `trtc-electron-sdk@13.3.801` 提供：
+
+```ts
+enableFollowingDefaultAudioDevice(
+  TRTCDeviceType.TRTCDeviceTypeSpeaker,
+  true,
+): void;
+```
+
+TRTC main shared instance 在每次 `enterRoom()` 前启用该设置；Windows 和 macOS 使用同一路径。SDK 文档契约为：系统默认扬声器改变时立即切换播放设备。system child 是 publish-only，不调用该接口；它不应产生任何远端 playout。WebRTC fallback 继续使用 Chromium 对系统默认输出的原生跟随，不增加 `setSinkId()` 或设备 ID 持久化。
+
+启用失败只上报 call-scoped、无设备名称的诊断事件并继续进房；不得因此停止屏幕、麦克风、系统声音或主通话。连接恢复时对当前 main generation 重新启用一次，旧 generation 回调不得触碰新实例。测试 fake cloud 必须证明 speaker 类型与 `true` 参数正确，且调用发生在 `enterRoom` 之前、重连后重套、失败不阻断进房。

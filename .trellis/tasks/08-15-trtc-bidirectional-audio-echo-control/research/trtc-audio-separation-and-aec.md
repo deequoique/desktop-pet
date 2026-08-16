@@ -114,3 +114,18 @@ TRTC 13.3.801 的 `sendCustomAudioData()` 支持 16/24/32/44.1/48 kHz、单/双�
 - UI：非共享端显示独立系统声/麦克风开关，共享端只显示远端麦克风；新通话全部默认关闭。
 - Windows POC：必须用外放扬声器验证系统回环和麦克风两条回声路径，不能只用耳机通过。
 - macOS：核心双向麦克风与独立控制仍需通过；免提 AEC 不作为本任务门槛。
+
+## Default Audio Output Following Evidence
+
+锁定包 `trtc-electron-sdk@13.3.801` 的类型声明同时在 `TRTCCloud` 与 `TRTCDeviceManager` 暴露默认设备跟随能力：
+
+```ts
+enableFollowingDefaultAudioDevice(
+  deviceType: TRTCDeviceType,
+  enable: boolean,
+): void;
+```
+
+声明说明该接口只支持麦克风和扬声器；传入 `TRTCDeviceTypeSpeaker` 与 `true` 后，系统默认音频输出改变时 SDK 立即切换播放设备。SDK 还提供 `TRTCDeviceState.TRTCDefaultDeviceChanged`、`getCurrentSpeakerDevice()` 和 `setCurrentSpeakerDevice()`，但本产品不需要维护手动设备列表或固定设备 ID。
+
+结论：主 TRTC playout 应直接启用 SDK 跟随，不通过 Chromium `enumerateDevices()` 轮询，也不把设备名称/ID送入 renderer 状态。publish-only system child 不播放远端音频，不需要设备跟随。该调用失败时保留主通话并记录无设备名称的可恢复诊断。

@@ -44,9 +44,11 @@ export function connect(serverUrl, secret, identity) {
     });
     s.on('webrtc:signal', (signal) => listeners.onSignal?.(signal));
     s.on('webrtc:camera-signal', (signal) => listeners.onCameraSignal?.(signal));
-    s.on('webrtc:hangup', () => listeners.onHangup?.());
+    s.on('webrtc:hangup', (payload) => {
+        listeners.onHangup?.(payload?.callId, payload?.reason);
+    });
     s.on('webrtc:error', (payload) => {
-        listeners.onRtcError?.(payload?.message || '通话出错');
+        listeners.onRtcError?.(payload?.message || '通话出错', payload?.callId);
     });
     s.on('webrtc:media-status', (payload) => listeners.onMediaStatus?.(payload));
     s.on('trtc:media-control', (payload) => listeners.onTrtcMediaControl?.(payload));
@@ -57,7 +59,7 @@ export function connect(serverUrl, secret, identity) {
         }
     });
     s.on('call:end', (payload) => {
-        listeners.onCallEnd?.(payload?.callId, payload?.reason);
+        listeners.onCallEnd?.(payload?.callId, payload?.reason, payload?.transferredMemberId);
     });
     s.on('tts:status', (payload) => listeners.onTtsStatus?.(payload));
     s.on('note:changed', (payload) => listeners.onNoteChanged?.(payload));
@@ -192,10 +194,10 @@ export function sendTrtcMediaStatus(status) {
     socket.emit('trtc:media-status', status);
     return true;
 }
-export function sendHangup() {
+export function sendHangup(callId) {
     if (!socket || !socket.connected)
         return false;
-    socket.emit('webrtc:hangup');
+    socket.emit('webrtc:hangup', { callId });
     return true;
 }
 export function requestCall(targetDeviceId) {

@@ -509,3 +509,88 @@ jobs:
 - name: Install pet dependencies
   run: npm ci --legacy-peer-deps
 ```
+
+## 12. Scenario: explicit same-member call handoff and default TRTC playout
+
+### 1. Scope / Trigger
+
+- Trigger：修改 `call:start`、通话端点/设备代次、挂断与错误转发、TRTC 默认播放设备或同成员多设备行为时。
+- 同一成员的另一台设备只能通过用户明确点击“开始通话”接管当前对端；上线、重连、唤醒和 peer snapshot 不得抢占。TRTC 播放设备由操作系统默认输出决定，不增加本地设备 ID 状态。
+
+### 2. Signatures
+
+```ts
+socket.emit('call:start', { targetDeviceId }, ack);
+// normal/idempotent: { ok:true, callId:string }
+// handoff:          { ok:true, callId:string, transferred:true }
+// rejection:        { ok:false, code:'peer_not_ready'|'call_busy'|'not_joined' }
+
+type TransferredCallEnd = {
+  callId:string;
+  reason:'transferred';
+  transferredMemberId:'a'|'b';
+};
+
+cloud.enableFollowingDefaultAudioDevice(
+  TRTCDeviceType.TRTCDeviceTypeSpeaker,
+  true,
+);
+```
+
+### 3. Contracts
+
+- `call:start` 在已有通话时按顺序分类：当前两个端点重复请求为幂等；目标是当前对端且请求设备与被替换端点同 member 时为 handoff；其他情况返回 `call_busy`。
+- handoff 提交前，新设备和未替换对端都必须同时具有 pet/controller endpoint。预检失败保留旧 call；成功时先向旧端点发送 `call:end`/`webrtc:hangup`（`reason:'transferred'`），再创建新 call ID 并只向新端点和未替换对端发送新 `call:start`。
+- 新 call 保留旧 initiator/target 角色；替换 target 时，新设备继承屏幕与单向系统声音发布角色。旧设备断线或旧 call 的 signal/status/error/end/hangup 不能改变新 call。
+- 所有 call 结束、hangup、error、signal、control 和 status 入口必须要求精确匹配当前 `callId` 及当前端点 membership；不能接受缺少 call ID 的兼容挂断，因为同一端点的迟到 continuation 会误杀新 generation。
+- Windows 与 macOS 的 TRTC main instance 在 `enterRoom()` 前启用默认 speaker 跟随，并在当前 generation 连接恢复时重套。publish-only system child 不调用该接口。失败只产生不含设备名称的稳定诊断并继续进房。
+- WebRTC fallback 继续依赖 Chromium/系统默认输出，不调用 `setSinkId()`，不持久化扬声器 ID、名称或选择 UI。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 结果 |
+| --- | --- |
+| 新设备或当前对端缺 pet/controller | `peer_not_ready`，旧 call 保持 |
+| 新设备与被替换端点不是同 member | `call_busy`，不发送 transferred 事件 |
+| 请求目标不是当前通话对端 | `call_busy`，不改变当前端点 |
+| 当前两个端点重复 `call:start` | 返回当前 call ID，不创建 generation |
+| 合法同成员接管 | 旧 call transferred 结束，新 call ID 启动，角色保持 |
+| 旧 call 或缺 call ID 的 hangup/error/signal/status | 丢弃，不转发、不结束新 call |
+| main 默认输出跟随调用抛错 | 记录 `media_trtc_audio_output_follow_unavailable`，仍调用 `enterRoom()` |
+| system child 创建或恢复 | 不调用 speaker following，不产生远端 playout |
+
+### 5. Good/Base/Bad Cases
+
+- Good：A1↔B 通话时 A2 对同一 B 点击开始；B 先结束旧媒体再与 A2 进入新 call，A1 的迟到 hangup 无效；若被替换的是 target，A2 自动成为屏幕/系统声音发布方。
+- Base：A1 对当前 B 重复点击只收到同一 call ID；通话中从系统设置切换耳机/显示器音频，main playout 跟随且远端收听开关不变。
+- Bad：A2 上线即抢占；复用旧 call ID；在切断旧 call 后才发现 A2 pet 不在线；允许无 call ID hangup；给 system child 启用扬声器跟随或记录输出设备名称。
+
+### 6. Tests Required
+
+- Server integration：initiator 与 target 替换、角色保持、新 call ID、重复请求幂等、真实 busy、endpoint 未就绪不破坏旧 call、join/reconnect 不抢占。
+- Stale isolation：旧设备及未替换端点的旧 generation `call:end`、有/无 call ID hangup、main/camera signal、error、media status/control 均不能影响新 call。
+- Bridge behavior：speaker enum + `true`、调用早于 main `enterRoom()`、连接恢复重套、system child 零调用、SDK 抛错仍进房且诊断不含设备名称。
+- Build：`npm test --prefix server`、`npm test --prefix pet`、`npm run build:web`、`npm run build:pet`、`git diff --check`。
+- Manual：Windows/macOS 默认输出切换；A1/A2/B 三设备双向角色接管与 1–3 秒中断验收。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```js
+if (room.call) return ack({ ok:false, code:'call_busy' });
+if (!payload?.callId || payload.callId === room.callId) endRoomCall(room);
+systemChild.enableFollowingDefaultAudioDevice(speaker, true);
+```
+
+#### Correct
+
+```js
+const eligible = targetIsCurrentPeer && replaced.memberId === requester.memberId;
+preflightCombinedEndpoints(requester, currentPeer);
+endRoomCall(room, 'transferred', { transferredMemberId: requester.memberId });
+startRoomCall(room, preservedInitiatorDeviceId, preservedTargetDeviceId); // new call ID
+
+if (payload?.callId !== room.callId || !isCurrentCallDevice(room, deviceId)) return;
+main.enableFollowingDefaultAudioDevice(TRTCDeviceTypeSpeaker, true);
+```

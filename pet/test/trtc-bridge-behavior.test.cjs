@@ -5,6 +5,7 @@ const { createTrtcPreloadBridge } = require('../src/main/trtc-preload-bridge');
 class FakeCloud {
   static shared = null;
   static destroyed = 0;
+  static followDefaultAudioError = null;
 
   static getTRTCShareInstance() {
     if (!FakeCloud.shared) FakeCloud.shared = new FakeCloud('main');
@@ -29,6 +30,10 @@ class FakeCloud {
   getSDKVersion() { return 'fake'; }
   createSubCloud() { const child = new FakeCloud(); this.children.push(child); return child; }
   setDefaultStreamRecvMode(...args) { this.record('setDefaultStreamRecvMode', ...args); }
+  enableFollowingDefaultAudioDevice(...args) {
+    this.record('enableFollowingDefaultAudioDevice', ...args);
+    if (FakeCloud.followDefaultAudioError) throw FakeCloud.followDefaultAudioError;
+  }
   muteRemoteAudio(...args) {
     this.record('muteRemoteAudio', ...args);
     const error = this.muteRemoteAudioErrors?.get(args[0]) || this.muteRemoteAudioError;
@@ -67,6 +72,7 @@ function fakeSdk() {
     Rect,
     TRTCAppScene: { TRTCAppSceneAudioCall: 1 },
     TRTCAudioQuality: { TRTCAudioQualityDefault: 2 },
+    TRTCDeviceType: { TRTCDeviceTypeSpeaker: 1 },
     TRTCVideoStreamType: { TRTCVideoStreamTypeSub: 1 },
     TRTCScreenCaptureSourceType: { TRTCScreenCaptureSourceTypeScreen: 1 },
     TRTCVideoResolution: { TRTCVideoResolution_1280_720: 3, TRTCVideoResolution_1920_1080: 5 },
@@ -99,6 +105,11 @@ test('TRTC main microphone and system subcloud remain separate and default muted
     localSystemAudio: { userId: 's_target', userSig: 'system-sig' },
   }).ok, true);
   const main = FakeCloud.shared;
+  assert.deepEqual(calls(main, 'enableFollowingDefaultAudioDevice')[0], [
+    'enableFollowingDefaultAudioDevice', 1, true,
+  ]);
+  assert.ok(main.calls.findIndex((entry) => entry[0] === 'enableFollowingDefaultAudioDevice')
+    < main.calls.findIndex((entry) => entry[0] === 'enterRoom'));
   assert.deepEqual(calls(main, 'muteRemoteAudio').slice(0, 2), [
     ['muteRemoteAudio', 'c_initiator', true],
     ['muteRemoteAudio', 's_target', true],
@@ -112,6 +123,7 @@ test('TRTC main microphone and system subcloud remain separate and default muted
 
   assert.equal(bridge.startScreenShare('720p30').ok, true);
   const child = main.children[0];
+  assert.equal(calls(child, 'enableFollowingDefaultAudioDevice').length, 0);
   assert.deepEqual(calls(child, 'muteAllRemoteAudio')[0], ['muteAllRemoteAudio', true]);
   assert.equal(calls(main, 'startSystemAudioLoopback').length, 0);
   assert.equal(calls(child, 'enterRoom')[0][1].userId, 's_target');
@@ -135,6 +147,7 @@ test('TRTC main microphone and system subcloud remain separate and default muted
   const localSystemMuteCountAfterMainRecovery = calls(main, 'muteRemoteAudio')
     .filter((entry) => entry[1] === 's_target' && entry[2] === true).length;
   assert.ok(localSystemMuteCountAfterMainRecovery > localSystemMuteCountAfterChildEntry);
+  assert.equal(calls(main, 'enableFollowingDefaultAudioDevice').length, 2);
   child.emit('onConnectionRecovery');
   assert.ok(calls(main, 'muteRemoteAudio')
     .filter((entry) => entry[1] === 's_target' && entry[2] === true).length > localSystemMuteCountAfterMainRecovery);
@@ -174,6 +187,39 @@ test('remote microphone and remote system controls mute distinct TRTC identities
     ['muteRemoteAudio', 'c_target', false],
     ['muteRemoteAudio', 's_target', false],
   ]);
+  bridge.leaveRoom();
+});
+
+test('default speaker following failure is reported without blocking room entry', () => {
+  FakeCloud.shared = null;
+  FakeCloud.destroyed = 0;
+  FakeCloud.followDefaultAudioError = new Error('speaker_follow_failed');
+  const bridge = createTrtcPreloadBridge({ sdkLoader: fakeSdk });
+  const events = [];
+  const removeListener = bridge.onEvent((event) => events.push(event));
+  assert.equal(bridge.enterRoom({
+    sdkAppId: 1,
+    roomId: 2,
+    userId: 'c_initiator',
+    userSig: 'main-sig',
+    remoteUserId: 'c_target',
+    remoteSystemUserId: 's_target',
+    publishScreen: false,
+  }).ok, true);
+  const main = FakeCloud.shared;
+  assert.equal(calls(main, 'enterRoom').length, 1);
+  assert.deepEqual(events.find((event) => event.event === 'audio-output-follow-state'), {
+    event: 'audio-output-follow-state',
+    state: 'unavailable',
+    error: 'enable_following_default_audio_device_failed',
+  });
+  FakeCloud.followDefaultAudioError = null;
+  main.emit('onConnectionRecovery');
+  assert.deepEqual(events.filter((event) => event.event === 'audio-output-follow-state').at(-1), {
+    event: 'audio-output-follow-state',
+    state: 'available',
+  });
+  removeListener();
   bridge.leaveRoom();
 });
 

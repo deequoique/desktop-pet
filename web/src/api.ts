@@ -96,13 +96,13 @@ export type Listeners = {
   onError?: (msg: string, code?: string) => void;
   onSignal?: (signal: WebRtcSignal) => void;
   onCameraSignal?: (signal: WebRtcSignal) => void;
-  onHangup?: () => void;
-  onRtcError?: (msg: string) => void;
+  onHangup?: (callId?: string, reason?: string) => void;
+  onRtcError?: (msg: string, callId?: string) => void;
   onMediaStatus?: (status: MediaStatus) => void;
   onTrtcMediaControl?: (control: MediaControl) => void;
   onTrtcMediaStatus?: (status: MediaStatus) => void;
   onCallStart?: (callId: string, peerDeviceId?: string, cameraOffererDeviceId?: string, cameraSenderDeviceId?: string, mediaMode?: 'webrtc' | 'trtc') => void;
-  onCallEnd?: (callId?: string, reason?: string) => void;
+  onCallEnd?: (callId?: string, reason?: string, transferredMemberId?: 'a' | 'b') => void;
   onTtsStatus?: (status: TtsStatus) => void;
   onNoteChanged?: (payload: { reason: string; note: DesktopNote }) => void;
   onNoteRemoved?: (payload: { noteId: string; reason: string }) => void;
@@ -167,9 +167,11 @@ export function connect(serverUrl: string, secret: string, identity: ConnectionI
   });
   s.on('webrtc:signal', (signal: WebRtcSignal) => listeners.onSignal?.(signal));
   s.on('webrtc:camera-signal', (signal: WebRtcSignal) => listeners.onCameraSignal?.(signal));
-  s.on('webrtc:hangup', () => listeners.onHangup?.());
-  s.on('webrtc:error', (payload: { message?: string }) => {
-    listeners.onRtcError?.(payload?.message || '通话出错');
+  s.on('webrtc:hangup', (payload: { callId?: string; reason?: string }) => {
+    listeners.onHangup?.(payload?.callId, payload?.reason);
+  });
+  s.on('webrtc:error', (payload: { callId?: string; message?: string }) => {
+    listeners.onRtcError?.(payload?.message || '通话出错', payload?.callId);
   });
   s.on('webrtc:media-status', (payload: MediaStatus) => listeners.onMediaStatus?.(payload));
   s.on('trtc:media-control', (payload: MediaControl) => listeners.onTrtcMediaControl?.(payload));
@@ -185,8 +187,8 @@ export function connect(serverUrl: string, secret: string, identity: ConnectionI
       );
     }
   });
-  s.on('call:end', (payload: { callId?: string; reason?: string }) => {
-    listeners.onCallEnd?.(payload?.callId, payload?.reason);
+  s.on('call:end', (payload: { callId?: string; reason?: string; transferredMemberId?: 'a' | 'b' }) => {
+    listeners.onCallEnd?.(payload?.callId, payload?.reason, payload?.transferredMemberId);
   });
   s.on('tts:status', (payload: TtsStatus) => listeners.onTtsStatus?.(payload));
   s.on('note:changed', (payload: { reason: string; note: DesktopNote }) => listeners.onNoteChanged?.(payload));
@@ -312,13 +314,13 @@ export function sendTrtcMediaStatus(status: MediaStatus): boolean {
   return true;
 }
 
-export function sendHangup(): boolean {
+export function sendHangup(callId: string): boolean {
   if (!socket || !socket.connected) return false;
-  socket.emit('webrtc:hangup');
+  socket.emit('webrtc:hangup', { callId });
   return true;
 }
 
-export function requestCall(targetDeviceId: string): Promise<{ ok: boolean; callId?: string; code?: string }> {
+export function requestCall(targetDeviceId: string): Promise<{ ok: boolean; callId?: string; code?: string; transferred?: boolean }> {
   return new Promise((resolve) => {
     if (!socket?.connected) return resolve({ ok: false, code: 'disconnected' });
     socket.timeout(4000).emit('call:start', { targetDeviceId }, (err: Error | null, response: any) => {

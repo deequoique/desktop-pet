@@ -445,15 +445,51 @@ function normalizeNoteReply(reply) {
   return { ok: true, reply: { ...(body ? { body } : {}), ...(image ? { image } : {}) } };
 }
 
-function endRoomCall(room, reason = 'ended') {
+function callDeviceIds(room) {
+  return room.call ? [room.call.initiatorDeviceId, room.call.targetDeviceId] : [];
+}
+
+function isCurrentCallDevice(room, deviceId) {
+  return !!deviceId && callDeviceIds(room).includes(deviceId);
+}
+
+function emitRoomCallStart(room) {
+  if (!room.callId || !room.call) return;
+  const deviceIds = callDeviceIds(room);
+  for (const deviceId of deviceIds) {
+    const participant = room.participants.get(deviceId);
+    const peerDeviceId = deviceIds.find((candidate) => candidate !== deviceId);
+    if (!participant?.controller || !peerDeviceId) continue;
+    io.to(participant.controller).emit('call:start', {
+      callId: room.callId,
+      mediaMode: trtcReady() ? 'trtc' : 'webrtc',
+      peerDeviceId,
+      cameraOffererDeviceId: room.call.initiatorDeviceId,
+      cameraSenderDeviceId: room.call.targetDeviceId,
+    });
+  }
+}
+
+function startRoomCall(room, initiatorDeviceId, targetDeviceId) {
+  room.callId = randomUUID();
+  room.call = { initiatorDeviceId, targetDeviceId, startedAt: Date.now() };
+  diagnostics.info('call', 'call.started', {
+    correlation: { callId: room.callId },
+    context: { initiatorDeviceId, targetDeviceId },
+  });
+  emitRoomCallStart(room);
+  return room.callId;
+}
+
+function endRoomCall(room, reason = 'ended', details = {}) {
   if (!room.callId) return;
   const callId = room.callId;
-  const deviceIds = room.call ? [room.call.initiatorDeviceId, room.call.targetDeviceId] : [];
+  const deviceIds = callDeviceIds(room);
   for (const deviceId of deviceIds) {
     const device = room.participants.get(deviceId);
     for (const socketId of [device?.pet, device?.controller]) if (socketId) {
-      io.to(socketId).emit('call:end', { callId, reason });
-      io.to(socketId).emit('webrtc:hangup', { callId, reason });
+      io.to(socketId).emit('call:end', { callId, reason, ...details });
+      io.to(socketId).emit('webrtc:hangup', { callId, reason, ...details });
     }
   }
   room.callId = null;
@@ -461,7 +497,7 @@ function endRoomCall(room, reason = 'ended') {
   flushRtcSignalSummary(callId, reason);
   diagnostics.info('call', 'call.ended', {
     correlation: { callId },
-    context: { reason },
+    context: { reason, ...details },
   });
 }
 
@@ -1310,15 +1346,16 @@ io.on('connection', (socket) => {
 
   socket.on('webrtc:signal', (payload) => {
     const room = roomForSocket(socket);
-    if (!room) return;
-    if (payload?.callId && payload.callId !== room.callId) {
-      noteRtcSignal(payload.callId, 'main', socket.data?.role, payload, false);
+    const call = room?.call;
+    if (!room || !call || payload?.callId !== room.callId
+      || !isCurrentCallDevice(room, socket.data.participantId)) {
+      noteRtcSignal(payload?.callId, 'main', socket.data?.role, payload, false);
       return;
     }
     const role = socket.data?.role;
     const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
-    const pairedDeviceId = room.call && (socket.data.participantId === room.call.initiatorDeviceId
-      ? room.call.targetDeviceId : room.call.initiatorDeviceId);
+    const pairedDeviceId = socket.data.participantId === call.initiatorDeviceId
+      ? call.targetDeviceId : call.initiatorDeviceId;
     const targetId = targetRole && otherParticipant(room, socket.data.participantId, payload?.targetDeviceId || pairedDeviceId)?.[targetRole];
     if (!targetId) {
       noteRtcSignal(room.callId, 'main', role, payload, false);
@@ -1473,58 +1510,99 @@ io.on('connection', (socket) => {
 
   socket.on('call:start', (payload, ack) => {
     const room = roomForSocket(socket);
-    if (!room || socket.data?.role !== 'controller') return;
+    if (!room || socket.data?.role !== 'controller') {
+      if (typeof ack === 'function') ack({ ok: false, code: 'not_joined' });
+      return;
+    }
     const peer = otherParticipant(room, socket.data.participantId, payload?.targetDeviceId);
     const self = participantForSocket(socket);
     if (!peer?.pet || !peer?.controller || !self?.pet || !self?.controller) {
+      if (room.call) {
+        diagnostics.info('call', 'call.handoff-rejected', {
+          correlation: { callId: room.callId },
+          context: { reason: 'endpoint_not_ready' },
+        });
+      }
       if (typeof ack === 'function') ack({ ok: false, code: 'peer_not_ready' });
       return;
     }
-    if (room.call && !(
-      [room.call.initiatorDeviceId, room.call.targetDeviceId].includes(self.id)
-      && [room.call.initiatorDeviceId, room.call.targetDeviceId].includes(peer.id)
-    )) {
+    if (!room.call || !room.callId) {
+      const callId = startRoomCall(room, self.id, peer.id);
+      if (typeof ack === 'function') ack({ ok: true, callId });
+      return;
+    }
+
+    const currentDeviceIds = callDeviceIds(room);
+    if (currentDeviceIds.includes(self.id) && currentDeviceIds.includes(peer.id)) {
+      emitRoomCallStart(room);
+      if (typeof ack === 'function') ack({ ok: true, callId: room.callId });
+      return;
+    }
+
+    if (!currentDeviceIds.includes(peer.id)) {
+      diagnostics.info('call', 'call.handoff-rejected', {
+        correlation: { callId: room.callId },
+        context: { reason: 'target_not_current_peer' },
+      });
       if (typeof ack === 'function') ack({ ok: false, code: 'call_busy' });
       return;
     }
-    if (!room.callId) {
-      room.callId = randomUUID();
-      room.call = { initiatorDeviceId: self.id, targetDeviceId: peer.id, startedAt: Date.now() };
-      diagnostics.info('call', 'call.started', {
+
+    const replacedDeviceId = currentDeviceIds.find((deviceId) => deviceId !== peer.id);
+    const replaced = replacedDeviceId && room.participants.get(replacedDeviceId);
+    if (!replaced || replaced.memberId !== self.memberId) {
+      diagnostics.info('call', 'call.handoff-rejected', {
         correlation: { callId: room.callId },
-        context: { initiatorDeviceId: self.id, targetDeviceId: peer.id },
+        context: { reason: 'member_mismatch' },
       });
+      if (typeof ack === 'function') ack({ ok: false, code: 'call_busy' });
+      return;
     }
-    for (const participant of [self, peer]) if (participant.controller) {
-      io.to(participant.controller).emit('call:start', {
-        callId: room.callId,
-        mediaMode: trtcReady() ? 'trtc' : 'webrtc',
-        peerDeviceId: participant.id === self.id ? peer.id : self.id,
-        cameraOffererDeviceId: room.call.initiatorDeviceId,
-        cameraSenderDeviceId: room.call.targetDeviceId,
-      });
-    }
-    if (typeof ack === 'function') ack({ ok: true, callId: room.callId });
+
+    const oldCallId = room.callId;
+    const replacedInitiator = room.call.initiatorDeviceId === replacedDeviceId;
+    const nextInitiatorDeviceId = replacedInitiator ? self.id : room.call.initiatorDeviceId;
+    const nextTargetDeviceId = replacedInitiator ? room.call.targetDeviceId : self.id;
+    diagnostics.info('call', 'call.handoff-requested', {
+      correlation: { callId: oldCallId },
+      context: { transferredMemberId: self.memberId },
+    });
+    diagnostics.info('call', 'call.handoff-accepted', {
+      correlation: { callId: oldCallId },
+      context: { transferredMemberId: self.memberId },
+    });
+    endRoomCall(room, 'transferred', { transferredMemberId: self.memberId });
+    const callId = startRoomCall(room, nextInitiatorDeviceId, nextTargetDeviceId);
+    diagnostics.info('call', 'call.handoff-committed', {
+      correlation: { callId },
+      context: { previousCallId: oldCallId, transferredMemberId: self.memberId },
+    });
+    if (typeof ack === 'function') ack({ ok: true, callId, transferred: true });
   });
 
   socket.on('call:end', (payload) => {
     const room = roomForSocket(socket);
-    if (!room || (payload?.callId && payload.callId !== room.callId)) return;
+    if (!room || !room.call || payload?.callId !== room.callId
+      || !isCurrentCallDevice(room, socket.data.participantId)) return;
     endRoomCall(room, 'ended');
   });
 
-  socket.on('webrtc:hangup', () => {
+  socket.on('webrtc:hangup', (payload) => {
     const room = roomForSocket(socket);
-    if (room?.callId) endRoomCall(room, 'hangup');
+    if (!room || !room.call || payload?.callId !== room.callId
+      || !isCurrentCallDevice(room, socket.data.participantId)) return;
+    endRoomCall(room, 'hangup');
   });
 
   socket.on('webrtc:error', (payload) => {
     const room = roomForSocket(socket);
+    if (!room || !room.call || payload?.callId !== room.callId
+      || !isCurrentCallDevice(room, socket.data.participantId)) return;
     const role = socket.data?.role;
     const targetRole = role === 'controller' ? 'pet' : role === 'pet' ? 'controller' : null;
-    const pairedDeviceId = room?.call && (socket.data.participantId === room.call.initiatorDeviceId
-      ? room.call.targetDeviceId : room.call.initiatorDeviceId);
-    const targetId = room && targetRole && otherParticipant(room, socket.data.participantId, pairedDeviceId)?.[targetRole];
+    const pairedDeviceId = socket.data.participantId === room.call.initiatorDeviceId
+      ? room.call.targetDeviceId : room.call.initiatorDeviceId;
+    const targetId = targetRole && otherParticipant(room, socket.data.participantId, pairedDeviceId)?.[targetRole];
     if (!targetId) return;
     io.to(targetId).emit('webrtc:error', payload);
   });
