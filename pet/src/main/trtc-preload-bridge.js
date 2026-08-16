@@ -34,6 +34,8 @@ function createTrtcPreloadBridge(options = {}) {
   let generation = 0;
   let screenSharing = false;
   let microphoneEnabled = false;
+  let remoteMicrophoneMuted = true;
+  let remoteSystemAudioMuted = true;
   let remoteViewUserId = '';
   const eventListeners = new Set();
 
@@ -55,6 +57,34 @@ function createTrtcPreloadBridge(options = {}) {
 
   const emitSystemState = (state, fields = {}) => emit('system-audio-state', { state, ...fields });
 
+  const applyMainRemoteAudioPolicy = (record) => {
+    if (!record || !isCurrent(record) || !activeConfig) {
+      return { firstError: null, localSystemError: null };
+    }
+    const operations = [
+      { userId: activeConfig.remoteUserId, muted: remoteMicrophoneMuted, localSystem: false },
+      { userId: activeConfig.remoteSystemUserId, muted: remoteSystemAudioMuted, localSystem: false },
+      { userId: activeConfig.localSystemAudio?.userId, muted: true, localSystem: true },
+    ];
+    let firstError = null;
+    let localSystemError = null;
+    for (const { userId, muted, localSystem } of operations) {
+      if (!userId) continue;
+      try {
+        record.cloud.muteRemoteAudio(userId, muted);
+      } catch (error) {
+        if (!firstError) firstError = error;
+        if (localSystem) localSystemError = error;
+      }
+    }
+    return { firstError, localSystemError };
+  };
+
+  const muteLocalSystemAudio = (record) => {
+    if (!record || !isCurrent(record) || !activeConfig?.localSystemAudio?.userId) return;
+    record.cloud.muteRemoteAudio(activeConfig.localSystemAudio.userId, true);
+  };
+
   const stopNativeTransport = (recordGeneration) => {
     try {
       const pending = systemAudioTransport?.stop(recordGeneration);
@@ -75,10 +105,10 @@ function createTrtcPreloadBridge(options = {}) {
       if (!isCurrent(record)) return;
       record.entered = asFiniteNumber(elapsed) >= 0;
       if (record.entered) {
-        try { cloud.muteRemoteAudio(activeConfig.remoteUserId, true); } catch {}
-        try {
-          if (activeConfig.remoteSystemUserId) cloud.muteRemoteAudio(activeConfig.remoteSystemUserId, true);
-        } catch {}
+        const policy = applyMainRemoteAudioPolicy(record);
+        if (policy.localSystemError && systemRecord) {
+          failSystemIdentity(systemRecord, 'local_system_audio_mute_failed');
+        }
       }
       emit('enter-room', { elapsed: asFiniteNumber(elapsed) });
     });
@@ -87,7 +117,14 @@ function createTrtcPreloadBridge(options = {}) {
     });
     cloud.on('onConnectionLost', () => { if (isCurrent(record)) emit('connection-lost'); });
     cloud.on('onTryToReconnect', () => { if (isCurrent(record)) emit('reconnecting'); });
-    cloud.on('onConnectionRecovery', () => { if (isCurrent(record)) emit('connection-recovered'); });
+    cloud.on('onConnectionRecovery', () => {
+      if (!isCurrent(record)) return;
+      const policy = applyMainRemoteAudioPolicy(record);
+      if (policy.localSystemError && systemRecord) {
+        failSystemIdentity(systemRecord, 'local_system_audio_mute_failed');
+      }
+      emit('connection-recovered');
+    });
     cloud.on('onUserSubStreamAvailable', (userId, available) => {
       if (!isCurrent(record)) return;
       emit('substream-available', {
@@ -253,7 +290,21 @@ function createTrtcPreloadBridge(options = {}) {
         failSystemIdentity(record, `enter_room_${asFiniteNumber(elapsed)}`);
         return;
       }
+      try {
+        muteLocalSystemAudio(mainRecord);
+      } catch {
+        failSystemIdentity(record, 'local_system_audio_mute_failed');
+        return;
+      }
       void startSystemCapture(record);
+    });
+    child.on('onConnectionRecovery', () => {
+      if (!isCurrent(record)) return;
+      try {
+        muteLocalSystemAudio(mainRecord);
+      } catch {
+        failSystemIdentity(record, 'local_system_audio_mute_failed');
+      }
     });
     try {
       child.setDefaultStreamRecvMode(false, false);
@@ -263,6 +314,7 @@ function createTrtcPreloadBridge(options = {}) {
       params.roomId = Number(activeConfig.roomId);
       params.userId = String(activeConfig.localSystemAudio.userId);
       params.userSig = String(activeConfig.localSystemAudio.userSig);
+      muteLocalSystemAudio(mainRecord);
       child.enterRoom(params, loadSdk().TRTCAppScene.TRTCAppSceneAudioCall);
       emitSystemState('starting', { mode: 'pending', echoExclusion: 'unknown' });
     } catch (error) {
@@ -295,6 +347,8 @@ function createTrtcPreloadBridge(options = {}) {
     remoteViewUserId = '';
     screenSharing = false;
     microphoneEnabled = false;
+    remoteMicrophoneMuted = true;
+    remoteSystemAudioMuted = true;
     activeConfig = null;
     mainRecord = null;
     try { sdk?.default.destroyTRTCShareInstance(); } catch {}
@@ -369,6 +423,8 @@ function createTrtcPreloadBridge(options = {}) {
         }
         leaveRoom();
         generation += 1;
+        remoteMicrophoneMuted = true;
+        remoteSystemAudioMuted = true;
         activeConfig = { ...config, sdkAppId, roomId, userId, userSig, remoteUserId, remoteSystemUserId };
         const instance = ensureMainCloud();
         mainRecord.generation = generation;
@@ -378,8 +434,8 @@ function createTrtcPreloadBridge(options = {}) {
         params.userId = userId;
         params.userSig = userSig;
         instance.setDefaultStreamRecvMode(true, true);
-        instance.muteRemoteAudio(remoteUserId, true);
-        if (remoteSystemUserId) instance.muteRemoteAudio(remoteSystemUserId, true);
+        const policy = applyMainRemoteAudioPolicy(mainRecord);
+        if (policy.firstError) throw policy.firstError;
         instance.enterRoom(params, loadSdk().TRTCAppScene.TRTCAppSceneAudioCall);
         return { ok: true };
       } catch (error) {
@@ -467,20 +523,28 @@ function createTrtcPreloadBridge(options = {}) {
       }
     },
     setRemoteMicrophoneMuted: (muted) => {
+      const previousMuted = remoteMicrophoneMuted;
       try {
         if (!activeConfig?.remoteUserId) return { ok: false, error: 'remote_microphone_unavailable' };
-        ensureMainCloud().muteRemoteAudio(activeConfig.remoteUserId, !!muted);
+        const nextMuted = !!muted;
+        mainRecord.cloud.muteRemoteAudio(activeConfig.remoteUserId, nextMuted);
+        remoteMicrophoneMuted = nextMuted;
         return { ok: true };
       } catch (error) {
+        try { mainRecord?.cloud.muteRemoteAudio(activeConfig?.remoteUserId, previousMuted); } catch {}
         return { ok: false, error: String(error?.message || error) };
       }
     },
     setRemoteSystemAudioMuted: (muted) => {
+      const previousMuted = remoteSystemAudioMuted;
       try {
         if (!activeConfig?.remoteSystemUserId) return { ok: false, error: 'remote_system_audio_unavailable' };
-        ensureMainCloud().muteRemoteAudio(activeConfig.remoteSystemUserId, !!muted);
+        const nextMuted = !!muted;
+        mainRecord.cloud.muteRemoteAudio(activeConfig.remoteSystemUserId, nextMuted);
+        remoteSystemAudioMuted = nextMuted;
         return { ok: true };
       } catch (error) {
+        try { mainRecord?.cloud.muteRemoteAudio(activeConfig?.remoteSystemUserId, previousMuted); } catch {}
         return { ok: false, error: String(error?.message || error) };
       }
     },
